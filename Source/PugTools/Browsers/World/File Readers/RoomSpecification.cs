@@ -1,117 +1,99 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
+using SlimDX;
 using File = TorArchive.File;
-
 
 namespace FileFormats {
   public class Room {
     private File File { get; set; }
     public string RoomName { get; private set; }
     public Area Area { get; private set; }
-
-    public Dictionary<ulong, AssetInstance> InstancesById { get; set; }
-    public Dictionary<ulong, List<AssetInstance>> InstancesByAssetId { get; set; }
-    public Dictionary<ulong, List<AssetInstance>> InstancesByParentId { get; set; }
+    public Dictionary<ulong, AssetInstance> InstancesById { get; set; } = new Dictionary<ulong, AssetInstance>();
+    public Dictionary<ulong, List<AssetInstance>> InstancesByAssetId { get; set; } = new Dictionary<ulong, List<AssetInstance>>();
+    public Dictionary<ulong, List<AssetInstance>> InstancesByParentId { get; set; } = new Dictionary<ulong, List<AssetInstance>>();
+    public List<string> VisibleRooms { get; } = new List<string>();
+    public string EnvironmentSchemeName { get; private set; } = "area";
+    public Vector3 VisibilityMin { get; private set; }
+    public Vector3 VisibilityMax { get; private set; }
+    public Vector3 VisibilityCenter { get; private set; }
+    public float VisibilityRadius { get; private set; }
+    public ulong RoomId { get; private set; }
+    public bool OutdoorsVisible { get; private set; }
+    public bool DisablePlantEmitters { get; private set; }
+    public AreaEnvironmentScheme EnvironmentScheme => Area?.GetEnvironmentScheme(EnvironmentSchemeName);
 
     public Room(File roomDat, string roomName, Area area) {
-      this.Area = area;
-      RoomName = roomName;
-      File = roomDat ?? throw new ArgumentNullException(nameof(roomDat), "File cannot be null");
+      Area = area; RoomName = NormalizeRoomName(roomName); File = roomDat ?? throw new ArgumentNullException(nameof(roomDat));
+    }
 
-      // Instances = new List<Dictionary<string, string>>();
+    public bool Contains(Vector3 p) => p.X >= VisibilityMin.X && p.X <= VisibilityMax.X && p.Y >= VisibilityMin.Y && p.Y <= VisibilityMax.Y && p.Z >= VisibilityMin.Z && p.Z <= VisibilityMax.Z;
 
-      InstancesByAssetId = new Dictionary<ulong, List<AssetInstance>>();
-      InstancesById = new Dictionary<ulong, AssetInstance>();
-      InstancesByParentId = new Dictionary<ulong, List<AssetInstance>>();
+    // Some shipped room DATs contain an all-zero visibility box. Jedipedia replaces those with the conservative
+    // bounds of the room's renderable placements before its dPVS/fallback room lookup starts. Keep the authored
+    // box when it is usable; this setter exists only for the same load-time fallback in the offline renderer.
+    public void SetComputedVisibilityBounds(Vector3 min, Vector3 max) {
+      VisibilityMin = min; VisibilityMax = max; VisibilityCenter = (min + max) * .5f;
+      VisibilityRadius = (max - min).Length() * .5f;
     }
 
     public void Read() {
-      using Stream fileStream = File.OpenCopyInMemory();
-      BinaryReader br = new BinaryReader(fileStream);
-
-      System.Diagnostics.Debug.WriteLine(File.FilePath);
-
-      // Move to 0x1C
-      br.BaseStream.Seek(0x1C, SeekOrigin.Begin);
-      uint instancesOffset = br.ReadUInt32();
-      uint visibleOffset = br.ReadUInt32();
-      uint settingsOffset = br.ReadUInt32();
-
-      // INSTANCES ==========================================================================
-      // Move to instancesOffset
-      br.BaseStream.Seek(instancesOffset, SeekOrigin.Begin);
-
-      uint numInstances = br.ReadUInt32();
-
-      for (int i = 0; i < numInstances; i++) {
-        // Move 0x05 bytes ahead
-        br.BaseStream.Seek(0x05, SeekOrigin.Current);
-
-        ulong instanceId = br.ReadUInt64();
-        ulong assetId = br.ReadUInt64();
-
-        AssetInstance currentInstance = new AssetInstance(instanceId, assetId, Area);
-
-        br.ReadByte();
-        br.ReadUInt32(); // var numProperties = br.ReadUInt32();
-
-        var propertiesLength = br.ReadUInt32();
-        var propertiesEnd = br.BaseStream.Position + propertiesLength;
-
-        br.ReadByte();
-
-        while (br.BaseStream.Position < propertiesEnd) {
-          uint type = br.ReadByte();
-          uint name = br.ReadUInt32();
-
-          currentInstance.AddProperty(ref br, name, type);
-        }
-
-        currentInstance.ReadHeightMap();
-
-        currentInstance.CalculateTransform();
-
-        InstancesById.Add(instanceId, currentInstance);
-
-        if (!InstancesByAssetId.TryGetValue(assetId, out List<AssetInstance> assetInstances)) {
-          assetInstances = new List<AssetInstance>();
-          InstancesByAssetId[assetId] = assetInstances;
-        }
-
-        assetInstances.Add(currentInstance);
-      }
-
-      // VISIBLE ============================================================================
-      // Move to visibleOffset
-      br.BaseStream.Seek(visibleOffset, SeekOrigin.Begin);
-
-      uint numVisible = br.ReadUInt32();
-
-      for (int i = 0; i < numVisible; i++) {
-        var visibleLength = br.ReadUInt32();
-        var visible = ReadWString(br, br.BaseStream.Position, visibleLength);
-        _ = visible;
-      }
-
-      // SETTINGS ===========================================================================
-      // Move to settngsOffset
-      br.BaseStream.Seek(settingsOffset, SeekOrigin.Begin);
+      using Stream stream = File.OpenCopyInMemory(); using BinaryReader br = new BinaryReader(stream);
+      if (br.ReadUInt32() != 0x18) throw new InvalidDataException("Only binary room DAT is supported by the World renderer.");
+      br.BaseStream.Position = 0x1C; uint instancesOffset = br.ReadUInt32(); uint visibleOffset = br.ReadUInt32(); uint settingsOffset = br.ReadUInt32();
+      ReadInstances(br, instancesOffset); ReadVisibleRooms(br, visibleOffset); ReadSettings(br, settingsOffset); BuildParentIndex();
     }
 
-    private static string ReadWString(BinaryReader br, long off, uint len) {
-      br.BaseStream.Seek(off, SeekOrigin.Begin);
-
-      ushort s;
-      string str = "";
-
-      while (len > 0 && (s = br.ReadUInt16()) != 0x00) {
-        str += BitConverter.GetBytes(s).First();
-        len--;
+    private void ReadInstances(BinaryReader br, uint offset) {
+      br.BaseStream.Position = offset; uint count = br.ReadUInt32();
+      for (int i = 0; i < count; i++) {
+        br.BaseStream.Position += 5; ulong instanceId = br.ReadUInt64(); ulong assetId = br.ReadUInt64();
+        var instance = new AssetInstance(instanceId, assetId, Area);
+        br.ReadByte(); uint numProperties = br.ReadUInt32(); _ = numProperties; uint propertiesLength = br.ReadUInt32(); long end = br.BaseStream.Position + propertiesLength;
+        if (br.BaseStream.Position < end) br.ReadByte();
+        while (br.BaseStream.Position < end) {
+          uint type = br.ReadByte(); uint name = br.ReadUInt32();
+          try { instance.AddProperty(ref br, name, type); } catch { br.BaseStream.Position = end; break; }
+        }
+        br.BaseStream.Position = end;
+        instance.ReadEmbeddedGeometry(); instance.CalculateTransform();
+        InstancesById[instanceId] = instance;
+        if (!InstancesByAssetId.TryGetValue(assetId, out List<AssetInstance> list)) InstancesByAssetId[assetId] = list = new List<AssetInstance>();
+        list.Add(instance);
       }
-
-      return str;
     }
+
+    private void ReadVisibleRooms(BinaryReader br, uint offset) {
+      br.BaseStream.Position = offset; uint count = br.ReadUInt32();
+      for (int i = 0; i < count; i++) {
+        uint len = br.ReadUInt32(); string visible = NormalizeRoomName(ReadWString(br, len)); if (!string.IsNullOrEmpty(visible)) VisibleRooms.Add(visible);
+      }
+    }
+
+    private void ReadSettings(BinaryReader br, uint offset) {
+      br.BaseStream.Position = offset;
+      uint envLen = br.ReadUInt32(); EnvironmentSchemeName = ReadWString(br, envLen).Trim().ToLowerInvariant(); if (string.IsNullOrEmpty(EnvironmentSchemeName)) EnvironmentSchemeName = "area";
+      uint mapsLen = br.ReadUInt32(); br.BaseStream.Position += mapsLen; uint mapsVisibleLen = br.ReadUInt32(); br.BaseStream.Position += mapsVisibleLen;
+      VisibilityMin = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
+      VisibilityMax = new Vector3(br.ReadSingle(), br.ReadSingle(), br.ReadSingle());
+      VisibilityCenter = (VisibilityMin + VisibilityMax) * .5f;
+      VisibilityRadius = (VisibilityMax - VisibilityMin).Length() * .5f;
+      RoomId = br.ReadUInt64(); OutdoorsVisible = br.ReadBoolean(); DisablePlantEmitters = br.ReadBoolean();
+    }
+
+    private void BuildParentIndex() {
+      foreach (AssetInstance instance in InstancesById.Values) {
+        if (instance.parentInstance == 0) continue;
+        if (!InstancesByParentId.TryGetValue(instance.parentInstance, out List<AssetInstance> children)) InstancesByParentId[instance.parentInstance] = children = new List<AssetInstance>();
+        children.Add(instance);
+      }
+    }
+
+    private static string ReadWString(BinaryReader br, uint byteLength) {
+      byte[] b = br.ReadBytes(checked((int)byteLength)); return Encoding.Unicode.GetString(b).TrimEnd('\0');
+    }
+    private static string NormalizeRoomName(string value) => (value ?? string.Empty).Trim().Replace('\\', '/').TrimStart('/').Replace(".dat", "", StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
   }
 }

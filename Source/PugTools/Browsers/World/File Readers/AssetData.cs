@@ -9,6 +9,7 @@ namespace FileFormats
     {
         public ulong Id { get; set; }
         public string Path { get; set; }
+        public string Extension { get; set; }
         public string EncounterIndex { get; set; }
     }
 }

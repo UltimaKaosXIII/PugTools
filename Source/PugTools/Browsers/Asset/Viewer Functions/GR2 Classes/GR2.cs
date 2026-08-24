@@ -11,6 +11,8 @@ namespace FileFormats {
     private Boolean disposed = false;
     public Boolean enabled = true;
     public String filename;
+    public String lodSchemaName = "granny_legacy_default";
+    public Single[] lodThresholds = Array.Empty<Single>();
     public GR2_Bounding_Box globalBox;
     public List<GR2_Material> materials = new List<GR2_Material>();
     public List<GR2_Mesh> meshes = new List<GR2_Mesh>();
@@ -52,6 +54,20 @@ namespace FileFormats {
 
       Boolean is64Bit = version >= 5;
 
+      // The LOD-schema string pointer and the bounding-box layout differ between BWAG v4 and v5.
+      // v5 stores min at 0x20 and max at 0x30, while v4 stores min/max at 0x30/0x40.  The old
+      // PugTools parser always started at 0x30, which made every v5 model sphere/radius garbage and in turn
+      // defeated distance/frustum culling.  These offsets match Jedipedia's gr2 loader.
+      Int64 schemaPointerPos = version == 5 ? 0x40 : 0x28;
+      if (schemaPointerPos + 4 <= br.BaseStream.Length) {
+        br.BaseStream.Seek(schemaPointerPos, SeekOrigin.Begin);
+        UInt32 schemaOffset = br.ReadUInt32();
+        if (schemaOffset > 0 && schemaOffset < br.BaseStream.Length) {
+          String schema = FileHelpers.ReadString(br, schemaOffset);
+          if (!String.IsNullOrWhiteSpace(schema)) lodSchemaName = schema;
+        }
+      }
+
       br.BaseStream.Seek(0x10, SeekOrigin.Begin);
 
       br.ReadUInt32(); // num50Offsets
@@ -61,7 +77,7 @@ namespace FileFormats {
       numBones = br.ReadUInt16();
       numAttach = br.ReadUInt16();
 
-      br.BaseStream.Seek(0x30, SeekOrigin.Begin);
+      br.BaseStream.Seek(version == 5 ? 0x20 : 0x30, SeekOrigin.Begin);
       globalBox = new GR2_Bounding_Box(br);
 
       br.BaseStream.Seek(0x50, SeekOrigin.Begin);

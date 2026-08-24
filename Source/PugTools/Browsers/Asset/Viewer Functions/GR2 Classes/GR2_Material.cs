@@ -1,6 +1,7 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Globalization;
 using System.Xml;
 using GomLib;
 using SlimDX;
@@ -21,6 +22,9 @@ namespace FileFormats {
     public String derived;
     public String diffuseDDS;
     public ShaderResourceView diffuseSRV;
+    // Optional low-frequency/selector map used by SWTOR TerrainAntiTile.
+    public String diffuse2DDS;
+    public ShaderResourceView diffuse2SRV;
     public String facepaintDDS;
     public ShaderResourceView facepaintSRV;
     public Single fleshBrightness;
@@ -30,6 +34,8 @@ namespace FileFormats {
     public ShaderResourceView glossSRV;
     public Boolean isTwoSided;
     public String materialName;
+    // The lookup key may be made unique for per-NPC palette variants, while this keeps the authored .mat name.
+    public String sourceMaterialName;
     public Vector4 palette1;
     public Vector4 palette1MetSpec;
     public Vector4 palette1Spec;
@@ -43,20 +49,37 @@ namespace FileFormats {
     public ShaderResourceView paletteMaskSRV;
     public ShaderResourceView paletteSRV;
     public Boolean parsed;
-    // private String polytype;
+    // SWTOR uses these authoring flags to keep editor/utility geometry out of the in-game render.
+    public String polyType;
+    public String visibility;
     public String rotationDDS;
     public ShaderResourceView rotationSRV;
     public Boolean useEmissive;
+    // World-viewer material parameters also used by Jedipedia's Uber/UberEnvBlend paths.
+    public Vector2 uvScale = new Vector2(1f, 1f);
+    public Single envBlendMaterialTileMult = 1f;
+    public Single diffuseTextureAlphaMax = 1f;
+    // Material tint used by SWTOR VFX/stronghold hook shaders (diffuseFlatColorProp).
+    public Vector4 diffuseFlatColor = new Vector4(1f, 1f, 1f, 1f);
+    public Boolean hasDiffuseFlatColor;
+    public Vector4 bloomMaterialParams = new Vector4(1f, 0f, 0f, 0f);
+    // Grass/DynamicDetail lighting control authored by SWTOR materials. Jedipedia defaults to (1,1,1,0).
+    public Vector4 vegetationParams2 = new Vector4(1f, 1f, 1f, 0f);
+    // Volume texture used by SWTOR water materials. ShaderResourceView.FromStream also handles volume DDS files.
+    public String waterSurfaceDDS;
+    public ShaderResourceView waterSurfaceSRV;
     // private Boolean useReflection;
     // private String visibility;
 
     public GR2_Material(String materialName) {
       this.materialName = materialName;
+      sourceMaterialName = materialName;
     }
 
     public GR2_Material(BinaryReader br, Boolean is64Bit) {
       UInt64 offsetMaterialName = is64Bit ? br.ReadUInt64() : br.ReadUInt32();
       materialName = FileHelpers.ReadString(br, offsetMaterialName);
+      sourceMaterialName = materialName;
     }
 
     private static void FileToShaderResource(ref Device device,
@@ -80,11 +103,11 @@ namespace FileFormats {
     }
 
     private static void FileToShaderResource(ref Device device,
-                                             String value,
+                                             String resourcePath,
                                              ref ShaderResourceView srv) {
 
       Assets curAssets = AssetHandler.Instance.GetCurrentAssets();
-      using File file = curAssets.FindFile(value);
+      using File file = curAssets.FindFile(resourcePath);
 
       FileToShaderResource(ref device, file, ref srv);
     }
@@ -99,10 +122,10 @@ namespace FileFormats {
     /// </summary>
     private static String ResolveTextureResourcePath(
       Assets assets,
-      String value,
+      String authoredValue,
       String variable
     ) {
-      String primary = NormalizeTextureResourcePath(value);
+      String primary = NormalizeTextureResourcePath(authoredValue);
       if (!String.IsNullOrWhiteSpace(primary)
           && TextureResourceExists(assets, primary))
         return primary;
@@ -123,10 +146,10 @@ namespace FileFormats {
       return file != null;
     }
 
-    private static String NormalizeTextureResourcePath(String value) {
-      if (String.IsNullOrWhiteSpace(value)) return null;
+    private static String NormalizeTextureResourcePath(String rawPath) {
+      if (String.IsNullOrWhiteSpace(rawPath)) return null;
 
-      String path = value.Trim().Replace('\\', '/');
+      String path = rawPath.Trim().Replace('\\', '/');
       while (path.Contains("//")) path = path.Replace("//", "/");
 
       if (path.StartsWith("resources/", StringComparison.OrdinalIgnoreCase))
@@ -150,9 +173,9 @@ namespace FileFormats {
       ref ShaderResourceView srv,
       Boolean useBlueFallback = false
     ) {
-      String value = inputNode?["value"]?.InnerText;
+      String authoredValue = inputNode?["value"]?.InnerText;
       String variable = inputNode?["variable"]?.InnerText;
-      String resolved = ResolveTextureResourcePath(assets, value, variable);
+      String resolved = ResolveTextureResourcePath(assets, authoredValue, variable);
 
       if (!String.IsNullOrWhiteSpace(resolved)) {
         using File file = assets?.FindFile(resolved);
@@ -170,8 +193,36 @@ namespace FileFormats {
       }
     }
 
+    private static Vector2 ParseVector2(String text, Vector2 fallback) {
+      if (String.IsNullOrWhiteSpace(text)) return fallback;
+      String[] parts = text.Trim().Trim('(', ')', '[', ']').Split(new[] { ',', ' ', ';' }, StringSplitOptions.RemoveEmptyEntries);
+      if (parts.Length == 1 && Single.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out Single scalar))
+        return new Vector2(scalar, scalar);
+      if (parts.Length >= 2
+          && Single.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out Single x)
+          && Single.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out Single y))
+        return new Vector2(x, y);
+      return fallback;
+    }
+
+    private static Single ParseSingle(String text, Single fallback) {
+      return Single.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out Single parsed) ? parsed : fallback;
+    }
+
+    private static Vector4 ParseVector4(String text, Vector4 fallback) {
+      if (String.IsNullOrWhiteSpace(text)) return fallback;
+      String[] parts = text.Trim().Trim('(', ')', '[', ']').Split(new[] { ',', ' ', ';' }, StringSplitOptions.RemoveEmptyEntries);
+      if (parts.Length >= 4
+          && Single.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out Single x)
+          && Single.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out Single y)
+          && Single.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out Single z)
+          && Single.TryParse(parts[3], NumberStyles.Float, CultureInfo.InvariantCulture, out Single w))
+        return new Vector4(x, y, z, w);
+      return fallback;
+    }
+
     public void ParseMAT(Device device, List<GR2_Material> parentMaterials = null) {
-      String materialFileName = "/resources/art/shaders/materials/" + materialName + ".mat";
+      String materialFileName = "/resources/art/shaders/materials/" + (String.IsNullOrWhiteSpace(sourceMaterialName) ? materialName : sourceMaterialName) + ".mat";
       Assets currentAssets = AssetHandler.Instance.GetCurrentAssets();
 
       try {
@@ -189,18 +240,10 @@ namespace FileFormats {
             Vector4 spec = FileHelpers.StringToVec4(
               p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Specular").InnerText
             );
-            Single hue = Single.Parse(
-              p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Hue").InnerText
-            );
-            Single bright = Single.Parse(
-              p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Brightness").InnerText
-            );
-            Single saturation = Single.Parse(
-              p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Saturation").InnerText
-            );
-            Single contrast = Single.Parse(
-              p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Contrast").InnerText
-            );
+            Single hue = ParseSingle(p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Hue")?.InnerText, 0f);
+            Single bright = ParseSingle(p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Brightness")?.InnerText, 0f);
+            Single saturation = ParseSingle(p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Saturation")?.InnerText, .5f);
+            Single contrast = ParseSingle(p1XmlDoc.DocumentElement.SelectSingleNode("/Palette/Contrast")?.InnerText, 1f);
 
             palette1 = new Vector4(hue, saturation, bright, contrast);
             palette1MetSpec = metSpec;
@@ -223,18 +266,10 @@ namespace FileFormats {
             Vector4 spec = FileHelpers.StringToVec4(
               p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Specular").InnerText
             );
-            Single hue = Single.Parse(
-              p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Hue").InnerText
-            );
-            Single bright = Single.Parse(
-              p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Brightness").InnerText
-            );
-            Single saturation = Single.Parse(
-              p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Saturation").InnerText
-            );
-            Single contrast = Single.Parse(
-              p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Contrast").InnerText
-            );
+            Single hue = ParseSingle(p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Hue")?.InnerText, 0f);
+            Single bright = ParseSingle(p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Brightness")?.InnerText, 0f);
+            Single saturation = ParseSingle(p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Saturation")?.InnerText, .5f);
+            Single contrast = ParseSingle(p2XmlDoc.DocumentElement.SelectSingleNode("/Palette/Contrast")?.InnerText, 1f);
 
             palette2 = new Vector4(hue, saturation, bright, contrast);
             palette2MetSpec = metSpec;
@@ -268,44 +303,74 @@ namespace FileFormats {
         XmlDocument material = new XmlDocument();
         material.Load(materialStream);
 
-        derived = material.SelectSingleNode("/Material/Derived").InnerText;
-        // polytype = material.SelectSingleNode("/Material/PolyType").InnerText;
-        // visibility = material.SelectSingleNode("/Material/Visibility").InnerText;
+        // MATs are asset data and always use invariant decimal syntax. Using the Windows UI culture here
+        // (for example de-DE) could throw before the texture inputs were even visited, leaving terrain
+        // materials completely untextured. Keep the parser deliberately tolerant like Jedipedia's readMat.
+        derived = material.SelectSingleNode("/Material/Derived")?.InnerText ?? String.Empty;
+        polyType = material.SelectSingleNode("/Material/PolyType")?.InnerText ?? String.Empty;
+        visibility = material.SelectSingleNode("/Material/Visibility")?.InnerText ?? String.Empty;
 
-        String alphaMode = material.SelectSingleNode("/Material/AlphaMode").InnerText;
-        String alphaTestValue = material.SelectSingleNode("/Material/AlphaTestValue").InnerText;
-
-        if (alphaMode != "None") {
-          alphaClip = true;
-          this.alphaMode = alphaMode;
-        }
-
-        this.alphaTestValue = Single.Parse(alphaTestValue);
-        isTwoSided = material.SelectSingleNode("/Material/IsTwoSided").InnerText == "True";
+        String alphaMode = material.SelectSingleNode("/Material/AlphaMode")?.InnerText ?? "None";
+        String alphaTestValue = material.SelectSingleNode("/Material/AlphaTestValue")?.InnerText ?? "0";
+        this.alphaMode = alphaMode;
+        alphaClip = !alphaMode.Equals("None", StringComparison.OrdinalIgnoreCase);
+        this.alphaTestValue = ParseSingle(alphaTestValue, 0f);
+        if (this.alphaTestValue > 1f) this.alphaTestValue = Math.Min(1f, this.alphaTestValue / 255f);
+        Boolean.TryParse(material.SelectSingleNode("/Material/IsTwoSided")?.InnerText, out isTwoSided);
         XmlNodeList nodeList = material.SelectNodes("/Material/input");
 
         foreach (XmlNode node in nodeList) {
-          String semantic = node["semantic"].InnerText;
-          String value = node["value"]?.InnerText?.Replace("\\", "/") ?? String.Empty;
+          String semantic = node["semantic"]?.InnerText;
+          if (String.IsNullOrWhiteSpace(semantic)) continue;
+          String inputValue = node["value"]?.InnerText?.Replace("\\", "/") ?? String.Empty;
 
-          if (semantic == "DiffuseMap") {
+          if (semantic.Equals("DiffuseMap", StringComparison.OrdinalIgnoreCase)) {
             LoadMaterialTexture(
               ref device, currentAssets, node, ref diffuseDDS, ref diffuseSRV, true
             );
-          } else if (semantic == "RotationMap1") {
+          } else if (semantic.Equals("TerrainMap0", StringComparison.OrdinalIgnoreCase) && diffuseSRV == null) {
+            // Grass/DynamicDetail MATs in some builds use TerrainMap0 as their authored sheet.
+            LoadMaterialTexture(
+              ref device, currentAssets, node, ref diffuseDDS, ref diffuseSRV, true
+            );
+          } else if (semantic.Equals("DiffuseMap2", StringComparison.OrdinalIgnoreCase)) {
+            // TerrainAntiTile uses this as both selector noise and distant macro albedo.
+            // Do not bind a fake fallback here: the shader deliberately takes a seam-free
+            // single-sample path when the material has no real DiffuseMap2.
+            LoadMaterialTexture(
+              ref device, currentAssets, node, ref diffuse2DDS, ref diffuse2SRV
+            );
+          } else if (semantic.Equals("RotationMap1", StringComparison.OrdinalIgnoreCase) || semantic.Equals("RotationMap", StringComparison.OrdinalIgnoreCase)) {
             LoadMaterialTexture(
               ref device, currentAssets, node, ref rotationDDS, ref rotationSRV
             );
-          } else if (semantic == "GlossMap") {
+          } else if (semantic.Equals("GlossMap", StringComparison.OrdinalIgnoreCase)) {
             LoadMaterialTexture(
               ref device, currentAssets, node, ref glossDDS, ref glossSRV
             );
-          } else if (semantic == "UsesEmissive") {
-            useEmissive = Convert.ToBoolean(value);
+          } else if (semantic.Equals("UsesEmissive", StringComparison.OrdinalIgnoreCase)) {
+            Boolean.TryParse(inputValue, out useEmissive);
+          } else if (semantic.Equals("UvScale", StringComparison.OrdinalIgnoreCase) || semantic.Equals("UvScaling", StringComparison.OrdinalIgnoreCase)) {
+            uvScale = ParseVector2(inputValue, uvScale);
+          } else if (semantic.Equals("envBlendMaterialTileMult", StringComparison.OrdinalIgnoreCase)) {
+            envBlendMaterialTileMult = ParseSingle(inputValue, 1f);
+          } else if (semantic.Equals("DiffuseTextureAlphaMax", StringComparison.OrdinalIgnoreCase)) {
+            diffuseTextureAlphaMax = ParseSingle(inputValue, 1f);
+          } else if (semantic.Equals("diffuseFlatColorProp", StringComparison.OrdinalIgnoreCase)) {
+            diffuseFlatColor = ParseVector4(inputValue, new Vector4(1f,1f,1f,1f));
+            hasDiffuseFlatColor = true;
+          } else if (semantic.Equals("BloomMaterialParams", StringComparison.OrdinalIgnoreCase) || semantic.Equals("bloomMaterialParams", StringComparison.OrdinalIgnoreCase)) {
+            bloomMaterialParams = ParseVector4(inputValue, new Vector4(1f,0f,0f,0f));
+          } else if (semantic.Equals("vegetationParams2", StringComparison.OrdinalIgnoreCase)) {
+            try { vegetationParams2 = FileHelpers.StringToVec4(inputValue); } catch { vegetationParams2 = new Vector4(1f,1f,1f,0f); }
+          } else if (semantic.Equals("WaterSurfaceMap", StringComparison.OrdinalIgnoreCase)) {
+            LoadMaterialTexture(
+              ref device, currentAssets, node, ref waterSurfaceDDS, ref waterSurfaceSRV
+            );
           }
 
-          if (derived == "Garment" || derived == "GarmentScrolling" || derived == "SkinB"
-              || derived == "HairC" || derived == "Eye") {
+          if (derived.Equals("Garment", StringComparison.OrdinalIgnoreCase) || derived.Equals("GarmentScrolling", StringComparison.OrdinalIgnoreCase) || derived.Equals("SkinB", StringComparison.OrdinalIgnoreCase)
+              || derived.Equals("HairC", StringComparison.OrdinalIgnoreCase) || derived.Equals("Eye", StringComparison.OrdinalIgnoreCase)) {
 
             if (semantic == "PaletteMap") {
               LoadMaterialTexture(
@@ -317,22 +382,22 @@ namespace FileFormats {
               );
             } else if (semantic == "palette1") {
               if (palette1 == new Vector4())
-                palette1 = FileHelpers.StringToVec4(value);
+                palette1 = FileHelpers.StringToVec4(inputValue);
             } else if (semantic == "palette2") {
               if (palette2 == new Vector4())
-                palette2 = FileHelpers.StringToVec4(value);
+                palette2 = FileHelpers.StringToVec4(inputValue);
             } else if (semantic == "palette1Specular") {
-              palette1Spec = FileHelpers.StringToVec4(value);
+              palette1Spec = FileHelpers.StringToVec4(inputValue);
             } else if (semantic == "palette2Specular") {
-              palette2Spec = FileHelpers.StringToVec4(value);
+              palette2Spec = FileHelpers.StringToVec4(inputValue);
             } else if (semantic == "palette1MetallicSpecular") {
-              palette1MetSpec = FileHelpers.StringToVec4(value);
+              palette1MetSpec = FileHelpers.StringToVec4(inputValue);
             } else if (semantic == "palette2MetallicSpecular") {
-              palette2MetSpec = FileHelpers.StringToVec4(value);
+              palette2MetSpec = FileHelpers.StringToVec4(inputValue);
             }
           }
 
-          if (derived == "SkinB") {
+          if (derived.Equals("SkinB", StringComparison.OrdinalIgnoreCase)) {
             if (semantic == "ComplexionMap") {
               LoadMaterialTexture(
                 ref device, currentAssets, node, ref complexionDDS, ref complexionSRV
@@ -347,19 +412,19 @@ namespace FileFormats {
               );
             } else if (semantic == "FlushTone") {
               if (flushTone == new Vector4())
-                flushTone = FileHelpers.StringToVec4(value);
+                flushTone = FileHelpers.StringToVec4(inputValue);
             } else if (semantic == "FleshBrightness") {
               if (fleshBrightness == 0)
-                fleshBrightness = Single.Parse(value);
+                fleshBrightness = ParseSingle(inputValue, fleshBrightness);
             }
           }
 
           /*
           if (derived == "Glass") {
             if (semantic == "UsesReflection") {
-              useReflection = Convert.ToBoolean(value);
+              useReflection = Convert.ToBoolean(inputValue);
             } else if (semantic == "GlassParams") {
-              glassParams = FileHelpers.StringToVec4(value);
+              glassParams = FileHelpers.StringToVec4(inputValue);
             }
           }
           */

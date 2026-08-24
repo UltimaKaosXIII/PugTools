@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Numerics;
 
 namespace FileFormats {
@@ -44,6 +45,69 @@ namespace FileFormats {
 
   public static class MPHAnimationReader {
     private const UInt32 MAWB = 0x4257414D;
+
+    // World-placeable MAG specs name a Morpheme network, not the idle JBA directly. Jedipedia walks the
+    // network recipe; for the lightweight world preview we pick the best authored animation name from the
+    // network's AnimationList and then use the normal clip->rig mapping below. This still keeps the animation
+    // on the correct network/skeleton instead of leaving every animated SPN object rigid.
+    public static String FindBestIdleClipName(BinaryReader br) {
+      List<String> names = FindIdleClipNames(br);
+      return names.Count > 0 ? names[0] : null;
+    }
+
+    public static List<String> FindIdleClipNames(BinaryReader br) {
+      if (br == null) throw new ArgumentNullException(nameof(br));
+      Int64 original = br.BaseStream.Position;
+      try {
+        Int64 pos = original;
+        Boolean is64 = false;
+        if (ReadUInt32At(br, pos) == MAWB) {
+          UInt32 version = ReadUInt32At(br, pos + 4);
+          if (version != 2) return new List<String>();
+          is64 = true; pos += 8;
+        }
+        var candidates = new List<(String Name, Int32 Score, Int32 Order)>();
+        var seen = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+        Int32 order = 0;
+        while (pos + 16 <= br.BaseStream.Length) {
+          UInt32 type = ReadUInt32At(br, pos);
+          UInt32 length = ReadUInt32At(br, pos + 8);
+          Int64 sectionStart = pos + 16;
+          Int64 sectionEnd = sectionStart + length;
+          if (length == 0 || sectionEnd > br.BaseStream.Length) break;
+          if (type == 1) {
+            try {
+              MPHAnimationList list = ReadAnimationList(br, sectionStart, is64);
+              foreach (String name in list.Names) {
+                if (String.IsNullOrWhiteSpace(name)) continue;
+                String stem = Path.GetFileNameWithoutExtension(name).ToLowerInvariant();
+                if (!seen.Add(stem)) continue;
+                candidates.Add((stem, ScoreIdleClip(stem), order++));
+              }
+            } catch { }
+          }
+          pos = is64 ? (((sectionEnd - 8 + 15) & ~15L) + 8) : ((sectionEnd + 15) & ~15L);
+        }
+        return candidates.OrderByDescending(x => x.Score).ThenBy(x => x.Order).Select(x => x.Name).ToList();
+      } finally {
+        if (br.BaseStream.CanSeek) br.BaseStream.Position = original;
+      }
+    }
+
+    private static Int32 ScoreIdleClip(String name) {
+      if (String.IsNullOrWhiteSpace(name)) return Int32.MinValue;
+      String n = name.ToLowerInvariant();
+      Int32 score = 0;
+      if (n.Contains("idle")) score += 1000;
+      if (n.Contains("stand")) score += 350;
+      if (n.Contains("closed") || n.Contains("close")) score += 250;
+      if (n.Contains("loop")) score += 200;
+      if (n.Contains("default")) score += 150;
+      if (n.Contains("open")) score -= 100;
+      if (n.Contains("combat")) score -= 50;
+      // Stable preference for the first sensible AnimationList entry when the network uses opaque names.
+      return score;
+    }
 
     public static JBARig FindRigForClip(
       BinaryReader br,

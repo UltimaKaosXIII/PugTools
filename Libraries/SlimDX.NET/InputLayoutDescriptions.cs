@@ -66,6 +66,16 @@ namespace SlimDXNet {
             new InputElement("WORLD", 3, Format.R32G32B32A32_Float, InputElement.AppendAligned, 1, InputClassification.PerInstanceData, 1 ),
         };
 
+        // Private SWTOR DynamicDetail/Grass card stream used by the World Browser.
+        public static readonly InputElement[] DynamicDetail = {
+            new InputElement("CORNER", 0, Format.R32G32_Float, 0, 0, InputClassification.PerVertexData, 0),
+            new InputElement("CENTER", 0, Format.R32G32B32_Float, 8, 0, InputClassification.PerVertexData, 0),
+            new InputElement("SCALE", 0, Format.R32_Float, 20, 0, InputClassification.PerVertexData, 0),
+            new InputElement("TINT", 0, Format.R32G32B32_Float, 24, 0, InputClassification.PerVertexData, 0),
+            new InputElement("ATLAS", 0, Format.R32G32_Float, 36, 0, InputClassification.PerVertexData, 0),
+            new InputElement("PACKEDNORMAL", 0, Format.R32_Float, 44, 0, InputClassification.PerVertexData, 0),
+        };
+
         public static readonly InputElement[] Particle = {
             new InputElement("POSITION", 0, Format.R32G32B32_Float, 0, 0, InputClassification.PerVertexData, 0), 
             new InputElement("VELOCITY", 0, Format.R32G32B32_Float, InputElement.AppendAligned, 0, InputClassification.PerVertexData, 0), 

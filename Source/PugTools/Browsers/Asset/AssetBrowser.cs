@@ -1110,21 +1110,43 @@ namespace PugTools {
               webBrowser1.Visible = true;
               break;
 
-            case "DAT":
-              // Disabled as there is a new bianry format for dat files
-              // rootList.Clear();
-              // await Task.Run(() => previewDAT());
-              // treeItemView.Roots = rootList;
-              // treeItemView.ExpandAll();
-              // LoadingSwirl1Hide();
-              // ProgressBar1Hide();
-              // txtRawView.Visible = true;
-              // treeItemView.Visible = true;
-              // break;
-              await Task.Run(PreviewAssetHEX);
-              LoadingSwirl1Hide();
-              ProgressBar1Hide();
+            case "DAT": {
+              // area.dat and room .dat files now get the same structured view as
+              // Jedipedia. Other DAT variants still fall back to the hex viewer.
+              Assets datAssets = asset.CompareState == BuildFileState.Removed
+                ? m_previousAssets
+                : m_currentAssets;
+
+              try {
+                m_rootList.Clear();
+                await Task.Run(() => PreviewAssetDAT(
+                  asset.HashInfo.Directory,
+                  asset.HashInfo.FileName,
+                  datAssets
+                ));
+                NodeListItem.ResetTreeListViewColumns(treeViewGrid1);
+                treeViewGrid1.Roots = m_rootList;
+
+                // Expand only the top-level sections. This gives the Jedipedia-style
+                // long room/asset/instance lists without recursively expanding every
+                // path point and every instance property.
+                foreach (NodeListItem root in m_rootList.Cast<NodeListItem>())
+                  treeViewGrid1.Expand(root);
+
+                treeViewGrid1.AutoResizeColumns(ColumnHeaderAutoResizeStyle.ColumnContent);
+                LoadingSwirl1Hide();
+                ProgressBar1Hide();
+                treeViewGrid1.Visible = true;
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("DAT structured preview failed: " + ex);
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                LoadingSwirl1Hide();
+                ProgressBar1Hide();
+              }
               break;
+            }
 
             case "DYC":
             case "MAG":
@@ -1286,18 +1308,13 @@ namespace PugTools {
       }
     }
 
-    /*
-    private void PreviewAssetDAT() {
-      StreamReader sr = new StreamReader(inputStream);
-      var myStr = sr.ReadToEnd();
-      txtRawView.ReadOnly = false;
-      txtRawView.Text = myStr;
-      txtRawView.ReadOnly = true;
-      sr.BaseStream.Seek(0, SeekOrigin.Begin);
-      View_DAT dat = new View_DAT();
-      rootList = dat.ParseDAT(sr);
+    private void PreviewAssetDAT(String directory, String fileName, Assets assets) {
+      if (m_inputStream == null) return;
+
+      m_inputStream.Position = 0;
+      using BinaryReader br = new BinaryReader(m_inputStream, Encoding.UTF8, true);
+      m_rootList = View_DAT.Parse(br, assets, directory, fileName);
     }
-    */
 
     private void PreviewAssetDDS() {
       try {

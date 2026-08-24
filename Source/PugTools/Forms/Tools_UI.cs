@@ -367,8 +367,25 @@ namespace PugTools {
     }
     private void BtnNodeBrowser_Click(Object sender, EventArgs e) {
       if (NodeBrowser == null || NodeBrowser.IsDisposed) {
+        if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
+          MessageBox.Show(
+            "Please select a Previous Assets Path before opening the browser in compare mode.",
+            "Compare Builds",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning
+          );
+          return;
+        }
+
         Boolean usePTS = chkAssetsUsePTS.Checked;
-        NodeBrowser = new NodeBrowser(txtAssetsPath.Text, usePTS, txtExtractPath.Text);
+        NodeBrowser = new NodeBrowser(
+          txtAssetsPath.Text,
+          usePTS,
+          txtExtractPath.Text,
+          txtPrevAssetsPath.Text,
+          chkPrevAssetsUsePTS.Checked,
+          chkBuildCompare.Checked
+        );
         System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
         NodeBrowser.Show();
         NodeBrowser.Focus();

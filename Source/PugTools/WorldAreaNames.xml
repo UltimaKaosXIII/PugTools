@@ -1,0 +1,291 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AreaNames>
+  <!--
+    PugTools World Browser metadata. This file is editable both in the source tree and beside PugTools.exe.
+    name="..." overrides the displayed name. category="..." and group="..." control the folders in the world list.
+    The current Jedipedia grouping is prefilled below. Areas discovered later that have no assignment are added as
+    category="Unassigned" group="" and therefore appear directly in the Unassigned folder.
+    internalName is informational and may be refreshed from area.dat.
+  -->
+  <Area id="3758002374" name="" internalName="Character Selection" category="Solo phases" group="Other areas" />
+  <Area id="36268000006" name="" internalName="DebugSystem" category="Inaccessible areas" group="Empty areas" />
+  <Area id="4611686018427650020" name="" internalName="tat_main" category="Open world" group="Original planets" />
+  <Area id="4611686019013922786" name="" internalName="LockSystem" category="Inaccessible areas" group="Empty areas" />
+  <Area id="4611686019047870293" name="" internalName="coruscant_main" category="Open world" group="Original planets" />
+  <Area id="4611686019618382666" name="" internalName="dro_main" category="Open world" group="Original planets" />
+  <Area id="4611686019802841877" name="" internalName="hut_main" category="Open world" group="Original planets" />
+  <Area id="4611686019802843831" name="" internalName="ord_resize" category="Open world" group="Original planets" />
+  <Area id="4611686019869492753" name="" internalName="tython_blockout" category="Open world" group="Original planets" />
+  <Area id="4611686021579460422" name="" internalName="lobby" category="Inaccessible areas" group="Dev worlds" />
+  <Area id="4611686022220993772" name="" internalName="bal_main" category="Open world" group="Original planets" />
+  <Area id="4611686022825732973" name="" internalName="kor_rebuild_test" category="Open world" group="Original planets" />
+  <Area id="4611686023014030644" name="" internalName="tar_main" category="Open world" group="Original planets" />
+  <Area id="4611686023300231736" name="" internalName="char_create" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686023868513034" name="" internalName="ald_main" category="Open world" group="Original planets" />
+  <Area id="4611686025038950088" name="" internalName="hot_main_1" category="Open world" group="Original planets" />
+  <Area id="4611686025383332936" name="" internalName="vos_main" category="Open world" group="Original planets" />
+  <Area id="4611686025952170568" name="" internalName="bel_main" category="Open world" group="Original planets" />
+  <Area id="4611686027378771320" name="" internalName="imp_transition_flashpoint" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686027681070173" name="" internalName="nar_main" category="Open world" group="Original planets" />
+  <Area id="4611686029292470123" name="" internalName="combat_test_area_low_lvl" category="Inaccessible areas" group="Dev worlds" />
+  <Area id="4611686030163371363" name="" internalName="que_main" category="Open world" group="Original planets" />
+  <Area id="4611686033020472228" name="" internalName="crl_main" category="Open world" group="Original planets" />
+  <Area id="4611686033507370314" name="" internalName="rep_transition_flashpoint" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686033786570078" name="" internalName="imp_transition_lobby" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686035947170168" name="" internalName="bh_mandalore" category="Solo phases" group="Bounty Hunter" />
+  <Area id="4611686038902870211" name="" internalName="rep_transition_lobby" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686039258170278" name="" internalName="ilm_main1" category="Open world" group="Original planets" />
+  <Area id="4611686040187270001" name="" internalName="bal2_main" category="Open world" group="Original planets" />
+  <Area id="4611686040994970456" name="" internalName="bh_tyrant" category="Solo phases" group="Bounty Hunter" />
+  <Area id="4611686041464170233" name="" internalName="bh_chancellor" category="Solo phases" group="Bounty Hunter" />
+  <Area id="4611686041700070232" name="" internalName="inq_pyron" category="Solo phases" group="Sith Inquisitor" />
+  <Area id="4611686041700070345" name="" internalName="war_transponder" category="Solo phases" group="Sith Warrior" />
+  <Area id="4611686041748970000" name="" internalName="bh_tyrantdestroyed" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686041748971553" name="" internalName="war_moffmasken" category="Solo phases" group="Sith Warrior" />
+  <Area id="4611686041922470000" name="" internalName="agnt_tenebrous" category="Solo phases" group="Imperial Agent" />
+  <Area id="4611686041922570062" name="" internalName="agt_isen4asteroid" category="Solo phases" group="Imperial Agent" />
+  <Area id="4611686041944170162" name="" internalName="trp_guantlet" category="Solo phases" group="Trooper" />
+  <Area id="4611686043810670011" name="" internalName="GalaxyMap" category="Solo phases" group="Other areas" />
+  <Area id="4611686044023070789" name="" internalName="smug_treasury" category="Solo phases" group="Smuggler" />
+  <Area id="4611686044198570319" name="" internalName="ald_pvp" category="Ground PvP" group="Warzones" />
+  <Area id="4611686044595970426" name="" internalName="agt_epochoffear" category="Solo phases" group="Imperial Agent" />
+  <Area id="4611686044801670947" name="" internalName="bh_kellianjarro" category="Solo phases" group="Bounty Hunter" />
+  <Area id="4611686044972970000" name="" internalName="spc_m08" category="Space combat" group="Original missions" />
+  <Area id="4611686044973070000" name="" internalName="spc_m01" category="Space combat" group="Original missions" />
+  <Area id="4611686044973070932" name="" internalName="spc_m02" category="Space combat" group="Original missions" />
+  <Area id="4611686044973071122" name="" internalName="spc_m03" category="Space combat" group="Original missions" />
+  <Area id="4611686045100172033" name="" internalName="trp_shadowfist" category="Solo phases" group="Trooper" />
+  <Area id="4611686045100172083" name="" internalName="smg_distressed" category="Solo phases" group="Smuggler" />
+  <Area id="4611686045100172130" name="" internalName="smg_abyss" category="Solo phases" group="Smuggler" />
+  <Area id="4611686045100172228" name="" internalName="trp_incsvalor" category="Solo phases" group="Trooper" />
+  <Area id="4611686045100172279" name="" internalName="kgt_newintel" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686045100172332" name="" internalName="kgt_defector" category="Solo phases" group="Jedi Knight" />
+  <Area id="4611686045100172383" name="" internalName="con_vivicar" category="Solo phases" group="Jedi Consular" />
+  <Area id="4611686045100172437" name="" internalName="con_distresscall" category="Solo phases" group="Jedi Consular" />
+  <Area id="4611686045100172488" name="" internalName="kgt_uphrades" category="Solo phases" group="Jedi Knight" />
+  <Area id="4611686045100172543" name="" internalName="kgt_fateofjedi" category="Solo phases" group="Jedi Knight" />
+  <Area id="4611686045100172596" name="" internalName="war_threatleveled" category="Solo phases" group="Sith Warrior" />
+  <Area id="4611686045100172646" name="" internalName="war_planworking" category="Solo phases" group="Sith Warrior" />
+  <Area id="4611686046956070020" name="" internalName="spc_m04" category="Space combat" group="Original missions" />
+  <Area id="4611686047570570202" name="" internalName="regression_botworld1" category="Inaccessible areas" group="Regression Botworlds" />
+  <Area id="4611686047583470023" name="" internalName="spc_m05" category="Space combat" group="Original missions" />
+  <Area id="4611686047590570352" name="" internalName="trp_portraga" category="Solo phases" group="Trooper" />
+  <Area id="4611686047590570994" name="" internalName="kgt_emperor" category="Solo phases" group="Jedi Knight" />
+  <Area id="4611686047590571064" name="" internalName="con_fortitude" category="Solo phases" group="Jedi Consular" />
+  <Area id="4611686048166971255" name="" internalName="imp_fleet_lobby" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686048166971304" name="" internalName="rep_fleet_lobby" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686048287570020" name="" internalName="spc_m09" category="Space combat" group="Original missions" />
+  <Area id="4611686050082471254" name="" internalName="con_royalss" category="Solo phases" group="Jedi Consular" />
+  <Area id="4611686050082471301" name="" internalName="smug_regnant" category="Solo phases" group="Smuggler" />
+  <Area id="4611686050082471486" name="" internalName="smug_portnowhere" category="Solo phases" group="Smuggler" />
+  <Area id="4611686050277771570" name="" internalName="agnt_tytunrings" category="Solo phases" group="Imperial Agent" />
+  <Area id="4611686050277771927" name="" internalName="trp_station256" category="Solo phases" group="Trooper" />
+  <Area id="4611686050277772007" name="" internalName="trp_a77" category="Solo phases" group="Trooper" />
+  <Area id="4611686050277772102" name="" internalName="kgt_impss" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686050551071108" name="" internalName="kgt_leehass" category="Solo phases" group="Jedi Knight" />
+  <Area id="4611686050551071169" name="" internalName="kgt_valiant" category="Solo phases" group="Jedi Knight" />
+  <Area id="4611686050551071230" name="" internalName="con_starkss" category="Solo phases" group="Jedi Consular" />
+  <Area id="4611686050650671058" name="" internalName="con_dreadnought" category="Solo phases" group="Jedi Consular" />
+  <Area id="4611686051284471420" name="" internalName="spc_ps_jedi_consular" category="Social areas" group="Player ships" />
+  <Area id="4611686051284472468" name="" internalName="imp_revan_arc_1_repship" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686051284476033" name="" internalName="spc_ps_jedi_knight" category="Social areas" group="Player ships" />
+  <Area id="4611686051284477081" name="" internalName="spc_ps_sith_warrior" category="Social areas" group="Player ships" />
+  <Area id="4611686051284477465" name="" internalName="spc_ps_sith_inquisitor" category="Social areas" group="Player ships" />
+  <Area id="4611686051463571693" name="" internalName="rep_revan_arc_1_taralv" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686051463571770" name="" internalName="rep_revan_arc_2_prison" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686051849071023" name="" internalName="spc_ps_bounty_hunter" category="Social areas" group="Player ships" />
+  <Area id="4611686051849071159" name="" internalName="spc_ps_imp_agent" category="Social areas" group="Player ships" />
+  <Area id="4611686051983571021" name="" internalName="imp_revan_arc_2_foundry" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686053134031672" name="" internalName="spc_ps_trooper" category="Social areas" group="Player ships" />
+  <Area id="4611686053134231191" name="" internalName="ilum_flashpoint_2_station" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686053134237022" name="" internalName="ilum_flashpoint_1_surface" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686053487831502" name="" internalName="spc_ps_smuggler" category="Social areas" group="Player ships" />
+  <Area id="4611686053962331193" name="" internalName="agnt_thestarchmbr" category="Solo phases" group="Imperial Agent" />
+  <Area id="4611686055156531852" name="" internalName="imp_ship_pvp" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686056896931332" name="" internalName="directive7_flashpoint" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686058495631191" name="" internalName="spc_m07_final" category="Space combat" group="Original missions" />
+  <Area id="4611686059452131744" name="" internalName="rak_flashpoint_2_ord" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686059528731402" name="" internalName="rak_flashpoint_1_kaon" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686067111231191" name="" internalName="rep_fleet_flashpoint_lobby" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686070128931191" name="" internalName="imp_fleet_flashpoint_lobby" category="Inaccessible areas" group="Removed areas" />
+  <Area id="4611686070551329793" name="" internalName="tar2_main" category="Open world" group="Original planets" />
+  <Area id="4611686073553282778" name="" internalName="pvp_arena" category="Ground PvP" group="Warzones" />
+  <Area id="4611686085808861591" name="" internalName="bh_tyrantassault" category="Solo phases" group="Bounty Hunter" />
+  <Area id="4611686087038969857" name="" internalName="dro_knight" category="Solo phases" group="Jedi Knight" />
+  <Area id="4611686089657270273" name="" internalName="regression_botworld2" category="Inaccessible areas" group="Regression Botworlds" />
+  <Area id="4611686096259570491" name="" internalName="raid_eternity_vault" category="Group phases" group="Operations" />
+  <Area id="4611686096259570814" name="" internalName="tst_area_instancing" category="Inaccessible areas" group="Dev worlds" />
+  <Area id="4611686142106770000" name="" internalName="imperial_fleet" category="Social areas" group="Fleet" />
+  <Area id="4611686142577070000" name="" internalName="pvp_voidstar" category="Ground PvP" group="Warzones" />
+  <Area id="4611686170050760051" name="" internalName="raid_hutt_palace" category="Group phases" group="Operations" />
+  <Area id="4611686170117610875" name="" internalName="mini_flashpoint_raiders" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686170117610984" name="" internalName="mini_flashpoint_vengeance" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686170375400000" name="" internalName="gameplay_persistence_imp_ship" category="Inaccessible areas" group="Gameplay Persistence" />
+  <Area id="4611686189079993896" name="" internalName="mini_flashpoint_hammer" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686198204660000" name="" internalName="republic_fleet" category="Social areas" group="Fleet" />
+  <Area id="4611686198628930082" name="" internalName="gameplay_persistence" category="Inaccessible areas" group="Gameplay Persistence" />
+  <Area id="4611686198666960368" name="" internalName="mini_flashpoint_athiss" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686198771220166" name="" internalName="gameplay_persistence_raid" category="Inaccessible areas" group="Gameplay Persistence" />
+  <Area id="4611686198771220221" name="" internalName="gameplay_persistence_flashpoint" category="Inaccessible areas" group="Gameplay Persistence" />
+  <Area id="4611686226355220643" name="" internalName="gameplay_persistence_republic_ship" category="Inaccessible areas" group="Gameplay Persistence" />
+  <Area id="4611686246575650631" name="" internalName="mini_flashpoint_cademimu" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686246575650677" name="" internalName="mini_flashpoint_colicoid" category="Group phases" group="Original flashpoints" />
+  <Area id="4611686255030930011" name="" internalName="pvp_denova2" category="Ground PvP" group="Warzones" />
+  <Area id="4611686255030931318" name="" internalName="raid_denova" category="Group phases" group="Operations" />
+  <Area id="4611686282649150465" name="" internalName="mak_main" category="Open world" group="Expansion planets" />
+  <Area id="4611686283647049729" name="" internalName="corelliadaily" category="Open world" group="Expansion planets" />
+  <Area id="4611686283648050177" name="" internalName="belsavisdaily" category="Open world" group="Expansion planets" />
+  <Area id="4611686283890770117" name="" internalName="ia_listening_post" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686284488750081" name="" internalName="regression_botworld_fleet1" category="Inaccessible areas" group="Regression Botworlds" />
+  <Area id="4611686284920210047" name="" internalName="hk_theoretikan" category="Group phases" group="Story" />
+  <Area id="4611686297362070013" name="" internalName="raid_gree_lair" category="Group phases" group="Lair operation bosses" />
+  <Area id="4611686298054484000" name="" internalName="ori_daily" category="Open world" group="Expansion planets" />
+  <Area id="4611686298054484002" name="" internalName="raid_ori_dreadpalace" category="Group phases" group="Operations" />
+  <Area id="4611686298054484003" name="" internalName="raid_ori_dreadfortress" category="Group phases" group="Operations" />
+  <Area id="4611686298214250068" name="" internalName="story_flashpoint_korriban" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686299739974000" name="" internalName="man_lobby" category="Open world" group="Expansion planets" />
+  <Area id="4611686300770584000" name="" internalName="stronghold_coruscant" category="Social areas" group="Strongholds" />
+  <Area id="4611686301174784000" name="" internalName="stronghold_nar_shaddaa" category="Social areas" group="Strongholds" />
+  <Area id="4611686301284054000" name="" internalName="stronghold_dromund_kaas" category="Social areas" group="Strongholds" />
+  <Area id="4611686303398684002" name="" internalName="zakuul" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686303418894000" name="" internalName="pvp_arena_rishi" category="Ground PvP" group="Arenas" />
+  <Area id="4611686303442284043" name="" internalName="pvp_yavin" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686303445284115" name="" internalName="stronghold_yavin_4" category="Social areas" group="Strongholds" />
+  <Area id="4611686303487294081" name="" internalName="raid_zio_lair" category="Group phases" group="Lair operation bosses" />
+  <Area id="4611686303496684000" name="" internalName="wild_space" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686303496684001" name="" internalName="dreamscape" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686303496684002" name="" internalName="haven" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686303496684003" name="" internalName="odessen" category="Open world" group="Expansion planets" />
+  <Area id="4611686303496684004" name="" internalName="tybere" category="Inaccessible areas" group="Empty areas" />
+  <Area id="4611686304016374002" name="" internalName="flashpoint_star_fortress" category="Group phases" group="Story" />
+  <Area id="4611686305473644000" name="" internalName="flashpoint_zakuul_arena" category="Group phases" group="Story" />
+  <Area id="4611686306083114002" name="" internalName="gravestone_season_2" category="Solo phases" group="KotET chapters" />
+  <Area id="4611686306303684010" name="" internalName="iokath" category="Solo phases" group="KotET chapters" />
+  <Area id="4611686306486974006" name="" internalName="nathema" category="Solo phases" group="KotET chapters" />
+  <Area id="4611686306720404000" name="" internalName="uprising_port_nowhere" category="Group phases" group="Uprisings" />
+  <Area id="4611686306720406649" name="" internalName="uprising_emperor" category="Group phases" group="Uprisings" />
+  <Area id="4611686306720409516" name="" internalName="uprising_station256" category="Group phases" group="Uprisings" />
+  <Area id="4611686306778614000" name="" internalName="uprising_rakata_prime" category="Group phases" group="Uprisings" />
+  <Area id="4611686306784644000" name="" internalName="uprising_denova_trench" category="Group phases" group="Uprisings" />
+  <Area id="4611686306856564000" name="" internalName="uprising_firefrost" category="Group phases" group="Uprisings" />
+  <Area id="4611686306929094010" name="" internalName="uprising_makeb" category="Group phases" group="Uprisings" />
+  <Area id="4611686307844944001" name="" internalName="umbara_flashpoint" category="Group phases" group="Story flashpoints" />
+  <Area id="4611686307922114000" name="" internalName="pvp_warzone_yavin" category="Ground PvP" group="Warzones" />
+  <Area id="4611686308451564000" name="" internalName="pvp_arena_beastpit" category="Ground PvP" group="Arenas" />
+  <Area id="4611686308968934000" name="" internalName="stronghold_rishi_pirate" category="Social areas" group="Strongholds" />
+  <Area id="4611686309279494000" name="" internalName="pvp_warzone_vandin" category="Ground PvP" group="Warzones" />
+  <Area id="4611686309294904008" name="" internalName="raid_ossus_lair" category="Group phases" group="Lair operation bosses" />
+  <Area id="4611686309684194006" name="" internalName="meksha_main" category="Open world" group="Expansion planets" />
+  <Area id="4611686309729425478" name="" internalName="dan_main" category="Open world" group="Event areas" />
+  <Area id="4611686309780404008" name="" internalName="raid_dxun" category="Group phases" group="Operations" />
+  <Area id="4611686309928804006" name="" internalName="corellia_flashpoint" category="Group phases" group="Story flashpoints" />
+  <Area id="4611686311118654000" name="" internalName="stronghold_fleet_imp" category="Social areas" group="Strongholds" />
+  <Area id="4611686311133891703" name="" internalName="stronghold_fleet_rep" category="Social areas" group="Strongholds" />
+  <Area id="4611686311383204000" name="" internalName="satele_plague_ship" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686311953834000" name="" internalName="story_flashpoint_sov" category="Group phases" group="Story flashpoints" />
+  <Area id="4611686312179844000" name="" internalName="dan_flashpoint" category="Group phases" group="Story flashpoints" />
+  <Area id="4611686312878824004" name="" internalName="raid_deepstation" category="Group phases" group="Operations" />
+  <Area id="4611686313016694000" name="" internalName="man_main" category="Open world" group="Expansion planets" />
+  <Area id="4611686313799334000" name="" internalName="elom_digsite" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686313826084003" name="" internalName="ruhnuk_main" category="Open world" group="Expansion planets" />
+  <Area id="4611686314443924000" name="" internalName="stronghold_meksha" category="Social areas" group="Strongholds" />
+  <Area id="4611686315446904000" name="" internalName="port_nowhere_74" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686315537964000" name="" internalName="ord_daily" category="Open world" group="Expansion planets" />
+  <Area id="4611686315702344000" name="" internalName="stronghold_copero" category="Social areas" group="Strongholds" />
+  <Area id="4611686315981804000" name="" internalName="heta_ship" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686315981804001" name="" internalName="hut_lz" category="Open world" group="Expansion planets" />
+  <Area id="4611686316093564000" name="" internalName="dan_spring_event" category="Open world" group="Event areas" />
+  <Area id="4611686316701274000" name="" internalName="elom_library" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686316702404000" name="" internalName="hoth_ship" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686316702404002" name="" internalName="ilum_lair_fortress" category="Group phases" group="Lair operation bosses" />
+  <Area id="4611686316702404003" name="" internalName="ilum_story_fortress" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686317241994000" name="" internalName="odessen_enigma" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611686317824084000" name="" internalName="dan_de_zone" category="Open world" group="Event areas" />
+  <Area id="4611686318920004001" name="" internalName="enigma_op" category="Group phases" group="Operations" />
+  <Area id="4611686332227680014" name="" internalName="pvp_denova" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686333791170830" name="" internalName="spc_m03h" category="Space combat" group="Heroic missions" />
+  <Area id="4611686333791171862" name="" internalName="spc_m04h" category="Space combat" group="Heroic missions" />
+  <Area id="4611686333791172308" name="" internalName="spc_m05h" category="Space combat" group="Heroic missions" />
+  <Area id="4611686333791173513" name="" internalName="spc_m07h" category="Space combat" group="Heroic missions" />
+  <Area id="4611686333791176416" name="" internalName="spc_m08h" category="Space combat" group="Heroic missions" />
+  <Area id="4611686333791178266" name="" internalName="spc_m09h" category="Space combat" group="Heroic missions" />
+  <Area id="4611686334178740000" name="" internalName="spc_m09_clone" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686334196290046" name="" internalName="zio_main" category="Open world" group="Expansion planets" />
+  <Area id="4611686334397610046" name="" internalName="qtr_flashpoint_czerka" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686334870800048" name="" internalName="gameplay_persistence_empty" category="Inaccessible areas" group="Gameplay Persistence" />
+  <Area id="4611686343808730000" name="" internalName="pvp_seline" category="Ground PvP" group="Warzones" />
+  <Area id="4611686344329300029" name="" internalName="raid_darvannis" category="Group phases" group="Operations" />
+  <Area id="4611686346500132760" name="" internalName="skr_arcanum" category="Group phases" group="Story" />
+  <Area id="4611686346640914630" name="" internalName="spc_pvp_001" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686347680497015" name="" internalName="raid_makeb_lair" category="Group phases" group="Lair operation bosses" />
+  <Area id="4611686348053967000" name="" internalName="story_flashpoint_tython" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686348107247000" name="" internalName="czk_flashpoint_1" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686348107247001" name="" internalName="czk_flashpoint_2" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686348107247003" name="" internalName="czk_flashpoint_lobby" category="Open world" group="Expansion planets" />
+  <Area id="4611686348149057001" name="" internalName="spvp_001" category="Space PvP" group="Galactic Starfighter" />
+  <Area id="4611686348220847000" name="" internalName="spvp_002" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686348261847000" name="" internalName="pvp_arena_tatooine" category="Ground PvP" group="Arenas" />
+  <Area id="4611686348301947000" name="" internalName="spvp_003" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686348324147018" name="" internalName="pvp_arena_makeb" category="Ground PvP" group="Arenas" />
+  <Area id="4611686348329727003" name="" internalName="pvp_arena_corellia" category="Ground PvP" group="Arenas" />
+  <Area id="4611686348392827004" name="" internalName="pvp_arena_spacegarage" category="Ground PvP" group="Arenas" />
+  <Area id="4611686349056137002" name="" internalName="man_flashpoint1" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686349159527001" name="" internalName="event_rakghoul" category="Open world" group="Event areas" />
+  <Area id="4611686349195367010" name="" internalName="daily_spc_kuat_drives" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686349453327000" name="" internalName="event_rakghoul_lair" category="Group phases" group="Lair operation bosses" />
+  <Area id="4611686349514817006" name="" internalName="pvp_warzone_quesh" category="Ground PvP" group="Warzones" />
+  <Area id="4611686350258187000" name="" internalName="spvp_002d" category="Space PvP" group="Galactic Starfighter" />
+  <Area id="4611686350299177000" name="" internalName="spvp_001dm" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686350302787022" name="" internalName="rkp_rakata_prime_flashpoint" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686350406667000" name="" internalName="spvp_001tdm" category="Space PvP" group="Galactic Starfighter" />
+  <Area id="4611686350406668428" name="" internalName="spvp_001_tutorial" category="Space PvP" group="Galactic Starfighter" />
+  <Area id="4611686350479757000" name="" internalName="housing_gallery" category="Inaccessible areas" group="Dev worlds" />
+  <Area id="4611686350594707000" name="" internalName="spvp_003d" category="Space PvP" group="Galactic Starfighter" />
+  <Area id="4611686350703857000" name="" internalName="spvp_002tdm" category="Space PvP" group="Galactic Starfighter" />
+  <Area id="4611686350919177000" name="" internalName="rishi_main_iteration" category="Open world" group="Expansion planets" />
+  <Area id="4611686350943797002" name="" internalName="raid_yav_temple_of_yavin" category="Group phases" group="Operations" />
+  <Area id="4611686350943797003" name="" internalName="story_flashpoint_battle_of_rishi" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686350943797004" name="" internalName="raid_rishi_storm_carrier" category="Group phases" group="Operations" />
+  <Area id="4611686351014277000" name="" internalName="spvp_003tdm" category="Space PvP" group="Galactic Starfighter" />
+  <Area id="4611686351101817002" name="" internalName="yav4_main" category="Open world" group="Expansion planets" />
+  <Area id="4611686351202427000" name="" internalName="story_flashpoint_blood_hunt" category="Group phases" group="Expansion flashpoints" />
+  <Area id="4611686351279967010" name="" internalName="stronghold_flagship_imp" category="Social areas" group="Guild flagships" />
+  <Area id="4611686351279967011" name="" internalName="stronghold_flagship_rep" category="Social areas" group="Guild flagships" />
+  <Area id="4611686351475197004" name="" internalName="stronghold_tatooine" category="Social areas" group="Strongholds" />
+  <Area id="4611686353542867000" name="" internalName="gravestone" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686353542867001" name="" internalName="rusted_skyscraper" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686353542867002" name="" internalName="endless_swamp" category="Inaccessible areas" group="Unfinished/abandoned areas" />
+  <Area id="4611686353542867004" name="" internalName="zakuul_city" category="Open world" group="Expansion planets" />
+  <Area id="4611686354293547000" name="" internalName="odessen_trials" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686354354137004" name="" internalName="darvannis" category="Open world" group="Expansion planets" />
+  <Area id="4611686354954347004" name="" internalName="pvp_odessen" category="Ground PvP" group="Warzones" />
+  <Area id="4611686355047967000" name="" internalName="voss" category="Solo phases" group="KotET chapters" />
+  <Area id="4611686355156337016" name="" internalName="vandin" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686355809927011" name="" internalName="coil" category="Solo phases" group="KotFE chapters" />
+  <Area id="4611686356033007000" name="" internalName="dromund_kaas_expanse" category="Solo phases" group="KotET chapters" />
+  <Area id="4611686356345607000" name="" internalName="odessen_assault" category="Solo phases" group="KotET chapters" />
+  <Area id="4611686356362167000" name="" internalName="zakuul_penthouse" category="Solo phases" group="KotET chapters" />
+  <Area id="4611686356475097000" name="" internalName="zakuul_spire" category="Solo phases" group="KotET chapters" />
+  <Area id="4611686356541137002" name="" internalName="ord_volcano" category="Group phases" group="Uprisings" />
+  <Area id="4611686356715258910" name="" internalName="uprising_tatooine" category="Group phases" group="Uprisings" />
+  <Area id="4611686356814727000" name="" internalName="uprising_works" category="Group phases" group="Uprisings" />
+  <Area id="4611686357334867000" name="" internalName="raid_iok" category="Group phases" group="Operations" />
+  <Area id="4611686357389147000" name="" internalName="iokath_daily" category="Open world" group="Expansion planets" />
+  <Area id="4611686357802307000" name="" internalName="stronghold_man" category="Social areas" group="Strongholds" />
+  <Area id="4611686358022527001" name="" internalName="copero" category="Group phases" group="Story flashpoints" />
+  <Area id="4611686358155127000" name="" internalName="stronghold_umbara" category="Social areas" group="Strongholds" />
+  <Area id="4611686358368677004" name="" internalName="nathema_flashpoint" category="Group phases" group="Story flashpoints" />
+  <Area id="4611686358907337000" name="" internalName="ossus_main" category="Open world" group="Expansion planets" />
+  <Area id="4611686359491197003" name="" internalName="onderon_main" category="Open world" group="Expansion planets" />
+  <Area id="4611686359654927000" name="" internalName="stronghold_alderaan" category="Social areas" group="Strongholds" />
+  <Area id="4611686359685887000" name="" internalName="pvp_arena_onderon" category="Ground PvP" group="Arenas" />
+  <Area id="4611686359978727001" name="" internalName="elom_flashpoint" category="Group phases" group="Story flashpoints" />
+  <Area id="4611687148589260057" name="" internalName="raid_asation" category="Group phases" group="Operations" />
+  <Area id="4611690220433140002" name="" internalName="gsi_fleet_ship" category="Solo phases" group="Other areas" />
+  <Area id="4611690220438330006" name="" internalName="balance_mindscape" category="Solo phases" group="Other areas" />
+  <Area id="4611690221946290005" name="" internalName="voss_reconstruction" category="Open world" group="Expansion planets" />
+  <Area id="4611690221961650000" name="" internalName="voss_flashpoint" category="Group phases" group="Story flashpoints" />
+  <Area id="4611690224814280000" name="" internalName="stronghold_dantooine" category="Social areas" group="Strongholds" />
+  <Area id="4611690224900330001" name="" internalName="khar_main" category="Solo phases" group="Post-Zakuul story" />
+  <Area id="4611690226560620001" name="" internalName="ryloth_main" category="Open world" group="Expansion planets" />
+</AreaNames>

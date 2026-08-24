@@ -190,7 +190,7 @@
             this.btnToggleDBO.Name = "btnToggleDBO";
             this.btnToggleDBO.Size = new System.Drawing.Size(126, 27);
             this.btnToggleDBO.TabIndex = 3;
-            this.btnToggleDBO.Text = "Hide DBO";
+            this.btnToggleDBO.Text = "Show DBO";
             this.btnToggleDBO.UseVisualStyleBackColor = true;
             this.btnToggleDBO.Click += new System.EventHandler(this.BtnToggleDBO_Click);
             // 

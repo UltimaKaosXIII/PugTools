@@ -21,11 +21,16 @@ namespace PugTools {
     private Dictionary<String, NodeAsset> _assetDict;
     private readonly String _assetsLocation;
     private readonly Boolean _assetsUsePts;
+    private readonly String _previousAssetsLocation;
+    private readonly Boolean _previousAssetsUsePts;
+    private readonly Boolean _compareNodes;
     private Boolean _buildCsv;
     private Boolean _closing;
     private Boolean _collapsed;
     private Assets _currentAssets;
     private DataObjectModel _currentDom;
+    private Assets _previousAssets;
+    private DataObjectModel _previousDom;
     private String[] _current; // 0 = Item, 1 = Node, 2 = Parent.
     private String _currentTreeNode;
     private Dictionary<String, String> _customNodeSort;
@@ -34,6 +39,7 @@ namespace PugTools {
     private DataTable _dataTable;
     private Boolean _filter;
     private Dictionary<String, DomType> _nodeDict;
+    private Dictionary<String, DomType> _previousNodeDict;
     private TreeNode[] _nodeMatch;
     private HashSet<String> _outputData;
     private List<NodeOutput> _outputList;
@@ -43,7 +49,9 @@ namespace PugTools {
     #endregion
 
     #region NodeBrowser
-    internal NodeBrowser(String assetLocation, Boolean usePTS, String extractLocation) {
+    internal NodeBrowser(String assetLocation, Boolean usePTS, String extractLocation,
+                         String previousAssetLocation = null, Boolean previousUsePTS = false,
+                         Boolean compareNodes = false) {
       if (extractLocation == null) throw new ArgumentNullException(nameof(extractLocation));
 
       InitializeComponent();
@@ -51,6 +59,9 @@ namespace PugTools {
 
       _assetsLocation = assetLocation;
       _assetsUsePts = usePTS;
+      _previousAssetsLocation = previousAssetLocation;
+      _previousAssetsUsePts = previousUsePTS;
+      _compareNodes = compareNodes && !String.IsNullOrWhiteSpace(previousAssetLocation);
 
       using System.IO.StringReader stringReader =
         new System.IO.StringReader(Properties.Resources.CustomNodeSorting);
@@ -116,6 +127,9 @@ namespace PugTools {
       _assetDict = null;
       _currentAssets = null;
       _currentDom = null;
+      _previousAssets = null;
+      _previousDom = null;
+      _previousNodeDict = null;
       _customNodeSort = null;
       _customRoots = null;
       _dataTable = null;
@@ -147,6 +161,12 @@ namespace PugTools {
 
       _currentAssets = AssetHandler.Instance.GetCurrentAssets(_assetsLocation, _assetsUsePts);
       _currentDom = DomHandler.Instance.GetCurrentDOM(_currentAssets);
+
+      if (_compareNodes) {
+        _previousAssets =
+          AssetHandler.Instance.GetPreviousAssets(_previousAssetsLocation, _previousAssetsUsePts);
+        _previousDom = DomHandler.Instance.GetPreviousDOM(_previousAssets);
+      }
     }
     private void BackgroundWorker1Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (_closing) return;
@@ -160,6 +180,8 @@ namespace PugTools {
       };
 
       _currentDom.NodeLookup.TryGetValue(typeof(GomObject), out _nodeDict);
+      if (_compareNodes && _previousDom != null)
+        _previousDom.NodeLookup.TryGetValue(typeof(GomObject), out _previousNodeDict);
 
       ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Continuous);
       StatusLabel1Text("Loading Nodes ...");
@@ -171,6 +193,11 @@ namespace PugTools {
     }
     private void BackgroundWorker2Run(Object sender, DoWorkEventArgs e) {
       if (_closing) return;
+
+      if (_compareNodes && _previousNodeDict != null) {
+        BuildCompareNodeTree();
+        return;
+      }
 
       HashSet<String> allDirs = new HashSet<String>();
       HashSet<String> nodeDirs = new HashSet<String>();
@@ -249,6 +276,165 @@ namespace PugTools {
         }
       }
     }
+    private void BuildCompareNodeTree() {
+      _assetDict = new Dictionary<String, NodeAsset>();
+
+      const String rootId = "/root";
+      const String newRoot = "/root/new";
+      const String changedRoot = "/root/changed";
+      const String removedRoot = "/root/removed";
+
+      Int32 newCount = 0;
+      Int32 changedCount = 0;
+      Int32 removedCount = 0;
+      HashSet<String> directoryIds = new HashSet<String>(StringComparer.Ordinal);
+
+      HashSet<String> names = new HashSet<String>(StringComparer.Ordinal);
+      if (_nodeDict != null) names.UnionWith(_nodeDict.Keys);
+      if (_previousNodeDict != null) names.UnionWith(_previousNodeDict.Keys);
+
+      Int32 done = 0;
+      Int32 total = Math.Max(1, names.Count);
+      foreach (String name in names.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) {
+        if (_closing) return;
+
+        GomObject current = null;
+        GomObject previous = null;
+        if (_nodeDict != null && _nodeDict.TryGetValue(name, out DomType currentType))
+          current = currentType as GomObject;
+        if (_previousNodeDict != null && _previousNodeDict.TryGetValue(name, out DomType previousType))
+          previous = previousType as GomObject;
+
+        BuildFileState state;
+        GomObject displayObject;
+        String categoryRoot;
+        if (current == null && previous != null) {
+          state = BuildFileState.Removed;
+          displayObject = previous;
+          categoryRoot = removedRoot;
+          removedCount++;
+        } else if (current != null && previous == null) {
+          state = BuildFileState.New;
+          displayObject = current;
+          categoryRoot = newRoot;
+          newCount++;
+        } else if (current != null && previous != null && NodeContentsDiffer(current, previous)) {
+          state = BuildFileState.Changed;
+          displayObject = current;
+          categoryRoot = changedRoot;
+          changedCount++;
+        } else {
+          done++;
+          backgroundWorker2.ReportProgress(done * 100 / total);
+          continue;
+        }
+
+        GetNodeTreeLocation(name, out String logicalParent, out String displayName);
+        String parentId = logicalParent == "/"
+          ? categoryRoot
+          : categoryRoot + "/" + logicalParent;
+        String itemId = categoryRoot + "/" + name;
+        if (_assetDict.ContainsKey(itemId)) itemId += " [node]";
+
+        NodeAsset asset = new NodeAsset(itemId, parentId, displayName, displayObject) {
+          compareState = state
+        };
+        _assetDict.Add(itemId, asset);
+
+        AddCompareDirectories(categoryRoot, logicalParent, directoryIds);
+        done++;
+        backgroundWorker2.ReportProgress(done * 100 / total);
+      }
+
+      _assetDict[rootId] = new NodeAsset(rootId, String.Empty, "Root", null);
+      _assetDict[changedRoot] = new NodeAsset(
+        changedRoot, rootId, "Changed Nodes (" + changedCount.ToString("N0") + ")", null
+      );
+      _assetDict[newRoot] = new NodeAsset(
+        newRoot, rootId, "New Nodes (" + newCount.ToString("N0") + ")", null
+      );
+      _assetDict[removedRoot] = new NodeAsset(
+        removedRoot, rootId, "Removed Nodes (" + removedCount.ToString("N0") + ")", null
+      );
+
+      foreach (String dirId in directoryIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) {
+        if (_assetDict.ContainsKey(dirId)) continue;
+
+        Int32 slash = dirId.LastIndexOf('/');
+        String categoryRoot = dirId.StartsWith(changedRoot + "/", StringComparison.OrdinalIgnoreCase)
+          ? changedRoot
+          : dirId.StartsWith(newRoot + "/", StringComparison.OrdinalIgnoreCase)
+            ? newRoot
+            : removedRoot;
+        String logical = slash >= 0 ? dirId.Substring(slash + 1) : dirId;
+        Int32 dot = logical.LastIndexOf('.');
+        String display = dot >= 0 ? logical.Substring(dot + 1) : logical;
+        String parentLogical = dot >= 0 ? logical.Substring(0, dot) : String.Empty;
+        String parentId = String.IsNullOrEmpty(parentLogical)
+          ? categoryRoot
+          : categoryRoot + "/" + parentLogical;
+
+        _assetDict.Add(dirId, new NodeAsset(dirId, parentId, display, null));
+      }
+
+      backgroundWorker2.ReportProgress(100);
+    }
+
+    private void AddCompareDirectories(String categoryRoot, String logicalParent,
+                                       HashSet<String> directories) {
+      if (String.IsNullOrEmpty(logicalParent) || logicalParent == "/") return;
+
+      String[] parts = logicalParent.Split('.');
+      for (Int32 i = 1; i <= parts.Length; i++) {
+        String logical = String.Join(".", parts, 0, i);
+        directories.Add(categoryRoot + "/" + logical);
+      }
+    }
+
+    private void GetNodeTreeLocation(String name, out String parent, out String display) {
+      parent = "/";
+      display = name;
+
+      if (name.Contains(".")) {
+        String[] parts = name.Split('.');
+        parent = String.Join(".", parts.Take(parts.Length - 1));
+        display = parts.Last();
+      }
+
+      if (!_customSort || _customNodeSort == null || _customNodeSort.Count == 0) return;
+
+      KeyValuePair<String, String> custom = _customNodeSort
+        .FirstOrDefault(item => name.StartsWith(item.Key, StringComparison.Ordinal));
+      if (!String.IsNullOrEmpty(custom.Key)) {
+        if (parent == "/")
+          parent = custom.Value;
+        else
+          parent = custom.Value + "." + parent;
+      }
+    }
+
+    private static Boolean NodeContentsDiffer(GomObject current, GomObject previous) {
+      if (current == null || previous == null) return true;
+      if (current.Checksum != previous.Checksum) return true;
+      if (current.ObjectSizeInFile != previous.ObjectSizeInFile
+          || current.NumGlommed != previous.NumGlommed
+          || current.InstanceType != previous.InstanceType
+          || current.NumFields != previous.NumFields)
+        return true;
+
+      // Compressed nodes have an Adler32 checksum calculated from their stored data.
+      // If it matches and the structural metadata matches, no decompression is needed.
+      if (current.Checksum != 0) return false;
+
+      try {
+        return !current.GetRawUncompressedNode().SequenceEqual(previous.GetRawUncompressedNode());
+      }
+      catch {
+        // A node that cannot be compared safely should be surfaced rather than hidden.
+        return true;
+      }
+    }
+
     private void BackgroundWorker2Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (_closing) return;
 
@@ -274,7 +460,11 @@ namespace PugTools {
       if (_closing) return;
 
       ProgressBarHide();
-      StatusLabel1Text("Loading Complete.");
+      StatusLabel1Text(
+        _compareNodes
+          ? "Comparison loaded. Showing New, Changed and Removed nodes only."
+          : "Loading Complete."
+      );
       ProgressBarValue(0);
       ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Continuous);
 
@@ -721,6 +911,8 @@ namespace PugTools {
       } else {
         if (UInt64.TryParse(txtSearch.Text, out UInt64 nodeId)) {
           GomObject node = _currentDom.GetObject(nodeId);
+          if (node == null && _compareNodes && _previousDom != null)
+            node = _previousDom.GetObject(nodeId);
 
           if (node != null) {
             txtSearch.Text = node.Name;
@@ -798,7 +990,16 @@ namespace PugTools {
       }
 
       TreeNode[] node = treeViewFast1.Nodes.Find(nodeString, true);
-      treeViewFast1.SelectedNode = node.First();
+      if (node.Length == 0 && _compareNodes) {
+        String compareKey = _assetDict.Keys.FirstOrDefault(key =>
+          key.EndsWith("/" + nodeString, StringComparison.OrdinalIgnoreCase)
+        );
+        if (!String.IsNullOrEmpty(compareKey))
+          node = treeViewFast1.Nodes.Find(compareKey, true);
+      }
+
+      if (node.Length > 0)
+        treeViewFast1.SelectedNode = node.First();
     }
     private void ToolStripTextBox1KeyDown(Object sender, KeyEventArgs e) {
       if (e.KeyCode == Keys.Enter && !String.IsNullOrEmpty(toolStripTextBox1.Text)) {
@@ -865,7 +1066,8 @@ namespace PugTools {
       TreeNode node = treeViewFast1.SelectedNode;
       NodeAsset asset = (NodeAsset)node.Tag;
 
-      Text = "Node Browser - " + asset.id.ToString();
+      String actualNodeName = asset?.Obj?.Name ?? asset?.displayName ?? asset?.id;
+      Text = "Node Browser - " + actualNodeName;
 
       _collapsed = false;
       btnToggleCollapse.Enabled = true;
@@ -903,14 +1105,20 @@ namespace PugTools {
         treeViewGrid1.TopItemIndex = 0;
       }
 
-      StatusLabel1Text(asset.id);
+      StatusLabel1Text(
+        asset.compareState != BuildFileState.None
+          ? asset.compareState + " Node: " + actualNodeName
+          : asset.id
+      );
 
       _dataTable = new DataTable();
       _dataTable.Columns.Add("Property");
       _dataTable.Columns.Add("Value");
-      _dataTable.Rows.Add(new String[] { "Current Node", asset.id });
+      _dataTable.Rows.Add(new String[] { "Node", actualNodeName });
+      if (asset.compareState != BuildFileState.None)
+        _dataTable.Rows.Add(new String[] { "Compare State", asset.compareState.ToString() });
 
-      _currentTreeNode = asset.id;
+      _currentTreeNode = actualNodeName;
       dataGridView1.DataSource = _dataTable;
       dataGridView1.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.AllCells;
 

@@ -39,9 +39,11 @@
 	<ItemGroup>
 		<Content Include="Hash\hashes_filename.bin.gz" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Shaders\GR2.fx" CopyToOutputDirectory="PreserveNewest" />
+		<Content Include="Shaders\World.fx" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\packed_codebooks_aoTuV_603.bin" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\revorb.exe" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\ww2ogg.exe" CopyToOutputDirectory="PreserveNewest" />
+		<Content Include="WorldAreaNames.xml" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 	<ItemGroup>
@@ -62,6 +64,9 @@
 		</Reference>
 		<Reference Include="SlimDX">
 			<HintPath>..\..\Libraries\SlimDX.NET\Include\SlimDX.dll</HintPath>
+		</Reference>
+		<Reference Include="SpriteTextRenderer">
+			<HintPath>..\..\Libraries\SlimDX.NET\Include\SpriteTextRenderer.dll</HintPath>
 		</Reference>
 	</ItemGroup>
 
@@ -111,6 +116,9 @@
 
 		<MakeDir Condition="!Exists('$(BinDir)Shaders')" Directories="$(BinDir)Shaders" />
 		<Copy SourceFiles="$(ProjectDir)Shaders\GR2.fx" DestinationFolder="$(BinDir)Shaders" />
+		<Copy SourceFiles="$(ProjectDir)Shaders\World.fx" DestinationFolder="$(BinDir)Shaders" />
+
+		<Copy SourceFiles="$(ProjectDir)WorldAreaNames.xml" DestinationFolder="$(BinDir)" SkipUnchangedFiles="true" />
 
 		<MakeDir Condition="!Exists('$(BinDir)Tools')" Directories="$(BinDir)Tools" />
 		<Copy SourceFiles="@(Tools)" DestinationFolder="$(BinDir)Tools" />
