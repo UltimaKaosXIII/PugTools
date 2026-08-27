@@ -1,4 +1,4 @@
-namespace PugTools {
+﻿namespace PugTools {
   partial class Tools {
     /// <summary>
     /// Required designer variable.
@@ -86,9 +86,9 @@ namespace PugTools {
       gbxTools.SuspendLayout();
       gbxFQN.SuspendLayout();
       SuspendLayout();
-      // 
+      //
       // chkAssetsUsePTS
-      // 
+      //
       chkAssetsUsePTS.AutoSize = true;
       chkAssetsUsePTS.Location = new System.Drawing.Point(513, 23);
       chkAssetsUsePTS.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
@@ -99,9 +99,9 @@ namespace PugTools {
       toolTip1.SetToolTip(chkAssetsUsePTS, "Loads PTS assets if checked.");
       chkAssetsUsePTS.UseVisualStyleBackColor = true;
       chkAssetsUsePTS.CheckedChanged += ChkUsePTSAssets_Changed;
-      // 
+      //
       // chkPrevAssetsUsePTS
-      // 
+      //
       chkPrevAssetsUsePTS.AutoSize = true;
       chkPrevAssetsUsePTS.Location = new System.Drawing.Point(513, 51);
       chkPrevAssetsUsePTS.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
@@ -112,9 +112,9 @@ namespace PugTools {
       toolTip1.SetToolTip(chkPrevAssetsUsePTS, "Loads PTS assets if checked.");
       chkPrevAssetsUsePTS.UseVisualStyleBackColor = true;
       chkPrevAssetsUsePTS.CheckedChanged += ChkPrevUsePTSAssets_Changed;
-      // 
+      //
       // btnUnloadAllData
-      // 
+      //
       btnUnloadAllData.Location = new System.Drawing.Point(568, 14);
       btnUnloadAllData.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnUnloadAllData.Name = "btnUnloadAllData";
@@ -124,9 +124,9 @@ namespace PugTools {
       toolTip1.SetToolTip(btnUnloadAllData, "Unload current DOM and assets.");
       btnUnloadAllData.UseVisualStyleBackColor = true;
       btnUnloadAllData.Click += BtnUnloadAllData_Click;
-      // 
+      //
       // chkVerbose
-      // 
+      //
       chkVerbose.AutoSize = true;
       chkVerbose.Checked = true;
       chkVerbose.CheckState = System.Windows.Forms.CheckState.Checked;
@@ -139,9 +139,9 @@ namespace PugTools {
       toolTip1.SetToolTip(chkVerbose, "Export all data.");
       chkVerbose.UseVisualStyleBackColor = true;
       chkVerbose.CheckedChanged += ChkVerbose_Changed;
-      // 
+      //
       // chkBuildCompare
-      // 
+      //
       chkBuildCompare.AutoSize = true;
       chkBuildCompare.Location = new System.Drawing.Point(181, 23);
       chkBuildCompare.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
@@ -152,9 +152,9 @@ namespace PugTools {
       toolTip1.SetToolTip(chkBuildCompare, "Generate an output of the changes between current and the previous builds.");
       chkBuildCompare.UseVisualStyleBackColor = true;
       chkBuildCompare.CheckedChanged += ChkBuildCompare_Changed;
-      // 
+      //
       // chkRemoveElements
-      // 
+      //
       chkRemoveElements.AutoSize = true;
       chkRemoveElements.Checked = true;
       chkRemoveElements.CheckState = System.Windows.Forms.CheckState.Checked;
@@ -167,9 +167,9 @@ namespace PugTools {
       toolTip1.SetToolTip(chkRemoveElements, "Remove unchanged elements.");
       chkRemoveElements.UseVisualStyleBackColor = true;
       chkRemoveElements.CheckedChanged += ChkRemoveElements_Changed;
-      // 
+      //
       // btnExtract
-      // 
+      //
       btnExtract.Location = new System.Drawing.Point(187, 52);
       btnExtract.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnExtract.Name = "btnExtract";
@@ -179,9 +179,9 @@ namespace PugTools {
       toolTip1.SetToolTip(btnExtract, "Opens the extraction dialog to extract data and compare builds.");
       btnExtract.UseVisualStyleBackColor = true;
       btnExtract.Click += BtnExtract_Click;
-      // 
+      //
       // btnSearch
-      // 
+      //
       btnSearch.Location = new System.Drawing.Point(204, 18);
       btnSearch.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnSearch.Name = "btnSearch";
@@ -191,9 +191,9 @@ namespace PugTools {
       toolTip1.SetToolTip(btnSearch, "Perform search");
       btnSearch.UseVisualStyleBackColor = true;
       btnSearch.Click += BtnSearch_Click;
-      // 
+      //
       // gbxPath
-      // 
+      //
       gbxPath.Controls.Add(lblAssetsPath);
       gbxPath.Controls.Add(txtAssetsPath);
       gbxPath.Controls.Add(btnAssetsPath);
@@ -216,28 +216,28 @@ namespace PugTools {
       gbxPath.TabIndex = 46;
       gbxPath.TabStop = false;
       gbxPath.Text = "Path Information";
-      // 
+      //
       // lblAssetsPath
-      // 
+      //
       lblAssetsPath.AutoSize = true;
       lblAssetsPath.Location = new System.Drawing.Point(7, 18);
       lblAssetsPath.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
       lblAssetsPath.Name = "lblAssetsPath";
       lblAssetsPath.Size = new System.Drawing.Size(71, 15);
       lblAssetsPath.TabIndex = 3;
-      lblAssetsPath.Text = "Asset Folder";
-      // 
+      lblAssetsPath.Text = "Game Folder";
+      //
       // txtAssetsPath
-      // 
+      //
       txtAssetsPath.Location = new System.Drawing.Point(110, 15);
       txtAssetsPath.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       txtAssetsPath.Name = "txtAssetsPath";
       txtAssetsPath.Size = new System.Drawing.Size(314, 23);
       txtAssetsPath.TabIndex = 0;
       txtAssetsPath.TextChanged += TxtAssetsPath_Changed;
-      // 
+      //
       // btnAssetsPath
-      // 
+      //
       btnAssetsPath.Image = Properties.Resources.ShieldRed;
       btnAssetsPath.Location = new System.Drawing.Point(432, 14);
       btnAssetsPath.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
@@ -248,28 +248,28 @@ namespace PugTools {
       btnAssetsPath.TextImageRelation = System.Windows.Forms.TextImageRelation.ImageBeforeText;
       btnAssetsPath.UseVisualStyleBackColor = true;
       btnAssetsPath.Click += BtnAssetsPath_Click;
-      // 
+      //
       // lblPrevAssetsPath
-      // 
+      //
       lblPrevAssetsPath.AutoSize = true;
       lblPrevAssetsPath.Location = new System.Drawing.Point(7, 47);
       lblPrevAssetsPath.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
       lblPrevAssetsPath.Name = "lblPrevAssetsPath";
       lblPrevAssetsPath.Size = new System.Drawing.Size(97, 15);
       lblPrevAssetsPath.TabIndex = 43;
-      lblPrevAssetsPath.Text = "Prev Asset Folder";
-      // 
+      lblPrevAssetsPath.Text = "Prev Game";
+      //
       // txtPrevAssetsPath
-      // 
+      //
       txtPrevAssetsPath.Location = new System.Drawing.Point(110, 44);
       txtPrevAssetsPath.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       txtPrevAssetsPath.Name = "txtPrevAssetsPath";
       txtPrevAssetsPath.Size = new System.Drawing.Size(314, 23);
       txtPrevAssetsPath.TabIndex = 3;
       txtPrevAssetsPath.TextChanged += TxtPrevAssetsPath_Changed;
-      // 
+      //
       // btnPrevAssetsPath
-      // 
+      //
       btnPrevAssetsPath.Image = Properties.Resources.ShieldGreen;
       btnPrevAssetsPath.Location = new System.Drawing.Point(432, 43);
       btnPrevAssetsPath.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
@@ -280,9 +280,9 @@ namespace PugTools {
       btnPrevAssetsPath.TextImageRelation = System.Windows.Forms.TextImageRelation.ImageBeforeText;
       btnPrevAssetsPath.UseVisualStyleBackColor = true;
       btnPrevAssetsPath.Click += BtnPrevAssetsPath_Click;
-      // 
+      //
       // lblExtractPath
-      // 
+      //
       lblExtractPath.AutoSize = true;
       lblExtractPath.Location = new System.Drawing.Point(7, 76);
       lblExtractPath.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
@@ -290,18 +290,18 @@ namespace PugTools {
       lblExtractPath.Size = new System.Drawing.Size(78, 15);
       lblExtractPath.TabIndex = 35;
       lblExtractPath.Text = "Extract Folder";
-      // 
+      //
       // txtExtractPath
-      // 
+      //
       txtExtractPath.Location = new System.Drawing.Point(110, 73);
       txtExtractPath.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       txtExtractPath.Name = "txtExtractPath";
       txtExtractPath.Size = new System.Drawing.Size(314, 23);
       txtExtractPath.TabIndex = 6;
       txtExtractPath.TextChanged += TxtExtractPath_Changed;
-      // 
+      //
       // btnExtractPath
-      // 
+      //
       btnExtractPath.Location = new System.Drawing.Point(432, 72);
       btnExtractPath.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnExtractPath.Name = "btnExtractPath";
@@ -310,9 +310,9 @@ namespace PugTools {
       btnExtractPath.Text = "Select";
       btnExtractPath.UseVisualStyleBackColor = true;
       btnExtractPath.Click += BtnExtractPath_Click;
-      // 
+      //
       // chkCrossLinkDom
-      // 
+      //
       chkCrossLinkDom.AutoSize = true;
       chkCrossLinkDom.Location = new System.Drawing.Point(513, 80);
       chkCrossLinkDom.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
@@ -322,9 +322,9 @@ namespace PugTools {
       chkCrossLinkDom.Text = "X-Lnk";
       chkCrossLinkDom.UseVisualStyleBackColor = true;
       chkCrossLinkDom.CheckedChanged += ChkCrossLinkDom_Changed;
-      // 
+      //
       // chkSmartLinkDom
-      // 
+      //
       chkSmartLinkDom.AutoSize = true;
       chkSmartLinkDom.Location = new System.Drawing.Point(573, 80);
       chkSmartLinkDom.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
@@ -333,9 +333,9 @@ namespace PugTools {
       chkSmartLinkDom.TabIndex = 47;
       chkSmartLinkDom.Text = "Smart-Lnk";
       chkSmartLinkDom.UseVisualStyleBackColor = true;
-      // 
+      //
       // gbxFormat
-      // 
+      //
       gbxFormat.Controls.Add(cbxLanguage);
       gbxFormat.Controls.Add(lblLanguage);
       gbxFormat.Controls.Add(cbxExtractFormat);
@@ -352,9 +352,9 @@ namespace PugTools {
       gbxFormat.TabIndex = 24;
       gbxFormat.TabStop = false;
       gbxFormat.Text = "Extract Format";
-      // 
+      //
       // cbxLanguage
-      // 
+      //
       cbxLanguage.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
       cbxLanguage.FormattingEnabled = true;
       cbxLanguage.Items.AddRange(new object[] { "en-us", "de-de", "fr-fr" });
@@ -364,9 +364,9 @@ namespace PugTools {
       cbxLanguage.Size = new System.Drawing.Size(69, 23);
       cbxLanguage.TabIndex = 16;
       cbxLanguage.SelectedIndexChanged += CbxLanguage_Changed;
-      // 
+      //
       // lblLanguage
-      // 
+      //
       lblLanguage.AutoSize = true;
       lblLanguage.Location = new System.Drawing.Point(408, 18);
       lblLanguage.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
@@ -374,9 +374,9 @@ namespace PugTools {
       lblLanguage.Size = new System.Drawing.Size(62, 15);
       lblLanguage.TabIndex = 17;
       lblLanguage.Text = "Language:";
-      // 
+      //
       // cbxExtractFormat
-      // 
+      //
       cbxExtractFormat.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
       cbxExtractFormat.FormattingEnabled = true;
       cbxExtractFormat.Items.AddRange(new object[] { "JSON", "SQL", "TXT", "XML" });
@@ -386,9 +386,9 @@ namespace PugTools {
       cbxExtractFormat.Size = new System.Drawing.Size(100, 23);
       cbxExtractFormat.TabIndex = 15;
       cbxExtractFormat.SelectedIndexChanged += CbxExtractFormat_Changed;
-      // 
+      //
       // lblVersion
-      // 
+      //
       lblVersion.AutoSize = true;
       lblVersion.Location = new System.Drawing.Point(546, 18);
       lblVersion.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
@@ -396,18 +396,18 @@ namespace PugTools {
       lblVersion.Size = new System.Drawing.Size(45, 15);
       lblVersion.TabIndex = 13;
       lblVersion.Text = "Version";
-      // 
+      //
       // txtVersion
-      // 
+      //
       txtVersion.Location = new System.Drawing.Point(600, 15);
       txtVersion.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       txtVersion.Name = "txtVersion";
       txtVersion.Size = new System.Drawing.Size(72, 23);
       txtVersion.TabIndex = 12;
       txtVersion.TextChanged += TxtVersion_Changed;
-      // 
+      //
       // gbxLogs
-      // 
+      //
       gbxLogs.Controls.Add(listBox1);
       gbxLogs.Controls.Add(listBox2);
       gbxLogs.Location = new System.Drawing.Point(14, 171);
@@ -418,9 +418,9 @@ namespace PugTools {
       gbxLogs.TabIndex = 47;
       gbxLogs.TabStop = false;
       gbxLogs.Text = "Logs";
-      // 
+      //
       // listBox1
-      // 
+      //
       listBox1.FormattingEnabled = true;
       listBox1.ItemHeight = 15;
       listBox1.Location = new System.Drawing.Point(12, 21);
@@ -430,9 +430,9 @@ namespace PugTools {
       listBox1.Size = new System.Drawing.Size(375, 184);
       listBox1.TabIndex = 0;
       listBox1.TabStop = false;
-      // 
+      //
       // listBox2
-      // 
+      //
       listBox2.FormattingEnabled = true;
       listBox2.ItemHeight = 15;
       listBox2.Location = new System.Drawing.Point(12, 212);
@@ -441,9 +441,9 @@ namespace PugTools {
       listBox2.Size = new System.Drawing.Size(375, 244);
       listBox2.TabIndex = 0;
       listBox2.TabStop = false;
-      // 
+      //
       // gbxSQL
-      // 
+      //
       gbxSQL.Controls.Add(lblSqlAddress);
       gbxSQL.Controls.Add(txtSqlAddress);
       gbxSQL.Controls.Add(lblSqlName);
@@ -461,9 +461,9 @@ namespace PugTools {
       gbxSQL.TabIndex = 26;
       gbxSQL.TabStop = false;
       gbxSQL.Text = "Database Options";
-      // 
+      //
       // lblSqlAddress
-      // 
+      //
       lblSqlAddress.AutoSize = true;
       lblSqlAddress.Location = new System.Drawing.Point(9, 18);
       lblSqlAddress.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
@@ -471,18 +471,18 @@ namespace PugTools {
       lblSqlAddress.Size = new System.Drawing.Size(80, 15);
       lblSqlAddress.TabIndex = 10;
       lblSqlAddress.Text = "DB IP Address";
-      // 
+      //
       // txtSqlAddress
-      // 
+      //
       txtSqlAddress.Location = new System.Drawing.Point(9, 37);
       txtSqlAddress.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       txtSqlAddress.Name = "txtSqlAddress";
       txtSqlAddress.Size = new System.Drawing.Size(125, 23);
       txtSqlAddress.TabIndex = 5;
       txtSqlAddress.Text = "127.0.0.1";
-      // 
+      //
       // lblSqlName
-      // 
+      //
       lblSqlName.AutoSize = true;
       lblSqlName.Location = new System.Drawing.Point(142, 18);
       lblSqlName.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
@@ -490,18 +490,18 @@ namespace PugTools {
       lblSqlName.Size = new System.Drawing.Size(57, 15);
       lblSqlName.TabIndex = 11;
       lblSqlName.Text = "DB Name";
-      // 
+      //
       // txtSqlName
-      // 
+      //
       txtSqlName.Location = new System.Drawing.Point(142, 37);
       txtSqlName.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       txtSqlName.Name = "txtSqlName";
       txtSqlName.Size = new System.Drawing.Size(125, 23);
       txtSqlName.TabIndex = 8;
       txtSqlName.Text = "tor_dump";
-      // 
+      //
       // lblSqlUsername
-      // 
+      //
       lblSqlUsername.AutoSize = true;
       lblSqlUsername.Location = new System.Drawing.Point(9, 65);
       lblSqlUsername.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
@@ -509,18 +509,18 @@ namespace PugTools {
       lblSqlUsername.Size = new System.Drawing.Size(78, 15);
       lblSqlUsername.TabIndex = 6;
       lblSqlUsername.Text = "DB Username";
-      // 
+      //
       // txtSqlUsername
-      // 
+      //
       txtSqlUsername.Location = new System.Drawing.Point(9, 83);
       txtSqlUsername.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       txtSqlUsername.Name = "txtSqlUsername";
       txtSqlUsername.Size = new System.Drawing.Size(125, 23);
       txtSqlUsername.TabIndex = 6;
       txtSqlUsername.Text = "root";
-      // 
+      //
       // lblSqlPassword
-      // 
+      //
       lblSqlPassword.AutoSize = true;
       lblSqlPassword.Location = new System.Drawing.Point(142, 65);
       lblSqlPassword.Margin = new System.Windows.Forms.Padding(4, 0, 4, 0);
@@ -528,18 +528,18 @@ namespace PugTools {
       lblSqlPassword.Size = new System.Drawing.Size(75, 15);
       lblSqlPassword.TabIndex = 7;
       lblSqlPassword.Text = "DB Password";
-      // 
+      //
       // txtSqlPassword
-      // 
+      //
       txtSqlPassword.Location = new System.Drawing.Point(142, 83);
       txtSqlPassword.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       txtSqlPassword.Name = "txtSqlPassword";
       txtSqlPassword.PasswordChar = '*';
       txtSqlPassword.Size = new System.Drawing.Size(125, 23);
       txtSqlPassword.TabIndex = 7;
-      // 
+      //
       // btnToggleSql
-      // 
+      //
       btnToggleSql.Location = new System.Drawing.Point(142, 112);
       btnToggleSql.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnToggleSql.Name = "btnToggleSql";
@@ -548,9 +548,9 @@ namespace PugTools {
       btnToggleSql.Text = "Mysql Off";
       btnToggleSql.UseVisualStyleBackColor = true;
       btnToggleSql.Click += BtnToggleSql_Click;
-      // 
+      //
       // gbxExtract
-      // 
+      //
       gbxExtract.Controls.Add(lblExtractDesc);
       gbxExtract.Controls.Add(cbxExtractors);
       gbxExtract.Controls.Add(btnExtract);
@@ -562,9 +562,9 @@ namespace PugTools {
       gbxExtract.TabIndex = 31;
       gbxExtract.TabStop = false;
       gbxExtract.Text = "Extractors";
-      // 
+      //
       // lblExtractDesc
-      // 
+      //
       lblExtractDesc.AutoSize = true;
       lblExtractDesc.Cursor = System.Windows.Forms.Cursors.IBeam;
       lblExtractDesc.Location = new System.Drawing.Point(12, 16);
@@ -574,9 +574,9 @@ namespace PugTools {
       lblExtractDesc.Size = new System.Drawing.Size(258, 30);
       lblExtractDesc.TabIndex = 29;
       lblExtractDesc.Text = "Click and select what you want from the dialog window. The default is to dump everything.";
-      // 
+      //
       // cbxExtractors
-      // 
+      //
       cbxExtractors.BackColor = System.Drawing.SystemColors.ControlLightLight;
       cbxExtractors.DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList;
       cbxExtractors.FormattingEnabled = true;
@@ -586,9 +586,9 @@ namespace PugTools {
       cbxExtractors.Size = new System.Drawing.Size(167, 23);
       cbxExtractors.Sorted = true;
       cbxExtractors.TabIndex = 20;
-      // 
+      //
       // gbxTools
-      // 
+      //
       gbxTools.Controls.Add(btnAssetBrowser);
       gbxTools.Controls.Add(btnNodeBrowser);
       gbxTools.Controls.Add(btnModelBrowser);
@@ -603,9 +603,9 @@ namespace PugTools {
       gbxTools.TabIndex = 34;
       gbxTools.TabStop = false;
       gbxTools.Text = "Tools";
-      // 
+      //
       // btnAssetBrowser
-      // 
+      //
       btnAssetBrowser.Location = new System.Drawing.Point(7, 22);
       btnAssetBrowser.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnAssetBrowser.Name = "btnAssetBrowser";
@@ -614,9 +614,9 @@ namespace PugTools {
       btnAssetBrowser.Text = "Asset Browser";
       btnAssetBrowser.UseVisualStyleBackColor = true;
       btnAssetBrowser.Click += BtnAssetBrowser_Click;
-      // 
+      //
       // btnNodeBrowser
-      // 
+      //
       btnNodeBrowser.Location = new System.Drawing.Point(139, 22);
       btnNodeBrowser.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnNodeBrowser.Name = "btnNodeBrowser";
@@ -625,9 +625,9 @@ namespace PugTools {
       btnNodeBrowser.Text = "Node Browser";
       btnNodeBrowser.UseVisualStyleBackColor = true;
       btnNodeBrowser.Click += BtnNodeBrowser_Click;
-      // 
+      //
       // btnModelBrowser
-      // 
+      //
       btnModelBrowser.Location = new System.Drawing.Point(7, 55);
       btnModelBrowser.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnModelBrowser.Name = "btnModelBrowser";
@@ -636,9 +636,9 @@ namespace PugTools {
       btnModelBrowser.Text = "Model Browser";
       btnModelBrowser.UseVisualStyleBackColor = true;
       btnModelBrowser.Click += BtnModelBrowser_Click;
-      // 
+      //
       // btnWorldBrowser
-      // 
+      //
       btnWorldBrowser.Location = new System.Drawing.Point(139, 55);
       btnWorldBrowser.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnWorldBrowser.Name = "btnWorldBrowser";
@@ -647,9 +647,9 @@ namespace PugTools {
       btnWorldBrowser.Text = "World Browser";
       btnWorldBrowser.UseVisualStyleBackColor = true;
       btnWorldBrowser.Click += BtnWorldBrowser_Click;
-      // 
+      //
       // btnCreateSql
-      // 
+      //
       btnCreateSql.Location = new System.Drawing.Point(7, 89);
       btnCreateSql.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnCreateSql.Name = "btnCreateSql";
@@ -658,9 +658,9 @@ namespace PugTools {
       btnCreateSql.Text = "Create SQL";
       btnCreateSql.UseVisualStyleBackColor = true;
       btnCreateSql.Click += BtnCreateSql_Click;
-      // 
+      //
       // btnFileCompare
-      // 
+      //
       btnFileCompare.Location = new System.Drawing.Point(139, 89);
       btnFileCompare.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       btnFileCompare.Name = "btnFileCompare";
@@ -669,9 +669,9 @@ namespace PugTools {
       btnFileCompare.Text = "File Compare";
       btnFileCompare.UseVisualStyleBackColor = true;
       btnFileCompare.Click += BtnFileCompare_Click;
-      // 
+      //
       // gbxFQN
-      // 
+      //
       gbxFQN.Controls.Add(tbxFqnSearch);
       gbxFQN.Controls.Add(btnSearch);
       gbxFQN.Controls.Add(lblFqnDesc);
@@ -683,17 +683,17 @@ namespace PugTools {
       gbxFQN.TabIndex = 33;
       gbxFQN.TabStop = false;
       gbxFQN.Text = "FQN Search";
-      // 
+      //
       // tbxFqnSearch
-      // 
+      //
       tbxFqnSearch.Location = new System.Drawing.Point(10, 20);
       tbxFqnSearch.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       tbxFqnSearch.Name = "tbxFqnSearch";
       tbxFqnSearch.Size = new System.Drawing.Size(188, 23);
       tbxFqnSearch.TabIndex = 22;
-      // 
+      //
       // lblFqnDesc
-      // 
+      //
       lblFqnDesc.AutoSize = true;
       lblFqnDesc.Cursor = System.Windows.Forms.Cursors.IBeam;
       lblFqnDesc.Location = new System.Drawing.Point(7, 50);
@@ -704,18 +704,18 @@ namespace PugTools {
       lblFqnDesc.TabIndex = 26;
       lblFqnDesc.Text = "Be careful what you put in here. As it will search and output all occurences in the GOM.";
       lblFqnDesc.TextAlign = System.Drawing.ContentAlignment.TopCenter;
-      // 
+      //
       // progressBar1
-      // 
+      //
       progressBar1.Location = new System.Drawing.Point(14, 655);
       progressBar1.Margin = new System.Windows.Forms.Padding(4, 3, 4, 3);
       progressBar1.MarqueeAnimationSpeed = 1000;
       progressBar1.Name = "progressBar1";
       progressBar1.Size = new System.Drawing.Size(681, 25);
       progressBar1.TabIndex = 45;
-      // 
+      //
       // Tools
-      // 
+      //
       AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
       AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
       ClientSize = new System.Drawing.Size(709, 695);

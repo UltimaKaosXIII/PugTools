@@ -22,8 +22,11 @@ namespace PugTools {
       public Buffer LodIndexBuffer;
       public TerrainLodRange[] LodRanges;
       public bool OwnsLodIndexBuffer = true;
+      public bool TexturesPrepared;
+      public long LastUseFrame;
       public readonly Dictionary<string, ShaderResourceView> Masks = new Dictionary<string, ShaderResourceView>(StringComparer.OrdinalIgnoreCase);
-      public void Dispose() { foreach (var v in Masks.Values) v?.Dispose(); Masks.Clear(); ColorMap?.Dispose(); ColorMap=null; if(OwnsLodIndexBuffer)LodIndexBuffer?.Dispose(); LodIndexBuffer=null; LodRanges=null; }
+      public void ReleaseTextures(){foreach(var v in Masks.Values)v?.Dispose();Masks.Clear();ColorMap?.Dispose();ColorMap=null;TexturesPrepared=false;}
+      public void Dispose() { ReleaseTextures(); if(OwnsLodIndexBuffer)LodIndexBuffer?.Dispose(); LodIndexBuffer=null; LodRanges=null; }
     }
     private sealed class SharedTerrainIndexGpu : IDisposable {
       public Buffer Buffer; public TerrainLodRange[] Ranges;
@@ -36,11 +39,18 @@ namespace PugTools {
     private sealed class WaterGpu : IDisposable {
       public ShaderResourceView Normal1, Normal2, DepthMap, SurfaceMap;
       public bool OwnsDepthMap;
-      public void Dispose(){if(OwnsDepthMap)DepthMap?.Dispose();Normal1=null;Normal2=null;DepthMap=null;SurfaceMap=null;}
+      public bool TexturesPrepared;
+      public long LastUseFrame;
+      public void ReleaseTextures(){if(OwnsDepthMap)DepthMap?.Dispose();Normal1=null;Normal2=null;DepthMap=null;SurfaceMap=null;OwnsDepthMap=false;TexturesPrepared=false;}
+      public void Dispose(){ReleaseTextures();}
     }
     private sealed class MapArtGpu : IDisposable {
       public Buffer Buffer; public int Count; public ShaderResourceView Texture; public string Name;
       public void Dispose(){Buffer?.Dispose();Buffer=null;Texture=null;}
+    }
+    private sealed class MapNoteIconGpu : IDisposable {
+      public Buffer Buffer; public int Capacity; public ShaderResourceView Texture; public string Key;
+      public void Dispose(){Buffer?.Dispose();Buffer=null;Texture?.Dispose();Texture=null;Capacity=0;}
     }
     private sealed class DynamicDetailGpu : IDisposable {
       public Buffer Buffer; public int Count; public int AtlasMode; public float Wind; public Vector2 TextureSize; public GR2_Material Material; public int ChannelId;
@@ -60,15 +70,19 @@ namespace PugTools {
       public bool RestrictToRoom;
       public bool DoHeightmaps;
       public bool DoGranny;
+      public bool DoSpeedTree = true;
+      public bool DoCharacters;
       public bool DoWater;
       public Vector4 PosRange;
       public Vector4 ColorIntensity;
       public Vector4 DirType;
       public Matrix ProjectorInv;
       public Vector4 ProjectorParams;
-      public ShaderResourceView IlluminationMap;
-      public ShaderResourceView FalloffMap;
-      public ShaderResourceView RampMap;
+      // Keep light texture paths as metadata and stream the SRVs only when this light is actually selected for a
+      // visible receiver. Eagerly uploading every static .lit projector was a large startup/VRAM cost on planets.
+      public string IlluminationPath;
+      public string FalloffPath;
+      public string RampPath;
     }
 
     private sealed class HeightMapFloorEntry {
@@ -86,12 +100,42 @@ namespace PugTools {
 
     private sealed class RoomPlacementEntry {
       public Room Room;
+      public AssetInstance Instance;
+      public string AssetPath;
       public Matrix Inverse;
       public float Width;
       public float Depth;
       public float Height;
       public bool HasHeight;
       public int Rank;
+      public RegionVolumeData RegionVolume;
+    }
+
+    // Jedipedia keeps trigger/region membership separate from camera-room selection. In particular, many authored
+    // .rgn volumes live in _everywhere_; excluding that room is correct for room culling but wrong for the volume
+    // inspector. Keep a dedicated all-room spatial index so Current volumes follows the authored data exactly.
+    private sealed class VolumeMembershipEntry {
+      public Room Room;
+      public AssetInstance Instance;
+      public string AssetPath;
+      public Matrix Inverse;
+      public RegionVolumeData RegionVolume;
+      public bool IsRegion;
+      public float HalfWidth, HalfHeight, HalfDepth;
+      public bool Ellipsoid;
+      public string ClassType;
+      public string Detail;
+      public float SortVolume;
+    }
+
+    public sealed class WorldVolumeInfo {
+      public ulong InstanceId { get; internal set; }
+      public string RoomName { get; internal set; }
+      public string Description { get; internal set; }
+      public string ClassType { get; internal set; }
+      public string Detail { get; internal set; }
+      public string AssetPath { get; internal set; }
+      public bool IsRegion { get; internal set; }
     }
 
     private sealed class FloorMeshData {
@@ -162,7 +206,10 @@ namespace PugTools {
       public GR2 Model;
       public int LodLevel;
       public readonly List<Matrix> Worlds = new List<Matrix>();
+      public int StartInstance;
       public Vector3 LightSample;
+      public float LightRadius;
+      public bool SpeedTree;
     }
 
     private sealed class DecorationHookRenderEntry {
@@ -175,26 +222,41 @@ namespace PugTools {
       public Vector4 FallbackTint;
     }
 
-    private struct LocalLightSelection {
-      public int Count;
-      public LocalLightEntry E0;
-      public LocalLightEntry E1;
-      public LocalLightEntry E2;
-      public LocalLightEntry E3;
+    private sealed class MapBoundsBox {
+      public float MinX,MaxX,MinZ,MaxZ,X,Z;
+      public bool Large;
+    }
 
-      public LocalLightEntry Get(int index) {
-        return index == 0 ? E0 : index == 1 ? E1 : index == 2 ? E2 : index == 3 ? E3 : null;
+    private sealed class MapBoundsOverride {
+      public float? MinX,MaxX,MinZ,MaxZ;
+      public float LargeObjectSize=5f;
+      public bool HideLargeObjects;
+      public readonly HashSet<string> HideAssets=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      public MapBoundsOverride(float? minX=null,float? maxX=null,float? minZ=null,float? maxZ=null,float largeObjectSize=5f,bool hideLargeObjects=false,params string[] hideAssets){
+        MinX=minX;MaxX=maxX;MinZ=minZ;MaxZ=maxZ;LargeObjectSize=largeObjectSize;HideLargeObjects=hideLargeObjects;
+        if(hideAssets!=null)foreach(string name in hideAssets)if(!String.IsNullOrWhiteSpace(name))HideAssets.Add(name);
       }
+      public bool HasMeasuredBounds=>MinX.HasValue||MaxX.HasValue||MinZ.HasValue||MaxZ.HasValue;
+    }
 
+    private sealed class LocalLightSelection {
+      public static readonly LocalLightSelection Empty = new LocalLightSelection(Array.Empty<LocalLightEntry>());
+      public readonly LocalLightEntry[] Entries;
+      public int Count => Entries?.Length ?? 0;
+      public LocalLightSelection(LocalLightEntry[] entries) { Entries = entries ?? Array.Empty<LocalLightEntry>(); }
+      public LocalLightEntry Get(int index) => index >= 0 && index < Count ? Entries[index] : null;
       public static LocalLightSelection From(LocalLightEntry[] entries, int count) {
-        return new LocalLightSelection {
-          Count = count,
-          E0 = count > 0 ? entries[0] : null,
-          E1 = count > 1 ? entries[1] : null,
-          E2 = count > 2 ? entries[2] : null,
-          E3 = count > 3 ? entries[3] : null
-        };
+        if(entries==null||count<=0)return Empty;
+        var copy=new LocalLightEntry[count];Array.Copy(entries,copy,count);return new LocalLightSelection(copy);
       }
+    }
+
+    private sealed class PortalVisibilityEntry {
+      public Room Source;
+      public Room Target;
+      public AssetInstance Instance;
+      public Vector3 Center;
+      public float Radius;
     }
 
     private string fqn;
@@ -212,9 +274,62 @@ namespace PugTools {
     private readonly Dictionary<AssetInstance,WaterGpu> waterGpu = new Dictionary<AssetInstance,WaterGpu>();
     private readonly Dictionary<string,GR2_Material> terrainMaterials = new Dictionary<string,GR2_Material>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string,ShaderResourceView> textureCache = new Dictionary<string,ShaderResourceView>(StringComparer.OrdinalIgnoreCase);
+    // Shared environment/light/water textures used to stay resident for the lifetime of an area. On the large
+    // planets this can easily consume several gigabytes of VRAM even though only a small camera neighbourhood is
+    // visible. Track last use and evict cold, transient entries like Jedipedia's LRU tile cache. Textures referenced
+    // by persistent GPU records (map art and static lights) are pinned until those records are rebuilt; water
+    // refreshes its shared references on each visible draw and can therefore remain transient.
+    private readonly Dictionary<string,long> textureLastUseFrame = new Dictionary<string,long>(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> pinnedTexturePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    // Transient light maps currently bound to the effect must survive the shared-texture LRU until another light
+    // selection replaces them. Unlike pinned map art, this set is rebuilt on every actual light bind.
+    private readonly HashSet<string> boundLocalLightTexturePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private int appliedTextureMipSkip = -1;
+    // Jedipedia keeps a persistent clicked selection and outlines its current receiver bounds. PugTools already had
+    // an exact one-shot triangle inspector; keep the same hit test but retain the winning render entry so the object
+    // remains visually identified while the user moves the camera.
+    private sealed class WorldPickCandidate {
+      public string Kind;
+      public string Key;
+      public float Distance;
+      public Vector3 HitPoint;
+      public Vector3 Center;
+      public float Radius;
+      public RenderEntry RenderEntry;
+      public GR2 Model;
+      public GR2_Mesh Mesh;
+      public GR2_Mesh_Piece Piece;
+      public WorldNpcPlacement Npc;
+      public WorldSpnPlacement Spn;
+      public UtilityRenderEntry Utility;
+      public AreaPath Path;
+    }
+
+    private Buffer selectedWorldBoxBuffer;
+    private RenderEntry selectedWorldRenderEntry;
+    private WorldNpcPlacement selectedWorldNpcPlacement;
+    private WorldSpnPlacement selectedWorldSpnPlacement;
+    private UtilityRenderEntry selectedWorldUtilityEntry;
+    private AreaPath selectedWorldPath;
+    private Vector3 selectedWorldPathHit;
+    private string selectedWorldModelDetails = String.Empty;
+    private string selectedWorldModelSummary = String.Empty;
+    private int selectedWorldCycleIndex = -1;
+    private int selectedWorldCycleCount;
+    private int lastWorldPickX = Int32.MinValue;
+    private int lastWorldPickY = Int32.MinValue;
+    private int lastWorldPickIndex = -1;
+    private string lastWorldPickSignature = String.Empty;
+    private string selectedWorldPickKey = String.Empty;
     private readonly List<LineGpu> roadGpu = new List<LineGpu>();
-    private readonly List<LineGpu> noteGpu = new List<LineGpu>();
+    private readonly List<LineGpu> mapNoteFallbackGpu = new List<LineGpu>();
     private readonly List<MapArtGpu> mapArtGpu = new List<MapArtGpu>();
+    private bool mapArtPrepared;
+    private readonly Dictionary<string,MapNoteIconGpu> mapNoteIconGpu = new Dictionary<string,MapNoteIconGpu>(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<GR2_Material,long> materialLastUseFrame = new Dictionary<GR2_Material,long>();
+    private readonly HashSet<GR2> modelGeometryPrepared = new HashSet<GR2>();
+    private readonly Dictionary<GR2,long> modelGeometryLastUseFrame = new Dictionary<GR2,long>();
+    private long worldRenderFrame;
     private readonly Dictionary<AssetInstance,List<DynamicDetailGpu>> dynamicDetailGpu = new Dictionary<AssetInstance,List<DynamicDetailGpu>>();
     private readonly Dictionary<string,GR2_Material> dynamicDetailMaterials = new Dictionary<string,GR2_Material>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<uint,GR2> dynamicDetailMeshModels = new Dictionary<uint,GR2>();
@@ -236,6 +351,9 @@ namespace PugTools {
     private const int MaxRoomPlacementCells = 4096;
     private readonly Dictionary<(int X,int Z),List<RoomPlacementEntry>> roomPlacementGrid = new Dictionary<(int X,int Z),List<RoomPlacementEntry>>();
     private readonly List<RoomPlacementEntry> roomPlacementGlobal = new List<RoomPlacementEntry>();
+    private readonly Dictionary<(int X,int Z),List<VolumeMembershipEntry>> volumeMembershipGrid = new Dictionary<(int X,int Z),List<VolumeMembershipEntry>>();
+    private readonly List<VolumeMembershipEntry> volumeMembershipGlobal = new List<VolumeMembershipEntry>();
+    private readonly Dictionary<string,VolumeMembershipEntry> volumeMembershipByKey = new Dictionary<string,VolumeMembershipEntry>(StringComparer.OrdinalIgnoreCase);
     // Jedipedia's camera-room lookup also ray-tests walkable Granny/collision geometry. Keep one local-space
     // triangle index per unique GR2 mesh and a cheap world-XZ placement index, instead of baking millions of
     // transformed floor triangles for every repeated building/prop placement.
@@ -257,10 +375,38 @@ namespace PugTools {
     private const byte RenderKindWater = 3;
     private readonly Dictionary<(int X,int Z),List<RenderEntry>> renderGrid = new Dictionary<(int X,int Z),List<RenderEntry>>();
     private readonly List<RenderEntry> renderGlobal = new List<RenderEntry>();
+    // When local room streaming is active, walking the camera's entire XZ grid still touches thousands of entries
+    // belonging to non-active Corellia cells. Keep a second lightweight room->entry index so current+adjacent room
+    // rendering can skip those entries before any distance/frustum/LOD/material work.
+    private readonly Dictionary<string,List<RenderEntry>> renderEntriesByRoom = new Dictionary<string,List<RenderEntry>>(StringComparer.OrdinalIgnoreCase);
+    // Authored dPVS occlusion geometry: ordinary model meshes with Granny LOD -3 plus placements explicitly marked
+    // OCCLUDER_ONLY. These never enter the visible model pass, but v12 can submit them depth-only before world art.
+    private readonly List<RenderEntry> occluderRenderEntries = new List<RenderEntry>();
+    // Path-follower descendants are dynamic and therefore live in renderGlobal, but Walking Mode queries the floor
+    // several times per frame. Keep just the model subset separately so riding a tram does not scan every global
+    // terrain/water/large-radius entry on each step/gravity test.
+    private readonly List<RenderEntry> walkingPathFollowerRenderEntries = new List<RenderEntry>();
     private Buffer regularModelInstanceBuffer;
     private int regularModelInstanceCapacity;
     private float[] regularModelInstanceScratch = Array.Empty<float>();
+    private readonly List<Matrix> regularModelFrameInstances = new List<Matrix>(2048);
     private readonly Dictionary<GR2,bool> regularModelInstancingSafe = new Dictionary<GR2,bool>();
+    // Elevator/bookmark teleports can jump into a completely cold part of a huge planet. While the destination
+    // dialog is still open, opportunistically prepare a small nearest-first working set on the render thread.
+    // This hides most first-frame GR2/DDS upload stalls without keeping the whole planet resident.
+    private readonly object teleportWarmupLock = new object();
+    private Vector3 teleportWarmupRequestedPosition;
+    private bool teleportWarmupRequestPending;
+    private bool teleportWarmupCancelPending;
+    private readonly Queue<GR2> teleportWarmupModels = new Queue<GR2>();
+    private readonly HashSet<GR2> teleportWarmupQueued = new HashSet<GR2>();
+    // Continuous camera-neighbourhood warmup. The renderer is CPU/upload bound when several cold models/materials
+    // first enter view at once; D3D11 then waits idle even on a fast GPU. Prepare a tiny nearest/ahead-of-camera
+    // working set over several frames instead of allowing a single movement frame to synchronously upload it all.
+    private readonly Queue<GR2> cameraWarmupModels = new Queue<GR2>();
+    private readonly HashSet<GR2> cameraWarmupQueued = new HashSet<GR2>();
+    private Vector3 cameraWarmupAnchor = new Vector3(float.NaN,float.NaN,float.NaN);
+    private string cameraWarmupRoomName = String.Empty;
     // Jedipedia honours the signed LOD class embedded in every BWAG mesh and the thresholds from
     // /resources/art/LODSchemas3.lod.  Rendering every non-negative mesh at once is both visually wrong and a
     // major draw-call/triangle multiplier on open-world assets, so cache the same model-level information here.
@@ -272,26 +418,45 @@ namespace PugTools {
     // That made the render thread CPU-bound while the GPU waited. Build a static XZ spatial index once per area,
     // preload the projector textures once, and reuse scratch arrays/bindings during the frame.
     private const float LocalLightCellSize = 32f;
+    // The base material pass keeps four lights for compatibility with the existing shader resources. Jedipedia
+    // then re-draws opaque/test receivers additively for every additional local light. Cap the offline renderer's
+    // receiver list to a generous 16 after projector/category/room culling so pathological authoring cannot explode
+    // draw calls while ordinary interiors are no longer limited to the nearest four lights.
+    private const int LocalLightBaseSlots = 4;
+    private const int MaxReceiverLocalLights = 16;
+    // Jedipedia's 32-unit light grid is a broad-phase index only. It never substitutes the centre of that
+    // enormous cell for the receiver's real position. Keep a much finer quantisation solely for sharing the
+    // selected four-light set between genuinely nearby PugTools draws.
+    private const float LocalLightSelectionCellSize = 1f;
     private const float LocalLightGridRangeLimit = 256f;
     private readonly Dictionary<(int X,int Z),List<LocalLightEntry>> localLightGrid = new Dictionary<(int X,int Z),List<LocalLightEntry>>();
     private readonly List<LocalLightEntry> localLightGlobal = new List<LocalLightEntry>();
-    // Cache one four-light choice per spatial cell/receiver kind for the current frame. Large SWTOR rooms
-    // can contain thousands of GR2 placements in the same few cells; recomputing the same nearest-light
-    // query for every placement was still enough to starve D3D11 even after introducing the light grid.
-    private readonly Dictionary<(int X,int Y,int Z,string Room,byte Kind),LocalLightSelection> localLightSelectionCache = new Dictionary<(int X,int Y,int Z,string Room,byte Kind),LocalLightSelection>();
-    private readonly LocalLightEntry[] localLightBest = new LocalLightEntry[4];
-    private readonly float[] localLightBestDistance = new float[4];
-    private readonly LocalLightEntry[] lastLocalLightSelection = new LocalLightEntry[4];
-    private readonly Vector4[] localLightPosRangeScratch = new Vector4[4];
-    private readonly Vector4[] localLightColorScratch = new Vector4[4];
-    private readonly Vector4[] localLightDirScratch = new Vector4[4];
-    private readonly Matrix[] localLightProjectorScratch = new Matrix[4];
-    private readonly Vector4[] localLightProjectorParamsScratch = new Vector4[4];
-    private readonly ShaderResourceView[] localLightIlluminationScratch = new ShaderResourceView[4];
-    private readonly ShaderResourceView[] localLightFalloffScratch = new ShaderResourceView[4];
-    private readonly ShaderResourceView[] localLightRampScratch = new ShaderResourceView[4];
+    // Radius is part of the cache key because Jedipedia tests light volumes against receiver bounds, not merely
+    // the placement origin. This is important for room shells and other large GR2s whose origin can be outside
+    // every local light that visibly touches the mesh.
+    private readonly Dictionary<(int X,int Y,int Z,int Radius,string Room,byte Kind),LocalLightSelection> localLightSelectionCache = new Dictionary<(int X,int Y,int Z,int Radius,string Room,byte Kind),LocalLightSelection>();
+    private readonly HashSet<LocalLightEntry> localLightCandidateScratch = new HashSet<LocalLightEntry>();
+    private readonly LocalLightEntry[] localLightBest = new LocalLightEntry[MaxReceiverLocalLights];
+    private readonly float[] localLightBestDistance = new float[MaxReceiverLocalLights];
+    private readonly LocalLightEntry[] lastLocalLightSelection = new LocalLightEntry[LocalLightBaseSlots];
+    private readonly Vector4[] localLightPosRangeScratch = new Vector4[LocalLightBaseSlots];
+    private readonly Vector4[] localLightColorScratch = new Vector4[LocalLightBaseSlots];
+    private readonly Vector4[] localLightDirScratch = new Vector4[LocalLightBaseSlots];
+    private readonly Matrix[] localLightProjectorScratch = new Matrix[LocalLightBaseSlots];
+    private readonly Vector4[] localLightProjectorParamsScratch = new Vector4[LocalLightBaseSlots];
+    private readonly ShaderResourceView[] localLightIlluminationScratch = new ShaderResourceView[LocalLightBaseSlots];
+    private readonly ShaderResourceView[] localLightFalloffScratch = new ShaderResourceView[LocalLightBaseSlots];
+    private readonly ShaderResourceView[] localLightRampScratch = new ShaderResourceView[LocalLightBaseSlots];
     private int lastLocalLightCount = -1;
     private string localLightVisibilityScope;
+    private LocalLightSelection currentLocalLightSelection = LocalLightSelection.Empty;
+    // Conservative portal graph built from /engine/portal.p placements. This is not the proprietary/native dPVS
+    // occluder solver, but mirrors Jedipedia's first visibility layer: room transitions are driven by authored
+    // PortalTarget links and only portals/rooms intersecting the camera frustum are expanded.
+    private readonly Dictionary<string,List<PortalVisibilityEntry>> roomPortals = new Dictionary<string,List<PortalVisibilityEntry>>(StringComparer.OrdinalIgnoreCase);
+    // Direct room neighbourhood used by local room streaming. It combines authored portal/VisibleRooms links with
+    // nearby room bounds, but intentionally does not recursively traverse an outdoor planet's entire visibility set.
+    private readonly Dictionary<string,HashSet<string>> roomStreamingNeighbors = new Dictionary<string,HashSet<string>>(StringComparer.OrdinalIgnoreCase);
     private Room currentCameraRoom;
     private Room displayCameraRoom;
     private readonly HashSet<string> skyRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -299,6 +464,7 @@ namespace PugTools {
     private WorldRenderSettings settings = new WorldRenderSettings();
     private WorldEffect fx;
     private InputLayout inputLayout;
+    private InputLayout skinnedLayout;
     private InputLayout instancedLayout;
     private InputLayout dynamicDetailLayout;
     private readonly FpsCamera camera = new FpsCamera();
@@ -306,6 +472,34 @@ namespace PugTools {
     private float cameraSpeed=1f;
     private const float MinCameraSpeed=.05f;
     private const float MaxCameraSpeed=1000f;
+
+    // Jedipedia orthographic plan/cutaway camera. The projection box, camera height and movement scale all follow
+    // the same zoom value, so zooming into a room also lowers the near-plane cut beneath roofs/upper storeys.
+    private bool orthographicActive;
+    private bool appliedOrthographicProjection;
+    private float appliedOrthographicHalfHeight=-1f;
+    private float orthographicZoom=1f;
+    private float orthographicZoomTarget=1f;
+    private float orthographicFloorY=float.NaN;
+    private float orthographicPitch=(float)Math.PI/2f;
+    private Vector3 orthographicHeading=Vector3.UnitZ;
+    private float perspectivePitchBeforeOrthographic;
+    private bool havePerspectivePitchBeforeOrthographic;
+    private bool orthographicPanning;
+    private Point orthographicPanStart;
+    private Vector3 orthographicPanCameraStart;
+    private const float OrthographicReferenceDistance=5f;
+    private const float OrthographicZoomMin=.05f;
+    private const float OrthographicZoomMax=20f;
+    private const float OrthographicZoomSensitivity=.0018f;
+    private const float OrthographicZoomSmoothingSeconds=.12f;
+    private const float OrthographicFloorClearance=.05f;
+    private const float OrthographicHeightPerBox=1.5f;
+    private const float OrthographicHeightClipShare=.5f;
+    private const float OrthographicMinPitch=.35f;
+    private const float OrthographicMaxPitch=(float)Math.PI/2f;
+    private const float OrthographicMoveSpeedScale=4.5f;
+
     // Jedipedia-style navigation map. M temporarily switches the viewport to an authored-world
     // top-down render without changing the toolbar render mode. A click teleports to the highest
     // heightmap surface under the cursor; drag pans and the wheel zooms.
@@ -321,18 +515,72 @@ namespace PugTools {
     private float mapZoom=1f;
     private float mapBaseHeight=20f;
     private float mapExtentMinX=-10f,mapExtentMaxX=10f,mapExtentMinZ=-10f,mapExtentMaxZ=10f;
+    // Jedipedia's map trims isolated placements and giant scenery shells when they would otherwise make the
+    // playable part of an area a tiny speck. Keep both extents so the user can switch back to the literal full area.
+    private float mapFullExtentMinX=-10f,mapFullExtentMaxX=10f,mapFullExtentMinZ=-10f,mapFullExtentMaxZ=10f;
+    private float mapClusterExtentMinX=-10f,mapClusterExtentMaxX=10f,mapClusterExtentMinZ=-10f,mapClusterExtentMaxZ=10f;
+    private volatile bool mapShowEntireArea;
+    private bool mapHasClusterExtent;
     private float mapVisibleWidth=20f;
     private float mapVisibleHeight=20f;
     private Vector3 mapCameraPosition;
+    // Fixed-pixel player/camera arrow drawn over the interactive M map. This uses Jedipedia's embedded copy of
+    // SWTOR's original 22x27 player marker (pivot 11,6), so the world map and minimap use the same authored art.
     private const float MapMinZoom=.025f;
     private const float MapMaxZoom=1f;
     private const float MapTeleportClearance=.5f;
+    // Ported from Jedipedia map.js. A crop must keep at least 95% of ordinary placements, cross a real empty
+    // gap, and reduce the map footprint substantially before it is offered as the default view.
+    private const float MapClusterCoverage=.95f;
+    private const float MapClusterMinGap=.10f;
+    private const float MapClusterMaxFootprint=.60f;
+    private const int MapClusterMaxPasses=4;
+    private const int MapClusterMinSmallCount=20;
+    private const float MapClusterMinSmallShare=.50f;
+    private const float MapClusterLargeObjectSize=5f;
+
+    // Jedipedia map.js MAP_BOUNDS_OVERRIDES. These are deliberately keyed by numeric area id: the same internal
+    // names can have variants, while the measured coordinates belong to one concrete area resource.
+    private static readonly Dictionary<string,MapBoundsOverride> MapBoundsOverrides=new Dictionary<string,MapBoundsOverride>(StringComparer.Ordinal){
+      ["4611686356715258910"]=new MapBoundsOverride(minX:-147f,maxX:-97f,minZ:47f,maxZ:77f),
+      ["4611686358155127000"]=new MapBoundsOverride(maxX:-31f,maxZ:-231.5f),
+      ["4611686301284054000"]=new MapBoundsOverride(minX:-9f,maxX:8f,minZ:-4.5f,maxZ:4.5f,largeObjectSize:10f,hideLargeObjects:true,hideAssets:new[]{"all_item_neon_trim_hue-able_8m.gr2"}),
+      ["4611686300770584000"]=new MapBoundsOverride(minX:-5f,maxX:3f,minZ:-7f,maxZ:8.5f,hideAssets:new[]{
+        "all_arch_neu_city_building_09.gr2","all_arch_neu_city_building_16.gr2","all_arch_neu_city_building_18.gr2",
+        "all_arch_neu_city_set_roof_2x2.gr2","all_arch_neu_city_set_roof_flat.gr2","str_arch_neu_city_vent_lod.gr2",
+        "all_item_tech_panel_01.gr2","all_item_tech_panel_02.gr2","all_item_tech_panel_03.gr2","all_item_tech_panel_04.gr2",
+        "str_arch_coruscant_exterior_01.gr2","str_arch_coruscant_exterior_02.gr2","str_arch_coruscant_exterior_03.gr2",
+        "str_arch_nar_vista_wall_mix_double.gr2","str_arch_neu_city_antenna_lod.gr2"}),
+      ["4611686301174784000"]=new MapBoundsOverride(minX:-5.5f,maxX:5.5f,minZ:-19.5f,maxZ:8f,hideAssets:new[]{
+        "str_arch_nar_exterior_01.gr2","str_arch_nar_exterior_02.gr2","str_arch_nar_fan_housing.gr2","all_arch_neu_city_set_roof_flat.gr2"}),
+      ["4611686351279967011"]=new MapBoundsOverride(largeObjectSize:20f,hideAssets:new[]{"str_arch_rep_guildship_exterior.gr2"}),
+      ["4611686351279967010"]=new MapBoundsOverride(largeObjectSize:20f,hideAssets:new[]{"all_arch_imp_space_room_bridge_exterior.gr2","veh_imp_capital_destroyer_bridge_view.gr2"}),
+      ["4611686044198570319"]=new MapBoundsOverride(maxX:17f,minZ:-12f,maxZ:12f,hideAssets:new[]{"ald_arch_battleground_turret_tower_center.gr2"}),
+      ["4611686255030930011"]=new MapBoundsOverride(minX:-15f,maxX:15f,minZ:-14f,maxZ:10f),
+      ["4611686343808730000"]=new MapBoundsOverride(minX:-22f,maxX:25f,minZ:-12f,maxZ:12f),
+      ["4611686349514817006"]=new MapBoundsOverride(minX:-7f,maxX:7f,minZ:-8f,maxZ:8f),
+      ["4611686354954347004"]=new MapBoundsOverride(minX:-15f,maxX:13f,minZ:-12f,maxZ:10f),
+      ["4611686307922114000"]=new MapBoundsOverride(minX:-18f,maxX:17f,minZ:-11f,maxZ:11f),
+      ["4611686309279494000"]=new MapBoundsOverride(minZ:-2f,maxZ:15f,hideAssets:new[]{
+        "all_arch_neu_city_set_roof_rusted.gr2","bot_arch_metal_accessories_grain_elevator.gr2","czk_arch_city_walkway_fill_64m.gr2",
+        "van_arch_ext_facade_02_96.gr2","van_arch_huttball_vista_buildings_yellow_main_lower_walls.gr2","van_arch_huttball_vista_refinery.gr2",
+        "van_arch_huttball_vista_smokestacks.gr2","van_arch_vandin_rocks_purple_side.gr2","van_arch_vandin_rocks_yellow_side.gr2",
+        "van_item_huttball_vista_yellow_right_building_01.gr2"}),
+      ["4611686051463571770"]=new MapBoundsOverride(hideAssets:new[]{
+        "veh_imp_capital_destroyer.gr2","veh_imp_capital_destroyer_lod02.gr2","veh_imp_capital_destroyer_lod03.gr2","veh_rep_capital_ship.gr2"}),
+      ["4611686351475197004"]=new MapBoundsOverride(minX:-24f,maxX:11f,minZ:-20f,maxZ:12.5f),
+      ["4611686019802843831"]=new MapBoundsOverride(minX:-110f,maxX:100f,minZ:-106f,maxZ:75f),
+      ["4611686357389147000"]=new MapBoundsOverride(maxZ:210f)
+    };
+
     private bool makeScreenshot;
     public bool _disposed;
     public List<string> ignoreList = new List<string>{"collision","dbo","fadeportal","occluder"};
     private readonly ShadowMap[] shadowMaps = new ShadowMap[4];
     private readonly Matrix[] shadowMatrices = new Matrix[4];
     private readonly float[] shadowDistances = {1.5f,4.5f,12.5f,25f};
+    private WorldShadowQuality appliedShadowQuality = (WorldShadowQuality)(-1);
+    private int appliedShadowResolution;
     private static readonly float[] terrainLodDistances = {50f,120f,250f};
     // Keep SWTOR/Jedipedia's authored static_clip_distance for fog/environment behaviour, but use a stable
     // user-facing hard render budget for the World Browser. Some shipped room schemes author very short clip
@@ -388,11 +636,12 @@ namespace PugTools {
       fx=new WorldEffect(Device,"Shaders\\World.fx");
       var signature=fx.Lit.GetPassByIndex(0).Description.Signature;
       inputLayout=new InputLayout(Device,signature,InputLayoutDescriptions.PosNormalTexTan);
+      var skinnedSignature=fx.SkinnedLit.GetPassByIndex(0).Description.Signature;
+      skinnedLayout=new InputLayout(Device,skinnedSignature,InputLayoutDescriptions.PosNormalTexTanSkinned);
       var instancedSignature=fx.InstancedLit.GetPassByIndex(0).Description.Signature;
       instancedLayout=new InputLayout(Device,instancedSignature,InputLayoutDescriptions.InstancedPosNormalTexTan);
       var dydSignature=fx.DynamicDetail.GetPassByIndex(0).Description.Signature;
       dynamicDetailLayout=new InputLayout(Device,dydSignature,InputLayoutDescriptions.DynamicDetail);
-      for(int i=0;i<4;i++)shadowMaps[i]=new ShadowMap(Device,1024,1024);
       CreateSceneTarget();
       InitializeFeatureTextRenderer();
       return true;
@@ -400,9 +649,12 @@ namespace PugTools {
 
     public void LoadModel(Dictionary<ulong,GR2> models, Dictionary<string,GR2_Material> materials, List<Room> rooms, string fqn, Area area=null, Dictionary<string,GR2> utilityModels=null, List<WorldNpcPlacement> npcData=null, List<WorldSpnPlacement> spnData=null) {
       this.fqn=fqn; this.area=area; this.models=models??new Dictionary<ulong,GR2>(); this.materials=materials??new Dictionary<string,GR2_Material>(); this.rooms=rooms??new List<Room>();
+      WorldRenderSettings initialSettings=SettingsSnapshot();
+      appliedTextureMipSkip=TextureMipSkip(initialSettings.TextureQuality);
       SetJedipediaFeatureData(utilityModels,npcData,spnData);
       elapsed=0f;
       placeableCameraAssetId=0; currentCameraRoom=null; displayCameraRoom=null; skyRoomNames.Clear(); regularModelInstancingSafe.Clear(); mapOpen=false; mapPointerDown=false;
+      orthographicActive=false;appliedOrthographicProjection=false;appliedOrthographicHalfHeight=-1f;orthographicZoom=orthographicZoomTarget=1f;orthographicFloorY=float.NaN;orthographicPanning=false;havePerspectivePitchBeforeOrthographic=false;
       if(Window is WorldBrowser worldBrowser)worldBrowser.SetFullMapActive(false);
       if(area!=null){
         AreaAsset camAsset=area.AssetIdMap.Values.FirstOrDefault(a=>string.Equals(a.Extension,"cam",StringComparison.OrdinalIgnoreCase)&&NormalizeAssetPath(a.Path)=="engine/placeablecamera");if(camAsset!=null)placeableCameraAssetId=camAsset.Id;
@@ -415,18 +667,22 @@ namespace PugTools {
       BuildPathFollowers();
       UpdatePathFollowers(elapsed);
       PrimeRoomVisibilityBounds();
+      BuildPortalVisibilityGraph();
+      BuildRoomStreamingGraph();
       BuildDynamicDetailMeshModels();
       LoadStrongholdHookModels();
       LoadAndApplyLodSchemas();
-      foreach(var m in this.materials.Values) if(!m.parsed) m.ParseMAT(Device);
-      BuildModelGeometry(); BuildJedipediaOverlayResources(); BuildDecorationHookRenderEntries(); BuildEmbeddedGeometry(); BuildTerrainResources(); BuildWaterResources(); BuildHeightMapFloorIndex(); BuildRoomPlacementIndex(); BuildModelFloorIndex(); BuildRenderSpatialIndex(); BuildLocalLightIndex(); BuildRoads(); BuildMapNotes(); CalculateBounds(); BuildMapArt(); InvalidateTemporalHistory();
+      // Material textures are intentionally resident-on-demand. Parsing every MAT here eagerly uploaded every texture
+      // used anywhere in a planet before the first frame, which was the main source of long loads and runaway VRAM.
+      BuildModelGeometry(); BuildJedipediaOverlayResources(); BuildDecorationHookRenderEntries(); BuildEmbeddedGeometry(); BuildTerrainResources(); BuildWaterResources(); BuildHeightMapFloorIndex(); BuildRoomPlacementIndex(); BuildVolumeMembershipIndex(); BuildModelFloorIndex(); BuildRenderSpatialIndex(); BuildLocalLightIndex(); BuildRoads(); BuildMapNotes(); CalculateBounds(); InvalidateTemporalHistory();
       camera.Reset();
-      WorldRenderSettings initialSettings=SettingsSnapshot();
       activeClipDistance=GetActiveClipDistance(area?.GetEnvironmentScheme("area"),initialSettings);
       appliedCameraFar=GetCameraFarDistance(activeClipDistance,initialSettings);
-      camera.SetLens(.25f*SlimDXNet.MathF.PI,AspectRatio,.01f,appliedCameraFar);
+      camera.SetLens(GetFieldOfViewRadians(initialSettings),AspectRatio,.01f,appliedCameraFar);
       if(area?.ArrivalPoint!=null){Vector3 p=area.ArrivalPoint.Position+new Vector3(0,2,0);camera.LookAt(p,p+new Vector3(0,0,1),new Vector3(0,1,0));}
       else {Vector3 center=(boundsMin+boundsMax)*.5f; float r=Math.Max(10,(boundsMax-boundsMin).Length()*.35f); camera.LookAt(center+new Vector3(0,r*.35f,r),center,new Vector3(0,1,0));}
+      if(initialSettings.OrthographicProjection)SetOrthographicMode(true);
+      ApplyCameraLens(initialSettings,appliedCameraFar,true);
       ResetMapCamera();
     }
 
@@ -439,6 +695,84 @@ namespace PugTools {
       }
     }
     public Vector3 CurrentCameraPosition => camera?.Position ?? new Vector3();
+    public float CurrentCameraSpeed => cameraSpeed;
+    public void SetCameraSpeed(float speed) {
+      cameraSpeed=(float)Math.Max(MinCameraSpeed,Math.Min(MaxCameraSpeed,speed));
+      if(Window is WorldBrowser browser)browser.SetStatusLabel("Camera speed: "+cameraSpeed.ToString("0.##")+" u/s (mouse wheel fine-tunes)");
+    }
+    public bool IsFullMapOpen => mapOpen;
+
+    // Jedipedia's public position readout is SWTOR display space: world X is display X, world Z is display Y,
+    // world Y is display Z, all multiplied by ten. Camera height includes the 1.8 m eye offset, which the readout
+    // removes so copying the coordinates describes the floor/player position rather than the camera lens.
+    public Vector3 CurrentDisplayPosition {
+      get {
+        Vector3 p = CurrentCameraPosition;
+        return new Vector3(p.X * 10f, p.Z * 10f, p.Y * 10f - WalkingEyeHeight * 10f);
+      }
+    }
+
+    public void TeleportToDisplayCoordinates(float displayX,float displayY,float? displayZ){
+      if(camera==null)return;
+      Vector3 pos=camera.Position;
+      pos.X=displayX/10f;
+      pos.Z=displayY/10f;
+      if(displayZ.HasValue)pos.Y=(displayZ.Value+WalkingEyeHeight*10f)/10f;
+      camera.Position=pos;
+      currentCameraRoom=null;displayCameraRoom=null;walkingVerticalVelocity=0f;walkingGrounded=false;ClearWalkingPlatform();
+      mapOpen=false;mapPointerDown=false;mapPointerDragged=false;InvalidateTemporalHistory();InvalidateObjectOcclusionVisibility();
+      if(Window is WorldBrowser browser)browser.SetFullMapActive(false);
+    }
+
+    public AreaMapNote CaptureCameraMapNote(string id, string label) {
+      if (camera == null) return null;
+      Vector3 look = camera.Look;
+      if (!IsFinite(look) || look.LengthSquared() < .000001f) look = Vector3.UnitZ; else look.Normalize();
+      float pitch = (float)Math.Asin(Math.Max(-1f, Math.Min(1f, look.Y)));
+      float yaw = (float)Math.Atan2(look.X, look.Z);
+      float toDeg = 180f / (float)Math.PI;
+      return new AreaMapNote {
+        Id = id ?? String.Empty,
+        Fqn = "Bookmark",
+        Label = String.IsNullOrWhiteSpace(label) ? "Bookmark" : label.Trim(),
+        // Mapnotes use a ground position; TeleportToMapNote restores the viewer eye height.
+        Position = camera.Position - new Vector3(0f, WalkingEyeHeight, 0f),
+        Rotation = new Vector3(-pitch * toDeg, -yaw * toDeg, 0f)
+      };
+    }
+
+    public void TeleportToMapNote(AreaMapNote note) {
+      if(note==null||camera==null)return;
+      Vector3 pos=note.Position+new Vector3(0,WalkingEyeHeight,0);
+      float toRad=(float)Math.PI/180f;
+      float pitch=-note.Rotation.X*toRad;
+      float yaw=-note.Rotation.Y*toRad;
+      // Jedipedia stores mapnote rotations in degrees and flips pitch/yaw when applying them to the viewer camera.
+      // FpsCamera has no SetAngles helper, so build the same forward vector and install it through LookAt().
+      float cp=(float)Math.Cos(pitch),sp=(float)Math.Sin(pitch),cy=(float)Math.Cos(yaw),sy=(float)Math.Sin(yaw);
+      Vector3 look=new Vector3(sy*cp,sp,cy*cp);
+      if(!IsFinite(look)||look.LengthSquared()<.000001f)look=Vector3.UnitZ;else look.Normalize();
+      camera.LookAt(pos,pos+look,Vector3.UnitY);
+      camera.UpdateViewMatrix();
+      currentCameraRoom=null;displayCameraRoom=null;walkingVerticalVelocity=0f;walkingGrounded=false;ClearWalkingPlatform();
+      mapOpen=false;mapPointerDown=false;mapPointerDragged=false;InvalidateTemporalHistory();InvalidateObjectOcclusionVisibility();
+      if(Window is WorldBrowser browser)browser.SetFullMapActive(false);
+    }
+
+    public void RequestTeleportWarmup(AreaMapNote note) {
+      if (note == null) return;
+      lock (teleportWarmupLock) {
+        teleportWarmupRequestedPosition = note.Position + new Vector3(0f, WalkingEyeHeight, 0f);
+        teleportWarmupRequestPending = true;
+      }
+    }
+
+    public void CancelTeleportWarmup() {
+      lock (teleportWarmupLock) {
+        teleportWarmupRequestPending = false;
+        teleportWarmupCancelPending = true;
+      }
+    }
 
     /// <summary>
     /// One-shot diagnostic picker for the World Browser. This deliberately intersects the same visible
@@ -465,11 +799,11 @@ namespace PugTools {
         float bestDistance=float.MaxValue;Vector3 bestPoint=Vector3.Zero;
         // The spatial index already excludes sky rooms. Inspection is a click-time diagnostic, so disable the
         // camera-frustum sphere prefilter and use exact triangle tests; this also catches models with poor bounds.
-        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,camera.FarZ,false)){
+        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,camera.FarZ,false,visible)){
           Room room=entry.Room;AssetInstance inst=entry.Instance;GR2 model=entry.Model;
-          if(room==null||inst==null||model==null||!model.enabled||skyRoomNames.Contains(room.RoomName)||!InstanceRoomVisible(inst,room,visible)||!InstanceVisibleInWorld(inst))continue;
+          if(room==null||inst==null||model==null||!model.enabled||skyRoomNames.Contains(room.RoomName)||!InstanceRoomVisible(inst,room,visible)||!InstanceVisibleInWorld(inst,s))continue;
           if(ShouldCullModelByLod(model,entry.World,false,inst.LodFactor))continue;
-          if(TryRayHitModel(model,entry.World,inst.LodFactor,near,direction,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))bestEntry=entry;
+          if(TryRayHitModel(model,entry.World,inst.LodFactor,near,direction,s,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))bestEntry=entry;
         }
         if(bestEntry==null||bestModel==null)return "No rendered model was hit. Click directly on an opaque/visible part of the object.";
 
@@ -495,6 +829,7 @@ namespace PugTools {
         if(material!=null){
           sb.AppendLine("Material derived: "+(material.derived??"(none)"));
           sb.AppendLine("Material visibility: "+(material.visibility??"(default)"));
+          sb.AppendLine("Material poly type: "+(material.polyType??"(default)"));
           sb.AppendLine("Alpha mode: "+(material.alphaMode??"None"));
         }
         sb.AppendLine(string.Format(System.Globalization.CultureInfo.InvariantCulture,"Local position: {0:0.###}, {1:0.###}, {2:0.###}",hit.position.X,hit.position.Y,hit.position.Z));
@@ -506,6 +841,265 @@ namespace PugTools {
       }catch(Exception ex){
         return "Model inspection failed: "+ex.Message;
       }
+    }
+
+    public string SelectedWorldModelSummary => selectedWorldModelSummary ?? String.Empty;
+    public string SelectedWorldModelDetails => selectedWorldModelDetails ?? String.Empty;
+
+    public void ClearWorldModelSelection(){
+      selectedWorldRenderEntry=null;selectedWorldNpcPlacement=null;selectedWorldSpnPlacement=null;selectedWorldUtilityEntry=null;selectedWorldPath=null;
+      selectedWorldPathHit=Vector3.Zero;selectedWorldModelSummary=String.Empty;selectedWorldModelDetails=String.Empty;selectedWorldPickKey=String.Empty;
+      selectedWorldCycleIndex=-1;selectedWorldCycleCount=0;
+      lastWorldPickX=lastWorldPickY=Int32.MinValue;lastWorldPickIndex=-1;lastWorldPickSignature=String.Empty;
+    }
+
+    // Backward-compatible one-shot entry point for callers that want a full world pick without cycling.
+    // The World Browser UI itself now marks objects exclusively through Ctrl+left-click.
+    public string SelectWorldModelAtScreen(int screenX,int screenY){return SelectWorldObjectAtScreen(screenX,screenY,false,false);}
+
+    /// <summary>
+    /// Lightweight interaction pick used by a plain left click. It deliberately ignores ordinary geometry and editor
+    /// helpers so an NPC/SPN taxi terminal cannot be hidden behind a large model candidate. The caller immediately
+    /// clears the temporary selection again when the spawn is not a taxi terminal.
+    /// </summary>
+    public string SelectWorldSpawnAtScreen(int screenX,int screenY){
+      if(area==null||camera==null||ClientWidth<=1||ClientHeight<=1){ClearWorldModelSelection();return "No world is loaded.";}
+      WorldRenderSettings s=SettingsSnapshot();
+      if(s.Mode==WorldRenderMode.Map){ClearWorldModelSelection();return "World interaction is only available in the 3D render modes.";}
+      try{
+        if(!TryBuildWorldPickRay(screenX,screenY,out Vector3 rayOrigin,out Vector3 rayDirection)){ClearWorldModelSelection();return "Could not build a pick ray for this screen position.";}
+        HashSet<string> visible=BuildVisibleRoomSet(currentCameraRoom,s);
+        List<WorldPickCandidate> hits=BuildWorldPickCandidates(rayOrigin,rayDirection,s,visible,true)
+          .Where(h=>h?.Npc!=null||h?.Spn!=null).OrderBy(h=>h.Distance).ToList();
+        if(hits.Count==0){ClearWorldModelSelection();return "No visible NPC or spawned object was hit.";}
+        ApplyWorldPickCandidate(hits[0]);
+        selectedWorldCycleIndex=0;selectedWorldCycleCount=hits.Count;
+        return selectedWorldModelDetails;
+      }catch(Exception ex){ClearWorldModelSelection();return "World interaction failed: "+ex.Message;}
+    }
+
+    /// <summary>
+    /// World selection used by the explicit Ctrl+left-click gesture. The caller may restrict the hit list to
+    /// population/editor markers and paths, or include ordinary world geometry. Repeated picks can cycle through
+    /// overlapping candidates. All expensive ray work happens only here, never in the render loop.
+    /// </summary>
+    public string SelectWorldObjectAtScreen(int screenX,int screenY,bool markersOnly,bool cycle){
+      if(area==null||camera==null||ClientWidth<=1||ClientHeight<=1){ClearWorldModelSelection();return "No world is loaded.";}
+      WorldRenderSettings s=SettingsSnapshot();
+      if(s.Mode==WorldRenderMode.Map){ClearWorldModelSelection();return "World selection is only available in the 3D render modes.";}
+      try{
+        if(!TryBuildWorldPickRay(screenX,screenY,out Vector3 rayOrigin,out Vector3 rayDirection)){ClearWorldModelSelection();return "Could not build a pick ray for this screen position.";}
+        HashSet<string> visible=BuildVisibleRoomSet(currentCameraRoom,s);
+        List<WorldPickCandidate> hits=BuildWorldPickCandidates(rayOrigin,rayDirection,s,visible,markersOnly);
+        if(hits.Count==0){ClearWorldModelSelection();return markersOnly?"No visible spawner, utility or path was hit.":"No rendered world object was hit.";}
+
+        hits.Sort((a,b)=>a.Distance.CompareTo(b.Distance)!=0?a.Distance.CompareTo(b.Distance):String.Compare(a.Key,b.Key,StringComparison.Ordinal));
+        if(hits.Count>96)hits.RemoveRange(96,hits.Count-96);
+        string signature=String.Join("|",hits.Select(h=>h.Key));
+        int index=0;
+        bool samePickRay=cycle&&Math.Abs(screenX-lastWorldPickX)<=3&&Math.Abs(screenY-lastWorldPickY)<=3&&String.Equals(signature,lastWorldPickSignature,StringComparison.Ordinal);
+        if(samePickRay) index=(lastWorldPickIndex+1)%hits.Count;
+        else if(cycle&&hits.Count>1&&String.Equals(hits[0].Key,selectedWorldPickKey,StringComparison.Ordinal)) index=1;
+        lastWorldPickX=screenX;lastWorldPickY=screenY;lastWorldPickIndex=index;lastWorldPickSignature=signature;
+        ApplyWorldPickCandidate(hits[index]);
+        selectedWorldCycleIndex=index;selectedWorldCycleCount=hits.Count;
+        if(cycle&&hits.Count>1)selectedWorldModelDetails+="\r\n\r\nSelection cycle: "+(index+1)+" of "+hits.Count+" (Ctrl+click again to advance).";
+        return selectedWorldModelDetails;
+      }catch(Exception ex){ClearWorldModelSelection();return "World selection failed: "+ex.Message;}
+    }
+
+    private bool TryBuildWorldPickRay(int screenX,int screenY,out Vector3 origin,out Vector3 direction){
+      origin=Vector3.Zero;direction=Vector3.Zero;
+      float nx=2f*screenX/(float)Math.Max(1,ClientWidth)-1f;
+      float ny=1f-2f*screenY/(float)Math.Max(1,ClientHeight);
+      Matrix inverseViewProj=Matrix.Invert(camera.ViewProj);
+      Vector3 near=Vector3.TransformCoordinate(new Vector3(nx,ny,0f),inverseViewProj);
+      Vector3 far=Vector3.TransformCoordinate(new Vector3(nx,ny,1f),inverseViewProj);
+      direction=far-near;if(direction.LengthSquared()<.0000001f)return false;direction.Normalize();
+      // Orthographic rays start at their near-plane pixel; perspective rays all start at the eye. The previous
+      // inspector used the near point in both modes, which was harmless for meshes but breaks cutaway picking.
+      origin=orthographicActive?near:camera.Position;return true;
+    }
+
+    private List<WorldPickCandidate> BuildWorldPickCandidates(Vector3 rayOrigin,Vector3 rayDirection,WorldRenderSettings s,HashSet<string> visible,bool markersOnly){
+      var hits=new List<WorldPickCandidate>();
+      if(!markersOnly){
+        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,camera.FarZ,false,visible)){
+          Room room=entry.Room;AssetInstance inst=entry.Instance;GR2 model=entry.Model;
+          if(room==null||inst==null||model==null||!model.enabled||skyRoomNames.Contains(room.RoomName)||!InstanceRoomVisible(inst,room,visible)||!InstanceVisibleInWorld(inst,s))continue;
+          if(ShouldCullModelByLod(model,entry.World,false,inst.LodFactor))continue;
+          float hitDistance=float.MaxValue;Vector3 hitPoint=Vector3.Zero;GR2 hitModel=null;GR2_Mesh hitMesh=null;GR2_Mesh_Piece hitPiece=null;
+          if(!TryRayHitModel(model,entry.World,inst.LodFactor,rayOrigin,rayDirection,s,ref hitDistance,ref hitPoint,ref hitModel,ref hitMesh,ref hitPiece))continue;
+          hits.Add(new WorldPickCandidate{Kind="model",Key="model:"+(room.RoomName??String.Empty)+":"+inst.ID,Distance=hitDistance,HitPoint=hitPoint,Center=entry.Center,Radius=Math.Max(.05f,entry.Radius),RenderEntry=entry,Model=hitModel,Mesh=hitMesh,Piece=hitPiece});
+        }
+      }
+
+      if((s.ShowNpcs||s.ShowTaxiTerminals)&&npcPlacements!=null){
+          foreach(WorldNpcPlacement npc in npcPlacements){
+            if(!NpcLayerVisible(npc,s))continue;
+            if(npc?.Instance==null||npc.Room==null||npc.Models==null||!SpnVariantActive(npc.VariantIndex,npc.VariantCount,npc.SpawnPoints))continue;
+            bool moving=npc.SpawnPoints!=null&&npc.SpawnPoints.Count>0;
+            if(!moving&&!InstanceRoomVisible(npc.Instance,npc.Room,visible))continue;
+            if(!InstanceVisibleInWorld(npc.Instance,s))continue;
+            Matrix world=NpcNameplateWorld(npc);
+            if(!TryWorldModelsSphere(npc.Models,world,out Vector3 center,out float radius)||!TryRaySphere(rayOrigin,rayDirection,center,Math.Max(.08f,radius),out float distance))continue;
+            hits.Add(new WorldPickCandidate{Kind="npc",Key="npc:"+(npc.Room.RoomName??String.Empty)+":"+npc.Instance.ID+":"+(npc.SourceFqn??String.Empty),Distance=distance,HitPoint=rayOrigin+rayDirection*distance,Center=center,Radius=Math.Max(.08f,radius),Npc=npc});
+          }
+        }
+        if(s.ShowSpnObjects&&spnPlacements!=null){
+          foreach(WorldSpnPlacement spn in spnPlacements){
+            if(spn?.Instance==null||spn.Room==null||!SpnVariantActive(spn.VariantIndex,spn.VariantCount,spn.SpawnPoints))continue;
+            bool moving=spn.Route!=null||(spn.SpawnPoints!=null&&spn.SpawnPoints.Count>0);
+            if(!moving&&!InstanceRoomVisible(spn.Instance,spn.Room,visible))continue;
+            if(!InstanceVisibleInWorld(spn.Instance,s))continue;
+            Matrix world=SpnPlacementWorld(spn,s.AnimateSpnObjects);WorldSpnDynState dyn=ActiveSpnDynState(spn,s.AnimateSpnObjects);if(dyn!=null&&dyn.Hidden)continue;
+            if(!TrySpnReceiverSphere(spn,world,dyn,out Vector3 center,out float radius)||!TryRaySphere(rayOrigin,rayDirection,center,Math.Max(.08f,radius),out float distance))continue;
+            hits.Add(new WorldPickCandidate{Kind="spn",Key="spn:"+(spn.Room.RoomName??String.Empty)+":"+spn.Instance.ID+":"+(spn.SourceFqn??String.Empty),Distance=distance,HitPoint=rayOrigin+rayDirection*distance,Center=center,Radius=Math.Max(.08f,radius),Spn=spn});
+          }
+        }
+
+      foreach(UtilityRenderEntry utility in utilityRenderEntries){
+          if(utility?.Instance==null||utility.Room==null||!UtilityCategoryEnabled(utility.Category,s))continue;
+          if(!InstanceRoomVisible(utility.Instance,utility.Room,visible)||!InstanceCanEnterRenderIndex(utility.Instance))continue;
+          Matrix world=InstanceWorld(utility.Instance,utility.Room);Vector3 center;float radius;
+          if(utility.Model!=null){if(!TryModelSphere(utility.Model,world,out center,out radius))continue;}
+          else {center=new Vector3(world.M41,world.M42,world.M43);radius=.08f;}
+          radius=Math.Max(.06f,radius);if(!TryRaySphere(rayOrigin,rayDirection,center,radius,out float distance))continue;
+          hits.Add(new WorldPickCandidate{Kind="utility",Key="utility:"+(utility.Room.RoomName??String.Empty)+":"+utility.Instance.ID,Distance=distance,HitPoint=rayOrigin+rayDirection*distance,Center=center,Radius=radius,Utility=utility});
+        }
+      if(s.ShowUtilityPaths&&area?.Paths!=null){
+        foreach(AreaPath path in area.Paths){
+          if(path?.Points==null||path.Points.Count<2||path.IsMapRoad&&!s.ShowUtilityMapRoadPaths)continue;
+          if(TryRayHitAreaPath(rayOrigin,rayDirection,path,s,out float distance,out Vector3 hitPoint))
+            hits.Add(new WorldPickCandidate{Kind="path",Key="path:"+path.Id+":"+(path.Fqn??path.Name??String.Empty),Distance=distance,HitPoint=hitPoint,Center=hitPoint,Radius=.12f,Path=path});
+        }
+      }
+      return hits;
+    }
+
+    private bool TryRayHitAreaPath(Vector3 rayOrigin,Vector3 rayDirection,AreaPath path,WorldRenderSettings s,out float bestDistance,out Vector3 bestPoint){
+      bestDistance=float.MaxValue;bestPoint=Vector3.Zero;if(path?.Points==null||path.Points.Count<2)return false;bool found=false;
+      int segments=path.Points.Count-1+(path.Circular?1:0);
+      for(int i=0;i<segments;i++){
+        Vector3 a=path.Points[i%path.Points.Count].Position,b=path.Points[(i+1)%path.Points.Count].Position;
+        if(!TryClosestRaySegment(rayOrigin,rayDirection,a,b,out float rayT,out Vector3 onSegment,out float separation))continue;
+        float tolerance=WorldPickLineTolerance(rayT,s);if(separation>tolerance||rayT>=bestDistance)continue;
+        bestDistance=rayT;bestPoint=onSegment;found=true;
+      }
+      return found;
+    }
+
+    private float WorldPickLineTolerance(float distance,WorldRenderSettings s){
+      const float pixels=7f;float height=Math.Max(1f,ClientHeight);
+      if(orthographicActive)return Math.Max(.01f,2f*GetOrthographicHalfHeight(s)/height*pixels);
+      float worldPerPixel=2f*Math.Max(.01f,distance)*(float)Math.Tan(GetFieldOfViewRadians(s)*.5f)/height;
+      return Math.Max(.01f,worldPerPixel*pixels);
+    }
+
+    private static bool TryClosestRaySegment(Vector3 origin,Vector3 direction,Vector3 a,Vector3 b,out float rayT,out Vector3 segmentPoint,out float separation){
+      rayT=0f;segmentPoint=a;separation=float.MaxValue;Vector3 seg=b-a;float c=Vector3.Dot(seg,seg);if(c<.0000001f)return false;
+      Vector3 w=origin-a;float bd=Vector3.Dot(direction,seg),d=Vector3.Dot(direction,w),e=Vector3.Dot(seg,w);float denom=c-bd*bd;
+      float u=Math.Abs(denom)>.0000001f?(e-bd*d)/denom:e/c;u=Math.Max(0f,Math.Min(1f,u));segmentPoint=a+seg*u;
+      rayT=Math.Max(0f,Vector3.Dot(segmentPoint-origin,direction));Vector3 rayPoint=origin+direction*rayT;separation=(rayPoint-segmentPoint).Length();return true;
+    }
+
+    private static bool TryRaySphere(Vector3 origin,Vector3 direction,Vector3 center,float radius,out float distance){
+      distance=0f;Vector3 toCenter=center-origin;float along=Vector3.Dot(toCenter,direction);float r=Math.Max(.0001f,radius);float closestSq=toCenter.LengthSquared()-along*along;float rSq=r*r;if(closestSq>rSq)return false;
+      float half=(float)Math.Sqrt(Math.Max(0f,rSq-closestSq));float entry=along-half,exit=along+half;if(exit<0f)return false;distance=Math.Max(0f,entry);return true;
+    }
+
+    private void ApplyWorldPickCandidate(WorldPickCandidate pick){
+      selectedWorldRenderEntry=null;selectedWorldNpcPlacement=null;selectedWorldSpnPlacement=null;selectedWorldUtilityEntry=null;selectedWorldPath=null;selectedWorldPathHit=Vector3.Zero;
+      if(pick==null){selectedWorldModelSummary=selectedWorldModelDetails=selectedWorldPickKey=String.Empty;selectedWorldCycleIndex=-1;selectedWorldCycleCount=0;return;}
+      if(pick.RenderEntry!=null)selectedWorldRenderEntry=pick.RenderEntry;
+      else if(pick.Npc!=null)selectedWorldNpcPlacement=pick.Npc;
+      else if(pick.Spn!=null)selectedWorldSpnPlacement=pick.Spn;
+      else if(pick.Utility!=null)selectedWorldUtilityEntry=pick.Utility;
+      else if(pick.Path!=null){selectedWorldPath=pick.Path;selectedWorldPathHit=pick.HitPoint;}
+      selectedWorldPickKey=pick.Key??String.Empty;selectedWorldModelSummary=WorldPickSummary(pick);selectedWorldModelDetails=WorldPickDetails(pick);
+    }
+
+    private string WorldPickSummary(WorldPickCandidate pick){
+      if(pick.Npc!=null)return "NPC: "+(pick.Npc.Name??pick.Npc.SourceFqn??"(unknown)")+"  ["+(pick.Npc.Room?.RoomName??"unknown")+"]";
+      if(pick.Spn!=null)return "SPN: "+(pick.Spn.Name??pick.Spn.SourceFqn??"(unknown)")+"  ["+(pick.Spn.Room?.RoomName??"unknown")+"]";
+      if(pick.Utility!=null){AreaAsset asset=null;if(area!=null)area.AssetIdMap.TryGetValue(pick.Utility.Instance.assetID,out asset);return "Utility: "+WorldAssetDisplayPath(asset,pick.Utility.Model)+"  ["+(pick.Utility.Room?.RoomName??"unknown")+"]";}
+      if(pick.Path!=null)return "Path: "+(pick.Path.Name??pick.Path.Fqn??pick.Path.Id.ToString());
+      if(pick.RenderEntry!=null){AreaAsset asset=null;if(area!=null)area.AssetIdMap.TryGetValue(pick.RenderEntry.Instance.assetID,out asset);return WorldAssetDisplayPath(asset,pick.Model??pick.RenderEntry.Model)+"  ["+(pick.RenderEntry.Room?.RoomName??"unknown")+"]";}
+      return pick.Kind??"Selection";
+    }
+
+    private string WorldPickDetails(WorldPickCandidate pick){
+      var sb=new System.Text.StringBuilder();sb.AppendLine("World viewer selection");sb.AppendLine("Type: "+(pick.Kind??"unknown"));
+      if(pick.Path!=null){
+        sb.AppendLine("Path: "+(pick.Path.Name??"(unnamed)"));sb.AppendLine("Node: "+(pick.Path.Fqn??"(none)"));sb.AppendLine("Path id: "+pick.Path.Id);
+        sb.AppendLine("Points: "+(pick.Path.Points?.Count??0)+"  Circular: "+pick.Path.Circular+"  Smooth: "+pick.Path.Smooth);
+        sb.AppendLine(WorldPickPositionLine("Hit point",pick.HitPoint));return sb.ToString().TrimEnd();
+      }
+      if(pick.Npc!=null){
+        WorldNpcPlacement n=pick.Npc;sb.AppendLine("NPC: "+(n.Name??"(unknown)"));if(!String.IsNullOrWhiteSpace(n.Title))sb.AppendLine("Title: "+n.Title);
+        sb.AppendLine("Node: "+(n.SourceFqn??"(none)"));sb.AppendLine("Room: "+(n.Room?.RoomName??"unknown"));sb.AppendLine("Instance id: "+(n.Instance?.ID??0));
+        if(n.Items!=null&&n.Items.Length>0)sb.AppendLine("Items: "+String.Join(", ",n.Items));if(!String.IsNullOrWhiteSpace(n.BodyType))sb.AppendLine("Body type: "+n.BodyType);
+        if(!String.IsNullOrWhiteSpace(n.IdleAnimationName))sb.AppendLine("Idle animation: "+n.IdleAnimationName);if(!String.IsNullOrWhiteSpace(n.PathFqn))sb.AppendLine("Path: "+n.PathFqn);
+        if(!String.IsNullOrWhiteSpace(n.RepublicReaction)||!String.IsNullOrWhiteSpace(n.ImperialReaction))sb.AppendLine("Faction reaction: Republic="+(n.RepublicReaction??"?")+", Empire="+(n.ImperialReaction??"?"));
+        sb.AppendLine(WorldPickPositionLine("World position",pick.Center));return sb.ToString().TrimEnd();
+      }
+      if(pick.Spn!=null){
+        WorldSpnPlacement spn=pick.Spn;sb.AppendLine("Placeable: "+(spn.Name??spn.SourceFqn??"(unknown)"));sb.AppendLine("Node: "+(spn.SourceFqn??"(none)"));
+        sb.AppendLine("Room: "+(spn.Room?.RoomName??"unknown"));sb.AppendLine("Instance id: "+(spn.Instance?.ID??0));if(!String.IsNullOrWhiteSpace(spn.PathFqn))sb.AppendLine("Path: "+spn.PathFqn);
+        WorldSpnDynState dyn=ActiveSpnDynState(spn,SettingsSnapshot().AnimateSpnObjects);if(dyn!=null)sb.AppendLine("State: "+(dyn.Name??"(unnamed)")+(dyn.Hidden?" (hidden)":""));
+        sb.AppendLine("Interactable glow: "+spn.BlueGlow);sb.AppendLine(WorldPickPositionLine("World position",pick.Center));return sb.ToString().TrimEnd();
+      }
+      Room room=pick.Utility?.Room??pick.RenderEntry?.Room;AssetInstance inst=pick.Utility?.Instance??pick.RenderEntry?.Instance;AreaAsset asset=null;if(inst!=null&&area!=null)area.AssetIdMap.TryGetValue(inst.assetID,out asset);
+      sb.AppendLine("Asset: "+WorldAssetDisplayPath(asset,pick.Model??pick.Utility?.Model??pick.RenderEntry?.Model));sb.AppendLine("Room: "+(room?.RoomName??"unknown"));sb.AppendLine("Instance id: "+(inst?.ID??0));
+      if(inst!=null)sb.AppendLine("Asset id: "+inst.assetID);
+      if(pick.Utility!=null)sb.AppendLine("Utility category: "+UtilityCategoryName(pick.Utility.Category));
+      if(inst!=null){
+        sb.AppendLine(WorldPickPositionLine("Local position",inst.position));sb.AppendLine(WorldPickPositionLine("Local rotation",inst.rotation));sb.AppendLine(WorldPickPositionLine("Local scale",inst.scale));
+        sb.AppendLine(WorldPickPositionLine("World position",pick.Center));sb.AppendLine("Viewability: "+inst.Viewability);sb.AppendLine("Hidden: "+inst.hidden);sb.AppendLine("LOD factor: "+inst.LodFactor.ToString("0.###",System.Globalization.CultureInfo.InvariantCulture));
+        if(inst.parentInstance!=0)AppendInspectorParentChain(sb,room,inst);
+      }
+      if(pick.Mesh!=null)sb.AppendLine("Mesh: "+(pick.Mesh.meshName??"(unknown)")+"  [LOD "+pick.Mesh.lod+"]");
+      if(pick.Piece!=null){GR2_Material material=ResolvePieceMaterial(pick.Model,pick.Piece);sb.AppendLine("Material: "+(material?.materialName??"(none)"));if(material!=null){sb.AppendLine("Material derived: "+(material.derived??"(none)"));sb.AppendLine("Material visibility: "+(material.visibility??"(default)"));sb.AppendLine("Material poly type: "+(material.polyType??"(default)"));sb.AppendLine("Alpha mode: "+(material.alphaMode??"None"));}}
+      sb.AppendLine(WorldPickPositionLine("Hit point",pick.HitPoint));sb.AppendLine("Hit distance: "+pick.Distance.ToString("0.###",System.Globalization.CultureInfo.InvariantCulture));return sb.ToString().TrimEnd();
+    }
+
+    private static string UtilityCategoryName(byte category){if(category==UtilitySpawner)return "Spawner / encounter";if(category==UtilityCover)return "Cover point";if(category==UtilityLight)return "Light";if(category==UtilitySeed)return "Kynapse seed point";return "Other helper";}
+    private static string WorldPickPositionLine(string label,Vector3 p){return String.Format(System.Globalization.CultureInfo.InvariantCulture,"{0}: {1:0.###}, {2:0.###}, {3:0.###}",label,p.X,p.Y,p.Z);}
+    private static string WorldAssetDisplayPath(AreaAsset asset,GR2 model){if(asset==null)return model?.filename??"(unknown)";return asset.Path+(String.IsNullOrWhiteSpace(asset.Extension)?String.Empty:"."+asset.Extension.TrimStart('.'));}
+
+    private void EnsureSelectedWorldBoxBuffer(){
+      if(selectedWorldBoxBuffer!=null||Device==null)return;
+      Vector3[] p={
+        new Vector3(-1,-1,-1),new Vector3(1,-1,-1), new Vector3(1,-1,-1),new Vector3(1,-1,1),
+        new Vector3(1,-1,1),new Vector3(-1,-1,1), new Vector3(-1,-1,1),new Vector3(-1,-1,-1),
+        new Vector3(-1,1,-1),new Vector3(1,1,-1), new Vector3(1,1,-1),new Vector3(1,1,1),
+        new Vector3(1,1,1),new Vector3(-1,1,1), new Vector3(-1,1,1),new Vector3(-1,1,-1),
+        new Vector3(-1,-1,-1),new Vector3(-1,1,-1), new Vector3(1,-1,-1),new Vector3(1,1,-1),
+        new Vector3(1,-1,1),new Vector3(1,1,1), new Vector3(-1,-1,1),new Vector3(-1,1,1)
+      };
+      PosNormalTexTan[] verts=p.Select(v=>new PosNormalTexTan(v,new Vector3(0,1,0),Vector2.Zero,new Vector3(1,0,0))).ToArray();
+      var bd=new BufferDescription(PosNormalTexTan.Stride*verts.Length,ResourceUsage.Immutable,BindFlags.VertexBuffer,CpuAccessFlags.None,ResourceOptionFlags.None,0);
+      using var ds=new DataStream(verts,false,false);selectedWorldBoxBuffer=new Buffer(Device,ds,bd){DebugName="World selection bounds"};
+    }
+
+    private bool TrySelectedWorldBounds(WorldRenderSettings s,out Vector3 center,out float radius){
+      center=Vector3.Zero;radius=0f;
+      if(selectedWorldRenderEntry!=null){RenderEntry entry=selectedWorldRenderEntry;if(entry.Instance==null||entry.Model==null||!entry.Model.enabled||!InstanceVisibleInWorld(entry.Instance,s))return false;center=entry.Center;radius=Math.Max(.05f,entry.Radius);return true;}
+      if(selectedWorldNpcPlacement!=null){WorldNpcPlacement npc=selectedWorldNpcPlacement;if(!NpcLayerVisible(npc,s)||!SpnVariantActive(npc.VariantIndex,npc.VariantCount,npc.SpawnPoints))return false;Matrix world=NpcNameplateWorld(npc);return TryWorldModelsSphere(npc.Models,world,out center,out radius);}
+      if(selectedWorldSpnPlacement!=null){WorldSpnPlacement spn=selectedWorldSpnPlacement;if(!s.ShowSpnObjects||!SpnVariantActive(spn.VariantIndex,spn.VariantCount,spn.SpawnPoints))return false;Matrix world=SpnPlacementWorld(spn,s.AnimateSpnObjects);WorldSpnDynState dyn=ActiveSpnDynState(spn,s.AnimateSpnObjects);if(dyn!=null&&dyn.Hidden)return false;return TrySpnReceiverSphere(spn,world,dyn,out center,out radius);}
+      if(selectedWorldUtilityEntry!=null){UtilityRenderEntry utility=selectedWorldUtilityEntry;if(!UtilityCategoryEnabled(utility.Category,s))return false;Matrix world=InstanceWorld(utility.Instance,utility.Room);if(utility.Model!=null)return TryModelSphere(utility.Model,world,out center,out radius);center=new Vector3(world.M41,world.M42,world.M43);radius=.08f;return true;}
+      if(selectedWorldPath!=null){bool pathVisible=s.ShowUtilityPaths&&(!selectedWorldPath.IsMapRoad||s.ShowUtilityMapRoadPaths);if(!pathVisible)return false;center=selectedWorldPathHit;radius=.12f;return true;}
+      return false;
+    }
+
+    private void DrawWorldSelectionOutline(Matrix vp,WorldRenderSettings s){
+      if(s==null||!s.ShowSelectionBounds||s.Mode==WorldRenderMode.Map||s.Mode==WorldRenderMode.Heightmap||!TrySelectedWorldBounds(s,out Vector3 center,out float radius))return;
+      EnsureSelectedWorldBoxBuffer();if(selectedWorldBoxBuffer==null)return;radius=Math.Max(.05f,radius);
+      Matrix boxWorld=Matrix.Scaling(radius,radius,radius)*Matrix.Translation(center);
+      fx.SetWorld(boxWorld);fx.SetViewProj(vp);fx.SetMaterial(null);fx.SetOverlay(new Vector4(1f,.82f,.18f,.95f));
+      ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.LineList;
+      ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(selectedWorldBoxBuffer,PosNormalTexTan.Stride,0));
+      fx.Overlay.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(24,0);ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
     }
 
     private void AppendInspectorParentChain(System.Text.StringBuilder sb,Room room,AssetInstance instance){
@@ -520,7 +1114,7 @@ namespace PugTools {
       }
     }
 
-    private bool TryRayHitModel(GR2 model,Matrix world,float lodFactor,Vector3 rayOrigin,Vector3 rayDirection,ref float bestDistance,ref Vector3 bestPoint,ref GR2 bestModel,ref GR2_Mesh bestMesh,ref GR2_Mesh_Piece bestPiece){
+    private bool TryRayHitModel(GR2 model,Matrix world,float lodFactor,Vector3 rayOrigin,Vector3 rayDirection,WorldRenderSettings s,ref float bestDistance,ref Vector3 bestPoint,ref GR2 bestModel,ref GR2_Mesh bestMesh,ref GR2_Mesh_Piece bestPiece){
       if(model==null)return false;bool hitAny=false;
       Matrix inverse;try{inverse=Matrix.Invert(world);}catch{return false;}
       Vector3 localOrigin=Vector3.TransformCoordinate(rayOrigin,inverse);
@@ -531,7 +1125,7 @@ namespace PugTools {
         if(mesh==null||!MeshVisibleForLod(model,mesh,selectedLod)||mesh.meshVerts==null||mesh.meshVertIndex==null||mesh.meshPieces==null)continue;
         int vertexCount=mesh.meshVerts.Count,indexCount=mesh.meshVertIndex.Count;if(vertexCount<3||indexCount<3)continue;
         foreach(GR2_Mesh_Piece piece in mesh.meshPieces){
-          if(piece==null||IsMaterialHiddenFromWorld(ResolvePieceMaterial(model,piece)))continue;
+          if(piece==null||IsMaterialHiddenFromWorld(ResolvePieceMaterial(model,piece),s))continue;
           long rawStart=(long)piece.startIndex*3L,rawEnd=rawStart+(long)piece.numPieceFaces*3L;
           int start=(int)Math.Max(0,Math.Min(indexCount,rawStart));int end=(int)Math.Max(start,Math.Min(indexCount,rawEnd));
           for(int i=start;i+2<end;i+=3){
@@ -549,7 +1143,7 @@ namespace PugTools {
           }
         }
       }
-      foreach(GR2 attached in model.attachedModels)if(TryRayHitModel(attached,world,lodFactor,rayOrigin,rayDirection,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))hitAny=true;
+      foreach(GR2 attached in model.attachedModels)if(TryRayHitModel(attached,world,lodFactor,rayOrigin,rayDirection,s,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))hitAny=true;
       return hitAny;
     }
 
@@ -570,7 +1164,7 @@ namespace PugTools {
       camera.Position=new Vector3(worldX,y+MapTeleportClearance,worldZ);
       currentCameraRoom=FindCameraRoom(camera.Position);
       InvalidateTemporalHistory();
-      if(Window is WorldBrowser browser)browser.SetStatusLabel(string.Format(System.Globalization.CultureInfo.InvariantCulture,"Teleported to {0:0.00}, {1:0.00}, {2:0.00}",camera.Position.X,camera.Position.Y,camera.Position.Z));
+      if(Window is WorldBrowser browser)browser.SetStatusLabel(string.Format(System.Globalization.CultureInfo.InvariantCulture,"Teleported to {0:0}, {1:0}, {2:0}",worldX*10f,worldZ*10f,y*10f));
     }
 
     public void GetMapPose(out float x,out float z,out float lookX,out float lookZ){
@@ -578,19 +1172,25 @@ namespace PugTools {
       x=pos.X;z=pos.Z;lookX=look.X;lookZ=look.Z;
     }
 
-    public void Clear(){ReleaseWorldGpu(); SetImplicitPhaseName(String.Empty); pathFollowers.Clear();instanceWorldTransforms.Clear(); models.Clear();materials.Clear();rooms.Clear();area=null;}
+    public void Clear(){EndTaxiRide(null);ReleaseWorldGpu(); SetImplicitPhaseName(String.Empty); pathFollowers.Clear();instanceWorldTransforms.Clear(); models.Clear();materials.Clear();rooms.Clear();area=null;}
     private void ReleaseWorldGpu(){
+      // Capture every material while population/SPN/model references are still alive.  Appearance-specific NPC
+      // materials are not guaranteed to live in the area's top-level MAT dictionary; releasing only that dictionary
+      // leaked their SRVs every time a world was cleared and made long sessions steadily consume VRAM.
+      List<GR2_Material> worldOwnedMaterials=WorldMaterialResidencySet().ToList();
       fx?.ClearWater();
+      ReleaseTaxiRouteMapGpu();
+      foreach(GR2_Material material in worldOwnedMaterials)ReleaseOwnedMaterial(material);
       ReleaseJedipediaFeatureGpu();
-      foreach(var g in terrainGpu.Values)g.Dispose();terrainGpu.Clear();foreach(var g in terrainIndexCache.Values)g.Dispose();terrainIndexCache.Clear(); foreach(var g in waterGpu.Values)g.Dispose();waterGpu.Clear(); foreach(var g in roadGpu)g.Dispose();roadGpu.Clear();foreach(var g in noteGpu)g.Dispose();noteGpu.Clear();foreach(var g in mapArtGpu)g.Dispose();mapArtGpu.Clear();
+      foreach(var g in terrainGpu.Values)g.Dispose();terrainGpu.Clear();foreach(var g in terrainIndexCache.Values)g.Dispose();terrainIndexCache.Clear(); foreach(var g in waterGpu.Values)g.Dispose();waterGpu.Clear(); foreach(var g in roadGpu)g.Dispose();roadGpu.Clear();foreach(var g in mapNoteFallbackGpu)g.Dispose();mapNoteFallbackGpu.Clear();foreach(var g in mapArtGpu)g.Dispose();mapArtGpu.Clear();mapArtPrepared=false;foreach(var g in mapNoteIconGpu.Values)g.Dispose();mapNoteIconGpu.Clear();materialLastUseFrame.Clear();modelGeometryPrepared.Clear();modelGeometryLastUseFrame.Clear();worldRenderFrame=0;Release(ref selectedWorldBoxBuffer);ClearWorldModelSelection();
       foreach(var list in dynamicDetailGpu.Values)foreach(var g in list)g.Dispose();dynamicDetailGpu.Clear();
       foreach(var list in dynamicDetailMeshBatches.Values)foreach(var g in list)g.Dispose();dynamicDetailMeshBatches.Clear();
-      instanceWorldTransforms.Clear();heightMapFloorGrid.Clear();heightMapFloors.Clear();roomPlacementGrid.Clear();roomPlacementGlobal.Clear();modelFloorData.Clear();modelFloorPlacementGrid.Clear();modelFloorPlacementGlobal.Clear();renderGrid.Clear();renderGlobal.Clear();decorationHookRenderEntries.Clear();Release(ref regularModelInstanceBuffer);regularModelInstanceCapacity=0;regularModelInstanceScratch=Array.Empty<float>();regularModelInstancingSafe.Clear();visualLodLevels.Clear();lodSchemas.Clear();localLightGrid.Clear();localLightGlobal.Clear();localLightSelectionCache.Clear();localLightVisibilityScope=null;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);lastLocalLightCount=-1;currentCameraRoom=null;displayCameraRoom=null;skyRoomNames.Clear();
+      instanceWorldTransforms.Clear();heightMapFloorGrid.Clear();heightMapFloors.Clear();roomPlacementGrid.Clear();roomPlacementGlobal.Clear();volumeMembershipGrid.Clear();volumeMembershipGlobal.Clear();modelFloorData.Clear();modelFloorPlacementGrid.Clear();modelFloorPlacementGlobal.Clear();renderGrid.Clear();renderGlobal.Clear();renderEntriesByRoom.Clear();occluderRenderEntries.Clear();walkingPathFollowerRenderEntries.Clear();decorationHookRenderEntries.Clear();teleportWarmupModels.Clear();teleportWarmupQueued.Clear();cameraWarmupModels.Clear();cameraWarmupQueued.Clear();cameraWarmupAnchor=new Vector3(float.NaN,float.NaN,float.NaN);cameraWarmupRoomName=String.Empty;lock(teleportWarmupLock){teleportWarmupRequestPending=false;teleportWarmupCancelPending=false;}Release(ref regularModelInstanceBuffer);regularModelInstanceCapacity=0;regularModelInstanceScratch=Array.Empty<float>();regularModelInstancingSafe.Clear();visualLodLevels.Clear();lodSchemas.Clear();localLightGrid.Clear();localLightGlobal.Clear();localLightSelectionCache.Clear();localLightVisibilityScope=null;currentLocalLightSelection=LocalLightSelection.Empty;boundLocalLightTexturePaths.Clear();roomPortals.Clear();roomStreamingNeighbors.Clear();Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);lastLocalLightCount=-1;currentCameraRoom=null;displayCameraRoom=null;skyRoomNames.Clear();
       foreach(var m in dynamicDetailMaterials.Values)ReleaseOwnedMaterial(m);dynamicDetailMaterials.Clear();
       var releasedDydModels=new HashSet<GR2>();foreach(var model in dynamicDetailMeshModels.Values)if(model!=null&&releasedDydModels.Add(model))ReleaseModelBuffers(model);dynamicDetailMeshModels.Clear();
       foreach(var model in strongholdHookModels.Values)if(model!=null&&releasedDydModels.Add(model))ReleaseModelBuffers(model);strongholdHookModels.Clear();
       Release(ref defaultWaterNormal);Release(ref defaultWaterDepth);
-      foreach(var v in textureCache.Values)v?.Dispose();textureCache.Clear();
+      foreach(var v in textureCache.Values)v?.Dispose();textureCache.Clear();textureLastUseFrame.Clear();pinnedTexturePaths.Clear();appliedTextureMipSkip=-1;
       foreach(var m in terrainMaterials.Values){Release(ref m.diffuseSRV);Release(ref m.diffuse2SRV);Release(ref m.rotationSRV);Release(ref m.glossSRV);Release(ref m.waterSurfaceSRV);}terrainMaterials.Clear();
       foreach(var room in rooms)foreach(var inst in room.InstancesById.Values){Release(ref inst.VBO);Release(ref inst.IBO);}
       foreach(var model in models.Values)ReleaseModelBuffers(model);
@@ -599,15 +1199,23 @@ namespace PugTools {
     private static void Release<T>(ref T v) where T:class,IDisposable{v?.Dispose();v=null;}
 
     protected override void Dispose(bool disposing){
-      if(!_disposed){if(disposing){ReleaseWorldGpu();DisposeFeatureTextRenderer();ReleasePostTargets();Release(ref sceneDepthShaderResource);for(int i=0;i<shadowMaps.Length;i++)shadowMaps[i]?.Dispose();dynamicDetailLayout?.Dispose();instancedLayout?.Dispose();inputLayout?.Dispose();fx?.Dispose();RenderStates.DestroyAll();}_disposed=true;}base.Dispose(disposing);
+      if(!_disposed){if(disposing){ReleaseWorldGpu();DisposeFeatureTextRenderer();ReleasePostTargets();Release(ref sceneDepthShaderResource);for(int i=0;i<shadowMaps.Length;i++)shadowMaps[i]?.Dispose();dynamicDetailLayout?.Dispose();instancedLayout?.Dispose();skinnedLayout?.Dispose();inputLayout?.Dispose();fx?.Dispose();RenderStates.DestroyAll();}_disposed=true;}base.Dispose(disposing);
     }
 
     public override void OnResize(){
       base.OnResize();
+      // SpriteTextRenderer caches the D3D viewport/screen size internally. The WinForms sidebar resizes only the
+      // swap-chain panel, so without refreshing this cache DrawString continues converting pixel coordinates with
+      // the previous render-panel dimensions. That makes otherwise correct 3D-projected nameplates slide/scale as
+      // the splitter moves. Refresh it on the render thread immediately after base.OnResize() installed the viewport.
+      try { npcTextSprite?.RefreshViewport(); } catch (Exception ex) { System.Diagnostics.Debug.WriteLine("NPC text viewport refresh failed: " + ex.Message); }
+      InvalidateObjectOcclusionVisibility();
+      objectOcclusionViewportWidth=-1;objectOcclusionViewportHeight=-1;
       CreateSampleableDepthTarget();
       CreateSceneTarget();
-      float cameraFar=GetCameraFarDistance(activeClipDistance,SettingsSnapshot());
-      camera.SetLens(.25f*SlimDXNet.MathF.PI,AspectRatio,.01f,cameraFar);
+      WorldRenderSettings resizeSettings=SettingsSnapshot();
+      float cameraFar=GetCameraFarDistance(activeClipDistance,resizeSettings);
+      ApplyCameraLens(resizeSettings,cameraFar,true);
       appliedCameraFar=cameraFar;
       UpdateMapCamera();
     }
@@ -655,6 +1263,9 @@ namespace PugTools {
 
     public override void UpdateScene(float dt){
       base.UpdateScene(dt);elapsed+=dt;
+      WorldRenderSettings navigationSettings=SettingsSnapshot();
+      // Projection transitions and the eased ortho zoom keep running even while a toolbar/search box owns input.
+      UpdateOrthographicState(dt,navigationSettings);
       bool inputActive=Window is WorldBrowser browser&&(mapOpen?browser.WorldWindowInputEnabled:browser.WorldKeyboardInputEnabled);
       if(!inputActive){
         // Preserve the physical edge state while another UI surface (notably Search) owns input,
@@ -676,26 +1287,78 @@ namespace PugTools {
       escapeKeyWasDown=escapeKey;
       if(Util.IsKeyDown(Keys.PrintScreen))makeScreenshot=true;
       if(mapOpen)return;
+      if(UpdateTaxiRide(dt,escapeKey))return;
 
-      if(Util.IsKeyDown(Keys.R)){Vector3 c=(boundsMin+boundsMax)*.5f;camera.LookAt(c+new Vector3(0,5,20),c,new Vector3(0,1,0));}
-      if(UpdateWalkingMode(dt))return;
       bool shift=Util.IsKeyDown(Keys.LShiftKey)||Util.IsKeyDown(Keys.RShiftKey);
       bool alt=Util.IsKeyDown(Keys.LMenu)||Util.IsKeyDown(Keys.RMenu);
       float multiplier=shift?(alt?100f:10f):1f;
-      float speed=cameraSpeed*multiplier;
-      // Keep PugTools' camera-space sign convention, but use the familiar WASD layout requested for the browser.
-      if(Util.IsKeyDown(Keys.W))camera.Walk(-speed*dt);
-      if(Util.IsKeyDown(Keys.S))camera.Walk(speed*dt);
-      if(Util.IsKeyDown(Keys.A))camera.Strafe(-speed*dt);
-      if(Util.IsKeyDown(Keys.D))camera.Strafe(speed*dt);
+
+      if(orthographicActive){
+        if(Util.IsKeyDown(Keys.R)){
+          Vector3 c=(boundsMin+boundsMax)*.5f;camera.Position=new Vector3(c.X,camera.Position.Y,c.Z);
+          orthographicHeading=Vector3.UnitZ;orthographicPitch=OrthographicMaxPitch;orthographicZoom=orthographicZoomTarget=1f;orthographicFloorY=float.NaN;ApplyOrthographicOrientation();
+        }
+        float lookStep=1.8f*dt;bool orientationChanged=false;
+        float yaw=0f;if(Util.IsKeyDown(Keys.A)||Util.IsKeyDown(Keys.J))yaw-=lookStep;if(Util.IsKeyDown(Keys.D)||Util.IsKeyDown(Keys.L))yaw+=lookStep;
+        if(Math.Abs(yaw)>.000001f){orthographicHeading=Vector3.TransformNormal(orthographicHeading,Matrix.RotationY(yaw));orthographicHeading=HorizontalUnit(orthographicHeading,Vector3.UnitZ);orientationChanged=true;}
+        float pitch=orthographicPitch;if(Util.IsKeyDown(Keys.I))pitch-=lookStep;if(Util.IsKeyDown(Keys.K))pitch+=lookStep;
+        pitch=Math.Max(OrthographicMinPitch,Math.Min(OrthographicMaxPitch,pitch));if(Math.Abs(pitch-orthographicPitch)>.000001f){orthographicPitch=pitch;orientationChanged=true;}
+        if(orientationChanged)ApplyOrthographicOrientation();
+
+        Vector3 right=HorizontalUnit(camera.Right,Vector3.UnitX);
+        Vector3 velocity=Vector3.Zero;
+        if(Util.IsKeyDown(Keys.W))velocity+=orthographicHeading;if(Util.IsKeyDown(Keys.S))velocity-=orthographicHeading;
+        if(Util.IsKeyDown(Keys.Q))velocity-=right;if(Util.IsKeyDown(Keys.E))velocity+=right;
+        if(velocity.LengthSquared()>.000001f){velocity.Normalize();float speed=cameraSpeed*multiplier*GetOrthographicMoveScale(navigationSettings);camera.Position+=velocity*(speed*dt);}
+        return;
+      }
+
+      if(Util.IsKeyDown(Keys.R)){Vector3 c=(boundsMin+boundsMax)*.5f;camera.LookAt(c+new Vector3(0,5,20),c,new Vector3(0,1,0));}
+      if(UpdateWalkingMode(dt))return;
+      float freeSpeed=cameraSpeed*multiplier;
+
+      // Match Jedipedia's perspective keyboard layout. A/D and J/L turn, I/K pitch, Q/E strafe, while W/S
+      // move along the actual view direction and Space lifts in world Y. Build one normalized velocity so diagonal
+      // movement is not faster than a single-axis move. PugTools' RH view uses -Look as the visible forward vector.
+      float perspectiveLookStep=1.8f*dt;
+      if(Util.IsKeyDown(Keys.A)||Util.IsKeyDown(Keys.J))camera.Yaw(perspectiveLookStep);
+      if(Util.IsKeyDown(Keys.D)||Util.IsKeyDown(Keys.L))camera.Yaw(-perspectiveLookStep);
+      if(Util.IsKeyDown(Keys.I))PitchPerspectiveCamera(perspectiveLookStep);
+      if(Util.IsKeyDown(Keys.K))PitchPerspectiveCamera(-perspectiveLookStep);
+
+      Vector3 freeMove=Vector3.Zero;
+      Vector3 visibleForward=-camera.Look;
+      Vector3 visibleRight=camera.Right;
+      if(Util.IsKeyDown(Keys.W))freeMove+=visibleForward;
+      if(Util.IsKeyDown(Keys.S))freeMove-=visibleForward;
+      if(Util.IsKeyDown(Keys.E))freeMove+=visibleRight;
+      if(Util.IsKeyDown(Keys.Q))freeMove-=visibleRight;
+      if(Util.IsKeyDown(Keys.Space))freeMove+=Vector3.UnitY;
+      if(freeMove.LengthSquared()>.000001f){freeMove.Normalize();camera.Position+=freeMove*(freeSpeed*dt);}
+    }
+
+    private void PitchPerspectiveCamera(float delta){
+      // Jedipedia clamps perspective pitch just short of the poles (about 87 degrees). Derive the visible pitch
+      // from -Look so keyboard look cannot flip the FPS basis even if a key is held for a long time.
+      const float maxPitch=1.52f;
+      float y=Math.Max(-1f,Math.Min(1f,-camera.Look.Y));
+      float current=(float)Math.Asin(y);
+      float target=Math.Max(-maxPitch,Math.Min(maxPitch,current+delta));
+      float applied=target-current;
+      if(Math.Abs(applied)>.000001f)camera.Pitch(applied);
     }
 
     public override void DrawScene(){
       base.DrawScene(); if(fx==null)return; if(temporalHistoryResetRequested){InvalidateTemporalHistory();temporalHistoryResetRequested=false;} WorldRenderSettings s=SettingsSnapshot();
-      // /engine/follower.fol is an invisible moving parent used heavily by vista traffic. Update it before camera-room
-      // lookup and visibility collection so children never render at their authored origin (often 0,0,0).
-      UpdatePathFollowers(elapsed);
+      EnsureTextureQualityResources(s);
+      EnsureShadowQualityResources(s);
+      ProcessTeleportWarmup();
       bool captureMiniMap=miniMapCaptureRequested&&!mapOpen;
+      bool requestedMapNotes=s.ShowMapNotes;
+      // The full map/minimap is intentionally static. Freezing follower/SPN animation while a map frame is being
+      // rendered removes a large amount of per-frame transform/CPU-skin work without changing the normal 3D view;
+      // elapsed time is absolute, so followers immediately resume at the correct pose after the map closes.
+      if(!mapOpen&&!captureMiniMap)UpdatePathFollowers(elapsed);
       if(captureMiniMap){miniMapCaptureRequested=false;ResetMapCamera();}
       if(mapOpen||captureMiniMap){
         s=s.Clone();
@@ -706,11 +1369,28 @@ namespace PugTools {
         s.EnableLocalLights=false;
         s.ShowSky=false;
         s.ShowDynamicDetails=false;
+        // Keep the user's population visibility setting intact. Only animation is frozen below; this preserves the
+        // feature set while avoiding the costly per-frame CPU skinning/route work on full world/minimap renders.
+        // Generated maps suppress editor helpers regardless of the 3D-view submenu toggles. Without the old
+        // top-level Show tier these have to be disabled explicitly on the capture clone.
+        s.ShowUtilitySpawners=false;
+        s.ShowUtilityCoverPoints=false;
+        s.ShowUtilityLights=false;
+        s.ShowUtilitySeedPoints=false;
+        s.ShowUtilityPaths=false;
+        s.ShowUtilityMapRoadPaths=false;
+        s.ShowUtilityConnections=false;
+        s.ShowUtilityVolumes=false;
+        s.ShowUtilityOther=false;
+        s.ShowHiddenGeometry=false;
         s.ShowTerrain=true;
         s.ShowModels=true;
         s.ShowWater=true;
-        s.ShowRoads=true;
-        s.ShowMapNotes=false;
+        s.AnimateNpcs=false;
+        s.AnimateSpnObjects=false;
+        // The interactive M map now keeps the user's map-note layer and renders original game symbols. A generated
+        // minimap snapshot stays symbol-free because the WinForms overlay paints the same icons live on top of it.
+        s.ShowMapNotes=mapOpen&&requestedMapNotes;
         // Jedipedia's M map is a render of the actual terrain/world layout. Authored 2D map art remains
         // available through the explicit toolbar Map mode, but does not cover the interactive M map.
         s.ShowMapArt=false;
@@ -744,11 +1424,13 @@ namespace PugTools {
         else {viewProj=currentUnjittered;frameProjection=camera.Proj;taaJitterPixels=Vector2.Zero;taaReprojectionValid=false;}
       }
 
-      bool shadows=s.EnableShadows&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap&&env.CastDirectionalShadows;
+      bool shadows=s.EnableShadows&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap&&env.CastDirectionalShadows&&shadowMaps.All(x=>x!=null);
       HashSet<string> visible=BuildVisibleRoomSet(cameraRoom,s);
+      ProcessCameraWarmup(cameraRoom,visible,s);
+      PrepareObjectOcclusionFrame(s,visible);
       // Local lights and receiver meshes are static. Keep the cell selections across frames and invalidate only
       // when the active room/visibility mode changes; this removes the remaining per-frame CPU selection cost.
-      string lightScope=visible==null?"*":((cameraRoom?.RoomName??String.Empty)+(s.ShowSky?"|sky":"|nosky"));
+      string lightScope=(cameraRoom?.RoomName??String.Empty)+(s.ShowSky?"|sky|":"|nosky|")+VisibleRoomScope(visible);
       if(!String.Equals(lightScope,localLightVisibilityScope,StringComparison.Ordinal)){localLightSelectionCache.Clear();localLightVisibilityScope=lightScope;}
       // Dynamic-detail shadow cards need the same camera/time values as their visible pass.
       fx.SetCamera(cam);fx.SetScrolling(env,elapsed,LoadTexture(env.ScrollingTexture),LoadTexture(env.ScrollingMask));
@@ -760,9 +1442,10 @@ namespace PugTools {
       var clear=new Color4(env.FogColorSky.W,env.FogColorSky.X,env.FogColorSky.Y,env.FogColorSky.Z);
       ImmediateContext.ClearRenderTargetView(target,clear);ImmediateContext.ClearDepthStencilView(DepthStencilView,DepthStencilClearFlags.Depth|DepthStencilClearFlags.Stencil,1,0);
       ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
-      fx.SetViewProj(viewProj);fx.SetCamera(cam);fx.SetEnvironment(env,s.EnableLighting,s.EnableFog,shadows,s.ViewDistanceScale);fx.SetHeightRange(boundsMin.Y,boundsMax.Y);
+      fx.SetViewProj(viewProj);fx.SetCamera(cam);fx.SetEnvironment(env,s.EnableLighting,s.EnableFog,shadows,s.ViewDistanceScale);fx.SetHeightRange(boundsMin.Y,boundsMax.Y);fx.SetPlaceableBlueGlow(false);
       ShaderResourceView illum=LoadTexture(env.IlluminationMap);fx.SetIllumination(illum);fx.SetScrolling(env,elapsed,LoadTexture(env.ScrollingTexture),LoadTexture(env.ScrollingMask));
-      var maps=shadowMaps.Select(x=>x.DepthMapSRV).ToArray();fx.SetShadows(shadowMatrices,maps,shadowDistances,shadows);fx.ClearLocalLights();lastLocalLightCount=0;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
+      var maps=shadowMaps.Select(x=>x?.DepthMapSRV).ToArray();fx.SetShadows(shadowMatrices,maps,shadowDistances,shadows);fx.ClearLocalLights();currentLocalLightSelection=LocalLightSelection.Empty;lastLocalLightCount=0;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
+      UpdateJedipediaDynamicLights(s);
       // Jedipedia renders the skyscene as a backdrop and clears depth before the actual world. Drawing it
       // mixed into the model pass lets sky geometry fight with terrain/models and is responsible for many
       // floating/half-screen artefacts when a skyscene happens to intersect the world depth buffer.
@@ -770,13 +1453,48 @@ namespace PugTools {
         DrawSky(env,s);
         ImmediateContext.ClearDepthStencilView(DepthStencilView,DepthStencilClearFlags.Depth|DepthStencilClearFlags.Stencil,1,0);
       }
-      if(s.ShowTerrain)DrawTerrain(viewProj,visible,s,env,shadows);if(s.ShowDynamicDetails&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDynamicDetails(viewProj,visible,s,env,shadows);if(s.ShowModels)DrawModels(viewProj,visible,s,env,shadows);if(s.ShowNpcs&&s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaNpcs(viewProj,visible,s);if(s.ShowSpnObjects&&s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaSpnObjects(viewProj,visible,s);if(s.ShowDecorationHooks&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDecorationHooks(viewProj,visible,s,env,shadows);if(s.ShowWater)DrawWater(viewProj,visible,s);
+      // Jedipedia's native dPVS consumes authored occlusion geometry before deciding which receivers are visible.
+      // We cannot run its WASM/native solver here, but the same LOD -3/OCCLUDER_ONLY meshes make an effective
+      // conservative D3D11 depth prepass and also give nameplate occlusion the authored walls instead of text-only heuristics.
+      if(s.ShowModels&&s.EnableOccluderPrepass&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Wireframe)
+        DrawOccluderPrepass(viewProj,visible,s);
+      if(s.ShowTerrain)DrawTerrain(viewProj,visible,s,env,shadows);if(s.ShowDynamicDetails&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDynamicDetails(viewProj,visible,s,env,shadows);if(s.ShowModels)DrawModels(viewProj,visible,s,env,shadows);if((s.ShowNpcs||s.ShowTaxiTerminals)&&s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Map)DrawJedipediaNpcs(viewProj,visible,s,env,shadows);if(s.ShowSpnObjects&&s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaSpnObjects(viewProj,visible,s,env,shadows);DrawTaxiVehicle(viewProj,visible,s,env,shadows);if(s.ShowDecorationHooks&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDecorationHooks(viewProj,visible,s,env,shadows);if(s.ShowWater)DrawWater(viewProj,visible,s);
       if(s.Mode==WorldRenderMode.Map&&s.ShowMapArt)DrawMapArt(viewProj);
-      if(s.ShowRoads)DrawLines(roadGpu,viewProj,s.Mode==WorldRenderMode.Map?float.MaxValue:camera.FarZ);if(s.ShowMapNotes)DrawLines(noteGpu,viewProj,s.Mode==WorldRenderMode.Map?float.MaxValue:camera.FarZ);
+      if(s.ShowRoads)DrawLines(roadGpu,viewProj,s.Mode==WorldRenderMode.Map?float.MaxValue:camera.FarZ);
+      if(s.ShowMapNotes&&s.Mode==WorldRenderMode.Map){
+        if(s.ShowMapIconOther)DrawLines(mapNoteFallbackGpu,viewProj,float.MaxValue);
+        DrawMapNoteIcons(viewProj,s);
+      }
       if(s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaUtilities(viewProj,visible,s);
+      // The generated minimap already paints its marker in WinForms. Only the interactive M map needs the GPU
+      // marker, otherwise the minimap capture would bake a second arrow into its bitmap.
+      if(mapOpen&&s.Mode==WorldRenderMode.Map){DrawTaxiRouteMapOverlay(viewProj,s);DrawMapPlayerMarker(viewProj);}
+      DrawWorldSelectionOutline(viewProj,s);
 
       if(useOffscreen)ResolvePostProcessing(s,env,useTaa,useFxaa);
-      if(s.Mode!=WorldRenderMode.Heightmap)DrawNpcNameplates(viewProj,visible,s);
+      if(s.Mode!=WorldRenderMode.Heightmap){
+        // UI/nameplate projection must stay on the stable camera matrix while the depth query samples the matrix
+        // that actually rendered this frame (jittered when TAA is enabled).
+        Matrix labelViewProj=s.Mode==WorldRenderMode.Map?viewProj:camera.ViewProj;
+        DrawNpcNameplates(labelViewProj,viewProj,visible,s);
+        DrawWorldSelectionLabel(labelViewProj,s);
+        DrawTaxiRideHud(s);
+      }
+      UpdateObjectOcclusionVisibility(viewProj,visible,s);
+      UpdateWorldRenderStatsSnapshot();
+      worldRenderFrame++;
+      // Spread cache maintenance across frames.  Running all six world-wide scans on the same frame produced a
+      // visible hitch on NPC-heavy planets even though each cache keeps the same ~180-frame eviction cadence.
+      if((worldRenderFrame%30)==0){
+        switch((int)((worldRenderFrame/30)%6)){
+          case 0:TrimMaterialTextureResidency();break;
+          case 1:TrimWaterTextureResidency(s);break;
+          case 2:TrimSharedTextureResidency();break;
+          case 3:TrimTerrainTextureResidency(s);break;
+          case 4:TrimModelGeometryResidency();break;
+          default:TrimNpcSkinStateResidency();break;
+        }
+      }
       if(captureMiniMap){
         Bitmap snapshot=CaptureBackBufferBitmap();
         if(snapshot!=null&&Window is WorldBrowser browser){
@@ -871,6 +1589,11 @@ namespace PugTools {
       if(inst==null||area==null||!area.AssetIdMap.TryGetValue(inst.assetID,out AreaAsset asset))return false;
       return string.Equals((asset.Extension??string.Empty).Trim().TrimStart('.'),"fol",StringComparison.OrdinalIgnoreCase)&&
         string.Equals(NormalizeAssetPath(asset.Path),"engine/follower",StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsSpeedTreeInstance(AssetInstance inst){
+      if(inst==null||area==null||!area.AssetIdMap.TryGetValue(inst.assetID,out AreaAsset asset)||asset==null)return false;
+      return string.Equals((asset.Extension??string.Empty).Trim().TrimStart('.'),"spt",StringComparison.OrdinalIgnoreCase);
     }
 
     private void BuildPathFollowers(){
@@ -1060,10 +1783,17 @@ namespace PugTools {
       return result;
     }
 
-    private static bool InstanceVisibleInWorld(AssetInstance inst){
-      if(inst==null||inst.hidden||inst.PathFollowerPending)return false;
-      return inst.Viewability!=AssetInstanceViewability.MapOnly&&inst.Viewability!=AssetInstanceViewability.OccluderOnly;
+    private static bool InstanceVisibleInWorld(AssetInstance inst,WorldRenderSettings s=null){
+      if(inst==null||inst.PathFollowerPending)return false;
+      // Hidden/MAP_ONLY/OCCLUDER_ONLY placements are an explicit opt-in through the Utilities submenu. There is no
+      // second top-level display tier anymore: the submenu checkbox is the single source of truth.
+      bool showHidden=s?.ShowHiddenGeometry==true;
+      if(inst.hidden&&!showHidden)return false;
+      if(!showHidden&&(inst.Viewability==AssetInstanceViewability.MapOnly||inst.Viewability==AssetInstanceViewability.OccluderOnly))return false;
+      return true;
     }
+
+    private static bool InstanceCanEnterRenderIndex(AssetInstance inst)=>inst!=null&&!inst.PathFollowerPending;
 
     private static bool InstanceVisibleOnMap(AssetInstance inst){
       if(inst==null||inst.hidden||inst.PathFollowerPending)return false;
@@ -1139,18 +1869,24 @@ namespace PugTools {
           // an infinite vertical X/Z prism when Height was not authored, which is why flying high above a planet
           // still has a real camera room instead of `_everywhere_`.
           if(inst.hasHeightMap)rank=0;else if(ext=="rbd")rank=1;else if(ext=="rgn")rank=2;else if(ext=="trg")rank=3;else continue;
+          RegionVolumeData region=ext=="rgn"?inst.RegionVolume:null;
           float width=Math.Abs(inst.width),depth=Math.Abs(inst.depth),height=Math.Abs(inst.height);bool hasHeight=inst.HasHeightProperty&&height>.0001f;
-          if(!(width>.0001f)||!(depth>.0001f))continue;
+          // A real .rgn is not a Width/Depth box at all. Its rgnVolumeData footprint can be concave and each
+          // vertex has its own ceiling height; keep the simple dimensions only as a fallback for old/partial DATs.
+          if(region==null&&(!(width>.0001f)||!(depth>.0001f)))continue;
           Matrix world=InstanceWorld(inst,room),inverse;try{inverse=Matrix.Invert(world);}catch{continue;}
-          var entry=new RoomPlacementEntry{Room=room,Inverse=inverse,Width=width,Depth=depth,Height=height,HasHeight=hasHeight,Rank=rank};
+          string placementAssetPath=asset.Path+(String.IsNullOrWhiteSpace(asset.Extension)?String.Empty:"."+asset.Extension.TrimStart('.'));
+          var entry=new RoomPlacementEntry{Room=room,Instance=inst,AssetPath=placementAssetPath,Inverse=inverse,Width=width,Depth=depth,Height=height,HasHeight=hasHeight,Rank=rank,RegionVolume=region};
           float halfW=width*.5f,halfD=depth*.5f,halfH=hasHeight?height*.5f:0f;
-          // With no authored height the volume is an infinite local-Y prism. If local Y rotates into world X/Z,
+          // With no authored height the legacy box is an infinite local-Y prism. If local Y rotates into world X/Z,
           // there is no finite 2D index box; keep this rare placement in the global fallback exactly rather than
-          // risking a false negative. Upright heightmaps/volumes can still use the cheap grid.
-          if(!hasHeight&&(Math.Abs(world.M21)>.000001f||Math.Abs(world.M23)>.000001f)){roomPlacementGlobal.Add(entry);continue;}
+          // risking a false negative. Real region meshes always have finite local bounds.
+          if(region==null&&!hasHeight&&(Math.Abs(world.M21)>.000001f||Math.Abs(world.M23)>.000001f)){roomPlacementGlobal.Add(entry);continue;}
           Vector3 min=new Vector3(float.MaxValue,float.MaxValue,float.MaxValue),max=new Vector3(float.MinValue,float.MinValue,float.MinValue);
+          Vector3 localMin=region!=null?region.Min:new Vector3(-halfW,-halfH,-halfD);
+          Vector3 localMax=region!=null?region.Max:new Vector3(halfW,halfH,halfD);
           for(int z=0;z<2;z++)for(int y=0;y<2;y++)for(int x=0;x<2;x++){
-            Vector3 c=Vector3.TransformCoordinate(new Vector3(x==0?-halfW:halfW,y==0?-halfH:halfH,z==0?-halfD:halfD),world);Expand(ref min,ref max,c);
+            Vector3 c=Vector3.TransformCoordinate(new Vector3(x==0?localMin.X:localMax.X,y==0?localMin.Y:localMax.Y,z==0?localMin.Z:localMax.Z),world);Expand(ref min,ref max,c);
           }
           int minX=RoomPlacementCell(min.X),maxX=RoomPlacementCell(max.X),minZ=RoomPlacementCell(min.Z),maxZ=RoomPlacementCell(max.Z);
           long cells=(long)(maxX-minX+1)*(maxZ-minZ+1);
@@ -1161,6 +1897,115 @@ namespace PugTools {
         }
       }
     }
+    private void BuildVolumeMembershipIndex(){
+      volumeMembershipGrid.Clear();volumeMembershipGlobal.Clear();volumeMembershipByKey.Clear();if(area==null)return;
+      foreach(Room room in rooms){
+        if(room?.InstancesById==null)continue;
+        foreach(AssetInstance inst in room.InstancesById.Values){
+          if(inst==null||!area.AssetIdMap.TryGetValue(inst.assetID,out AreaAsset asset)||asset==null)continue;
+          string ext=(asset.Extension??String.Empty).Trim().TrimStart('.').ToLowerInvariant();
+          bool isRegion=ext=="rgn",isTrigger=ext=="trg";if(!isRegion&&!isTrigger)continue;
+          RegionVolumeData region=isRegion?inst.RegionVolume:null;
+          if(isRegion&&region==null)continue; // Jedipedia never invents a Width/Depth box for a region.rgn.
+          float width=Math.Abs(inst.width),height=Math.Abs(inst.height),depth=Math.Abs(inst.depth);
+          if(isTrigger){
+            // AssetInstance's 64-unit defaults are parser fallbacks, not authored trigger extents. A trigger with no
+            // dimension property is therefore not a real membership volume and must not cover half the map.
+            if(!inst.HasWidthProperty&&!inst.HasHeightProperty&&!inst.HasDepthProperty)continue;
+            if(!(width>.0001f)||!(height>.0001f)||!(depth>.0001f))continue;
+          }
+          Matrix world=InstanceWorld(inst,room),inverse;try{inverse=Matrix.Invert(world);}catch{continue;}
+          Vector3 localMin,localMax;
+          if(isRegion){localMin=region.Min;localMax=region.Max;}
+          else{localMin=new Vector3(-width*.5f,-height*.5f,-depth*.5f);localMax=new Vector3(width*.5f,height*.5f,depth*.5f);}
+          string cls=isRegion?(String.IsNullOrWhiteSpace(inst.RegionClassType)?"GENERIC":inst.RegionClassType)
+            :(String.IsNullOrWhiteSpace(inst.TriggerClassType)?"GENERIC":inst.TriggerClassType);
+          string detail=isRegion
+            ? (String.Equals(cls,"RESPAWN",StringComparison.OrdinalIgnoreCase)?inst.RegionRespawnMedCenter:RegionCharacteristicsSummary(inst.RegionCharacteristics))
+            : (!String.IsNullOrWhiteSpace(inst.TriggerParam)?inst.TriggerParam:inst.TriggerTag);
+          float determinant=world.M11*(world.M22*world.M33-world.M23*world.M32)-world.M12*(world.M21*world.M33-world.M23*world.M31)+world.M13*(world.M21*world.M32-world.M22*world.M31);
+          Vector3 extent=localMax-localMin;float sortVolume=Math.Max(.000001f,Math.Abs(extent.X*extent.Y*extent.Z*determinant));
+          string placementAssetPath=asset.Path+(String.IsNullOrWhiteSpace(asset.Extension)?String.Empty:"."+asset.Extension.TrimStart('.'));
+          var entry=new VolumeMembershipEntry{Room=room,Instance=inst,AssetPath=placementAssetPath,Inverse=inverse,RegionVolume=region,IsRegion=isRegion,
+            HalfWidth=width*.5f,HalfHeight=height*.5f,HalfDepth=depth*.5f,Ellipsoid=inst.TriggerEllipsoid,ClassType=cls,Detail=detail,SortVolume=sortVolume};
+          volumeMembershipByKey[WorldVolumeKey(room?.RoomName,inst.ID)]=entry;
+          Vector3 min=new Vector3(float.MaxValue,float.MaxValue,float.MaxValue),max=new Vector3(float.MinValue,float.MinValue,float.MinValue);
+          for(int z=0;z<2;z++)for(int y=0;y<2;y++)for(int x=0;x<2;x++){
+            Vector3 c=Vector3.TransformCoordinate(new Vector3(x==0?localMin.X:localMax.X,y==0?localMin.Y:localMax.Y,z==0?localMin.Z:localMax.Z),world);Expand(ref min,ref max,c);
+          }
+          int minX=RoomPlacementCell(min.X),maxX=RoomPlacementCell(max.X),minZ=RoomPlacementCell(min.Z),maxZ=RoomPlacementCell(max.Z);
+          long cells=(long)(maxX-minX+1)*(maxZ-minZ+1);
+          if(cells<=0||cells>MaxRoomPlacementCells){volumeMembershipGlobal.Add(entry);continue;}
+          for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++){
+            var key=(x,z);if(!volumeMembershipGrid.TryGetValue(key,out List<VolumeMembershipEntry> bucket))volumeMembershipGrid[key]=bucket=new List<VolumeMembershipEntry>();bucket.Add(entry);
+          }
+        }
+      }
+    }
+
+    private static string RegionCharacteristicsSummary(string value){
+      string text=(value??String.Empty).Trim();if(text.Length==0||text=="!!")return String.Empty;
+      return String.Join(", ",text.Split(new[]{'!'},StringSplitOptions.RemoveEmptyEntries).Select(part=>part.Trim()).Where(part=>part.Length>0));
+    }
+
+    private static bool VolumeContainsPosition(VolumeMembershipEntry entry,Vector3 worldPosition){
+      if(entry==null)return false;Vector3 local;try{local=Vector3.TransformCoordinate(worldPosition,entry.Inverse);}catch{return false;}
+      if(entry.IsRegion)return RegionContainsLocalPosition(entry.RegionVolume,local);
+      float x=Math.Abs(local.X)/Math.Max(.0001f,entry.HalfWidth),y=Math.Abs(local.Y)/Math.Max(.0001f,entry.HalfHeight),z=Math.Abs(local.Z)/Math.Max(.0001f,entry.HalfDepth);
+      return entry.Ellipsoid?x*x+y*y+z*z<=1.0001f:x<=1.0001f&&y<=1.0001f&&z<=1.0001f;
+    }
+
+    private static int VolumeClassOrder(string value){
+      string cls=(value??String.Empty).ToUpperInvariant();
+      switch(cls){
+        case "RESPAWN": return 0; case "MAP": return 1; case "AUDIO": case "AUDIO_REGION": return 2; case "GENERIC": return 3;
+        case "INSTANCE_REGION": return 4; case "DEATH": case "DEATH_VOLUME": return 5; case "EXHAUSTION": case "EXHAUSTION_VOLUME": return 6;
+        case "PLANETARY_WORLD_QUEST": case "PLANETARY_WORLD_QUEST_VOLUME": return 7; case "META_WORLD_QUEST": case "META_WORLD_QUEST_VOLUME": return 8;
+        case "SHARED_WORLD_QUEST": case "SHARED_WORLD_QUEST_VOLUME": return 9; case "WORLD_QUEST": case "WORLD_QUEST_VOLUME": return 10; default:return 100;
+      }
+    }
+
+    private static string WorldVolumeKey(string roomName,ulong instanceId)=>(roomName??String.Empty)+"#"+instanceId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    private static WorldVolumeInfo ToWorldVolumeInfo(VolumeMembershipEntry entry){
+      if(entry?.Instance==null)return null;
+      string kind=entry.IsRegion?"REGION":"TRIGGER";string cls=String.IsNullOrWhiteSpace(entry.ClassType)?"GENERIC":entry.ClassType;
+      string text=kind+" "+cls;if(!String.IsNullOrWhiteSpace(entry.Detail))text+=" — "+entry.Detail;
+      text+=" — "+(entry.AssetPath??("instance "+entry.Instance.ID));if(!String.IsNullOrWhiteSpace(entry.Room?.RoomName))text+=" ["+entry.Room.RoomName+"]";
+      return new WorldVolumeInfo{InstanceId=entry.Instance.ID,RoomName=entry.Room?.RoomName??String.Empty,Description=text,ClassType=cls,Detail=entry.Detail??String.Empty,AssetPath=entry.AssetPath??String.Empty,IsRegion=entry.IsRegion};
+    }
+
+    public List<WorldVolumeInfo> PinnedWorldVolumeInfos {
+      get {
+        var result=new List<WorldVolumeInfo>();
+        lock(pinnedVolumeGpu){
+          foreach(string key in pinnedVolumeGpuByKey.Keys){
+            if(!volumeMembershipByKey.TryGetValue(key,out VolumeMembershipEntry entry))continue;
+            WorldVolumeInfo info=ToWorldVolumeInfo(entry);if(info!=null)result.Add(info);
+          }
+        }
+        return result;
+      }
+    }
+
+    public List<WorldVolumeInfo> CurrentVolumeInfos(Vector3 worldPosition,int maxCount=32){
+      var matches=new List<VolumeMembershipEntry>();var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      void Consider(IEnumerable<VolumeMembershipEntry> entries){
+        if(entries==null)return;foreach(VolumeMembershipEntry entry in entries){
+          if(entry?.Instance==null)continue;string key=(entry.Room?.RoomName??String.Empty)+"#"+entry.Instance.ID.ToString(System.Globalization.CultureInfo.InvariantCulture);if(!seen.Add(key))continue;
+          if(VolumeContainsPosition(entry,worldPosition))matches.Add(entry);
+        }
+      }
+      volumeMembershipGrid.TryGetValue((RoomPlacementCell(worldPosition.X),RoomPlacementCell(worldPosition.Z)),out List<VolumeMembershipEntry> bucket);Consider(bucket);Consider(volumeMembershipGlobal);
+      matches.Sort((a,b)=>{int c=VolumeClassOrder(a.ClassType).CompareTo(VolumeClassOrder(b.ClassType));if(c!=0)return c;c=String.Compare(a.ClassType,b.ClassType,StringComparison.OrdinalIgnoreCase);if(c!=0)return c;c=a.SortVolume.CompareTo(b.SortVolume);if(c!=0)return c;return String.Compare(a.AssetPath,b.AssetPath,StringComparison.OrdinalIgnoreCase);});
+      var result=new List<WorldVolumeInfo>();int limit=Math.Max(1,maxCount);
+      foreach(VolumeMembershipEntry entry in matches){
+        WorldVolumeInfo info=ToWorldVolumeInfo(entry);if(info!=null)result.Add(info);
+        if(result.Count>=limit)break;
+      }
+      return result;
+    }
+
     private static int RoomPlacementCell(float coordinate)=>(int)Math.Floor(coordinate/RoomPlacementCellSize);
 
     private static bool IsEverywhereRoom(Room room)=>room!=null&&string.Equals(room.RoomName,"_everywhere_",StringComparison.OrdinalIgnoreCase);
@@ -1170,7 +2015,7 @@ namespace PugTools {
       foreach(Room room in rooms){
         if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName))continue;
         foreach(AssetInstance inst in room.InstancesById.Values){
-          if(!InstanceVisibleInWorld(inst)||inst.PathFollowerBoundaryExcluded||inst.hasHeightMap||inst.hasWater||!models.TryGetValue(inst.assetID,out GR2 model)||model==null)continue;
+          if(!InstanceVisibleInWorld(inst)||inst.PathFollowerBoundaryExcluded||inst.hasHeightMap||inst.hasWater||IsSpeedTreeInstance(inst)||!models.TryGetValue(inst.assetID,out GR2 model)||model==null)continue;
           ModelFloorData floor=GetOrBuildModelFloorData(model,inst);if(floor==null||floor.Meshes.Count==0)continue;
           Matrix world=InstanceWorld(inst,room),inverse;try{inverse=Matrix.Invert(world);}catch{continue;}
           if(!TryModelWorldXZBounds(model,world,out float minX,out float maxX,out float minZ,out float maxZ))continue;
@@ -1270,9 +2115,62 @@ namespace PugTools {
       return TryTriangleYAtXZ(a,b,c,point.X,point.Z,out worldY);
     }
 
+    // Orthographic cutaway height follows Jedipedia's nearest authored floor under the camera. Prefer the
+    // highest valid HMS/model triangle at this X/Z, but never jump to geometry above the current eye.
+    private bool TrySampleViewerFloor(float worldX,float worldZ,float eyeY,out float worldY){
+      worldY=0f;float bestWorldY=float.MinValue;bool found=false;Vector3 p=new Vector3(worldX,eyeY,worldZ);
+      void ConsiderY(float y){
+        if(float.IsNaN(y)||float.IsInfinity(y)||y>eyeY+.05f)return;
+        if(!found||y>bestWorldY){bestWorldY=y;found=true;}
+      }
+      if(heightMapFloorGrid.TryGetValue((FloorCell(worldX),FloorCell(worldZ)),out List<HeightMapFloorEntry> heightEntries))
+        foreach(HeightMapFloorEntry entry in heightEntries)if(TryHeightMapFloorY(entry,p,out float y))ConsiderY(y);
+      void ConsiderModels(IEnumerable<ModelFloorPlacementEntry> placements){
+        if(placements==null)return;
+        foreach(ModelFloorPlacementEntry placement in placements){
+          if(placement==null||placement.Model==null||worldX<placement.WorldMinX-.0001f||worldX>placement.WorldMaxX+.0001f||worldZ<placement.WorldMinZ-.0001f||worldZ>placement.WorldMaxZ+.0001f)continue;
+          Vector3 local;try{local=Vector3.TransformCoordinate(p,placement.Inverse);}catch{continue;}
+          foreach(FloorMeshData meshData in placement.Model.Meshes)
+            foreach(int offset in FloorMeshCandidateOffsets(meshData,local,placement.LocalXZIndependentOfY))
+              if(TryFloorTriangleHit(meshData.Mesh,offset,placement.World,p,out float y))ConsiderY(y);
+        }
+      }
+      modelFloorPlacementGrid.TryGetValue((ModelFloorPlacementCell(worldX),ModelFloorPlacementCell(worldZ)),out List<ModelFloorPlacementEntry> modelEntries);
+      ConsiderModels(modelEntries);ConsiderModels(modelFloorPlacementGlobal);
+      if(found)worldY=bestWorldY;return found;
+    }
+
     private static bool TryTriangleYAtXZ(Vector3 a,Vector3 b,Vector3 c,float x,float z,out float y){
       y=0f;if(x<Math.Min(a.X,Math.Min(b.X,c.X))-.0001f||x>Math.Max(a.X,Math.Max(b.X,c.X))+.0001f||z<Math.Min(a.Z,Math.Min(b.Z,c.Z))-.0001f||z>Math.Max(a.Z,Math.Max(b.Z,c.Z))+.0001f)return false;
       float denominator=(b.Z-c.Z)*(a.X-c.X)+(c.X-b.X)*(a.Z-c.Z);if(Math.Abs(denominator)<.0001f)return false;float wa=((b.Z-c.Z)*(x-c.X)+(c.X-b.X)*(z-c.Z))/denominator;float wb=((c.Z-a.Z)*(x-c.X)+(a.X-c.X)*(z-c.Z))/denominator;float wc=1f-wa-wb;if(wa<-.0001f||wb<-.0001f||wc<-.0001f)return false;y=wa*a.Y+wb*b.Y+wc*c.Y;return true;
+    }
+
+    // Same triangular-prism containment as Jedipedia's phase.js. The floor follows the authored triangle plane
+    // and the ceiling adds the barycentrically interpolated per-vertex extrusion, so sloped regions remain wedges
+    // instead of turning into oversized axis-aligned slabs.
+    private static bool RegionContainsLocalPosition(RegionVolumeData region,Vector3 local){
+      if(region?.Positions==null||region.Heights==null||region.Indices==null||region.Indices.Length<3)return false;
+      Vector3 min=region.Min,max=region.Max;if(local.X<min.X-.0001f||local.X>max.X+.0001f||local.Y<min.Y-.0001f||local.Y>max.Y+.0001f||local.Z<min.Z-.0001f||local.Z>max.Z+.0001f)return false;
+      Vector3[] positions=region.Positions;float[] heights=region.Heights;ushort[] indices=region.Indices;
+      for(int i=0;i+2<indices.Length;i+=3){
+        int ai=indices[i],bi=indices[i+1],ci=indices[i+2];if(ai>=positions.Length||bi>=positions.Length||ci>=positions.Length||ai>=heights.Length||bi>=heights.Length||ci>=heights.Length)continue;
+        Vector3 a=positions[ai],b=positions[bi],c=positions[ci];float acx=c.X-a.X,acz=c.Z-a.Z,abx=b.X-a.X,abz=b.Z-a.Z;float denominator=abx*acz-acx*abz;if(Math.Abs(denominator)<.000000001f)continue;
+        float px=local.X-a.X,pz=local.Z-a.Z;float beta=(px*acz-acx*pz)/denominator,gamma=(abx*pz-px*abz)/denominator;if(beta<-.0001f||gamma<-.0001f||beta+gamma>1.0001f)continue;
+        float alpha=1f-beta-gamma;float floor=alpha*a.Y+beta*b.Y+gamma*c.Y;float ceiling=floor+alpha*heights[ai]+beta*heights[bi]+gamma*heights[ci];float low=Math.Min(floor,ceiling),high=Math.Max(floor,ceiling);
+        if(local.Y>=low-.0001f&&local.Y<=high+.0001f)return true;
+      }
+      return false;
+    }
+
+    public string CurrentRegionSummary {
+      get {
+        List<string> regions=CurrentRegionDescriptions(camera?.Position??Vector3.Zero,4);
+        return regions.Count==0?"none":String.Join(" | ",regions);
+      }
+    }
+
+    public List<string> CurrentRegionDescriptions(Vector3 worldPosition,int maxCount=16){
+      return CurrentVolumeInfos(worldPosition,maxCount).Select(info=>info.Description).ToList();
     }
 
     private Room FindPlacementRoom(Vector3 p){
@@ -1280,10 +2178,19 @@ namespace PugTools {
       void Consider(IEnumerable<RoomPlacementEntry> entries){
         if(entries==null)return;
         foreach(RoomPlacementEntry entry in entries){
-          Vector3 local=Vector3.TransformCoordinate(p,entry.Inverse);float halfW=entry.Width*.5f,halfD=entry.Depth*.5f;
-          if(Math.Abs(local.X)>halfW+.0001f||Math.Abs(local.Z)>halfD+.0001f)continue;
-          if(entry.HasHeight&&Math.Abs(local.Y)>entry.Height*.5f+8f)continue;
-          float distance=(float)Math.Sqrt(local.X*local.X/Math.Max(halfW*halfW,1f)+local.Z*local.Z/Math.Max(halfD*halfD,1f));
+          Vector3 local=Vector3.TransformCoordinate(p,entry.Inverse);float distance;
+          if(entry.RegionVolume!=null){
+            if(!RegionContainsLocalPosition(entry.RegionVolume,local))continue;
+            Vector3 rmin=entry.RegionVolume.Min,rmax=entry.RegionVolume.Max;
+            float cx=(rmin.X+rmax.X)*.5f,cz=(rmin.Z+rmax.Z)*.5f;
+            float hx=Math.Max((rmax.X-rmin.X)*.5f,1f),hz=Math.Max((rmax.Z-rmin.Z)*.5f,1f);
+            float dx=(local.X-cx)/hx,dz=(local.Z-cz)/hz;distance=(float)Math.Sqrt(dx*dx+dz*dz);
+          }else{
+            float halfW=entry.Width*.5f,halfD=entry.Depth*.5f;
+            if(Math.Abs(local.X)>halfW+.0001f||Math.Abs(local.Z)>halfD+.0001f)continue;
+            if(entry.HasHeight&&Math.Abs(local.Y)>entry.Height*.5f+8f)continue;
+            distance=(float)Math.Sqrt(local.X*local.X/Math.Max(halfW*halfW,1f)+local.Z*local.Z/Math.Max(halfD*halfD,1f));
+          }
           if(best==null||entry.Rank<best.Rank||(entry.Rank==best.Rank&&(distance<bestDistance-.0001f||(Math.Abs(distance-bestDistance)<.0001f&&String.Compare(entry.Room.RoomName,best.Room.RoomName,StringComparison.OrdinalIgnoreCase)<0)))){
             best=entry;bestDistance=distance;
           }
@@ -1294,11 +2201,21 @@ namespace PugTools {
     }
 
     private void BuildRenderSpatialIndex(){
-      renderGrid.Clear();renderGlobal.Clear();
+      renderGrid.Clear();renderGlobal.Clear();renderEntriesByRoom.Clear();occluderRenderEntries.Clear();walkingPathFollowerRenderEntries.Clear();
       foreach(Room room in rooms){
         if(room==null||skyRoomNames.Contains(room.RoomName))continue;
         foreach(AssetInstance inst in room.InstancesById.Values){
-          if(!InstanceVisibleInWorld(inst))continue;Matrix world=InstanceWorld(inst,room);RenderEntry entry=null;
+          Matrix world=InstanceWorld(inst,room);
+          // Only prepass LOD -3 occlusion meshes that belong to otherwise visible world placements. Direct
+          // OCCLUDER_ONLY / MAP_ONLY placements often are doorway/portal blocker planes; writing those invisible
+          // shapes into the final scene depth produces the solid black "wall" masks seen at some entrances.
+          if(inst!=null&&!inst.hidden&&!inst.PathFollowerPending&&!inst.PathFollowerAnimated&&
+             inst.Viewability!=AssetInstanceViewability.OccluderOnly&&inst.Viewability!=AssetInstanceViewability.MapOnly&&
+             models.TryGetValue(inst.assetID,out GR2 occModel)&&occModel!=null&&occModel.enabled&&ModelHasOcclusionGeometry(occModel)){
+            Vector3 oc;float oradius;if(!TryModelSphere(occModel,world,out oc,out oradius)){oc=new Vector3(world.M41,world.M42,world.M43);oradius=0f;}
+            if(IsFinite(oc))occluderRenderEntries.Add(new RenderEntry{Room=room,Instance=inst,Model=occModel,World=world,Center=oc,Radius=oradius,Kind=RenderKindModel});
+          }
+          if(!InstanceCanEnterRenderIndex(inst))continue;RenderEntry entry=null;
           if(inst.hasHeightMap&&TryTerrainSphere(inst,room,out Vector3 tc,out float tr))entry=new RenderEntry{Room=room,Instance=inst,World=world,Center=tc,Radius=tr,Kind=RenderKindTerrain};
           else if(inst.hasWater){
             Vector3 wc=Vector3.TransformCoordinate(Vector3.Zero,world);float wr=.5f*(float)Math.Sqrt(Math.Max(0f,inst.width*inst.width+inst.height*inst.height+inst.depth*inst.depth))*MatrixMaxScale(world);
@@ -1308,19 +2225,193 @@ namespace PugTools {
             entry=new RenderEntry{Room=room,Instance=inst,Model=model,World=world,Center=mc,Radius=mr,Kind=RenderKindModel};
           }
           if(entry==null||!IsFinite(entry.Center))continue;
+          if(!renderEntriesByRoom.TryGetValue(room.RoomName,out List<RenderEntry> roomEntries))renderEntriesByRoom[room.RoomName]=roomEntries=new List<RenderEntry>();
+          roomEntries.Add(entry);
           // Moving path-follower descendants cannot live in a fixed grid cell. Jedipedia keeps this traffic dynamic;
           // put the handful of animated entries in the global list and refresh their world sphere every frame.
-          if(inst.PathFollowerAnimated){renderGlobal.Add(entry);continue;}
+          if(inst.PathFollowerAnimated){renderGlobal.Add(entry);if(entry.Kind==RenderKindModel)walkingPathFollowerRenderEntries.Add(entry);continue;}
           if(entry.Radius>RenderIndexedRadiusLimit){renderGlobal.Add(entry);continue;}
           var key=(RenderCell(entry.Center.X),RenderCell(entry.Center.Z));if(!renderGrid.TryGetValue(key,out List<RenderEntry> bucket))renderGrid[key]=bucket=new List<RenderEntry>();bucket.Add(entry);
         }
       }
     }
     private static int RenderCell(float coordinate)=>(int)Math.Floor(coordinate/RenderCellSize);
-    private IEnumerable<RenderEntry> NearbyRenderEntries(byte kind,float range,bool cameraFrustum=true){
+
+    private void RebuildTeleportWarmupQueue(Vector3 target) {
+      teleportWarmupModels.Clear();
+      teleportWarmupQueued.Clear();
+      const float range = 72f;
+      float query = range + RenderIndexedRadiusLimit + RangeCullPadding;
+      int minX = RenderCell(target.X - query), maxX = RenderCell(target.X + query);
+      int minZ = RenderCell(target.Z - query), maxZ = RenderCell(target.Z + query);
+      var candidates = new List<(GR2 Model, float DistanceSquared)>();
+
+      void Consider(RenderEntry entry) {
+        if (entry == null || entry.Kind != RenderKindModel || entry.Model == null || !entry.Model.enabled) return;
+        Vector3 delta = entry.Center - target;
+        float limit = range + Math.Max(0f, entry.Radius);
+        float distanceSquared = delta.LengthSquared();
+        if (distanceSquared > limit * limit || !teleportWarmupQueued.Add(entry.Model)) return;
+        candidates.Add((entry.Model, distanceSquared));
+      }
+
+      long cellCount = (long)(maxX - minX + 1) * (maxZ - minZ + 1);
+      if (cellCount > Math.Max(256L, (long)renderGrid.Count * 3L)) {
+        foreach (List<RenderEntry> bucket in renderGrid.Values) foreach (RenderEntry entry in bucket) Consider(entry);
+      } else {
+        for (int z = minZ; z <= maxZ; z++) for (int x = minX; x <= maxX; x++)
+          if (renderGrid.TryGetValue((x, z), out List<RenderEntry> bucket)) foreach (RenderEntry entry in bucket) Consider(entry);
+      }
+      foreach (RenderEntry entry in renderGlobal) Consider(entry);
+
+      teleportWarmupQueued.Clear();
+      foreach (var candidate in candidates.OrderBy(x => x.DistanceSquared).Take(64)) {
+        if (teleportWarmupQueued.Add(candidate.Model)) teleportWarmupModels.Enqueue(candidate.Model);
+      }
+    }
+
+    private void WarmTeleportModel(GR2 model, HashSet<GR2> seen) {
+      if (model == null || !seen.Add(model)) return;
+      EnsureModelGeometryPrepared(model);
+      foreach (GR2_Mesh mesh in model.meshes) {
+        if (mesh == null || IsNonVisualMesh(model, mesh)) continue;
+        foreach (GR2_Mesh_Piece piece in mesh.meshPieces) ResolvePieceMaterial(model, piece);
+      }
+      foreach (GR2 attached in model.attachedModels) WarmTeleportModel(attached, seen);
+    }
+
+    private void ProcessTeleportWarmup() {
+      bool rebuild = false, cancel = false;
+      Vector3 requested = Vector3.Zero;
+      lock (teleportWarmupLock) {
+        if (teleportWarmupCancelPending) {
+          teleportWarmupCancelPending = false;
+          cancel = true;
+        }
+        if (teleportWarmupRequestPending) {
+          teleportWarmupRequestPending = false;
+          requested = teleportWarmupRequestedPosition;
+          rebuild = true;
+        }
+      }
+      if (cancel) {
+        teleportWarmupModels.Clear();
+        teleportWarmupQueued.Clear();
+      }
+      if (rebuild) RebuildTeleportWarmupQueue(requested);
+      if (teleportWarmupModels.Count == 0) return;
+
+      // A small time/count budget keeps the ordinary world responsive. The work happens while the modal elevator
+      // dialog is visible, so by the time the user presses Teleport most nearby geometry/textures are already hot.
+      var budget = System.Diagnostics.Stopwatch.StartNew();
+      int prepared = 0;
+      var seen = new HashSet<GR2>();
+      while (teleportWarmupModels.Count > 0 && prepared < 2 && budget.ElapsedMilliseconds < 5) {
+        GR2 model = teleportWarmupModels.Dequeue();
+        WarmTeleportModel(model, seen);
+        prepared++;
+      }
+      if (teleportWarmupModels.Count == 0) teleportWarmupQueued.Clear();
+    }
+
+    private bool ModelNeedsCameraWarmup(GR2 model,HashSet<GR2> seen){
+      if(model==null||!seen.Add(model))return false;
+      if(!ModelGeometryBuffersReady(model))return true;
+      if(model.materials!=null)foreach(GR2_Material material in model.materials){
+        if(material==null)continue;
+        if(!material.parsed)return true;
+        if(!String.IsNullOrWhiteSpace(material.diffuseDDS)&&material.diffuseSRV==null)return true;
+      }
+      if(model.attachedModels!=null)foreach(GR2 attached in model.attachedModels)if(ModelNeedsCameraWarmup(attached,seen))return true;
+      return false;
+    }
+
+    private void RebuildCameraWarmupQueue(Room cameraRoom,HashSet<string> visible,WorldRenderSettings s){
+      cameraWarmupModels.Clear();cameraWarmupQueued.Clear();
+      if(s==null||s.Mode==WorldRenderMode.Map||!s.ShowModels)return;
+      const float range=110f;
+      Vector3 forward=-camera.Look;if(!IsFinite(forward)||forward.LengthSquared()<.000001f)forward=Vector3.UnitZ;else forward.Normalize();
+      var needsSeen=new HashSet<GR2>();
+      var candidates=new List<(GR2 Model,float Score)>();
+      foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,range,false,visible)){
+        if(entry?.Model==null||entry.Room==null||!entry.Model.enabled||!InstanceRoomVisible(entry.Instance,entry.Room,visible)||!InstanceVisibleInWorld(entry.Instance,s))continue;
+        if(!ModelNeedsCameraWarmup(entry.Model,needsSeen))continue;
+        Vector3 delta=entry.Center-camera.Position;float dist2=delta.LengthSquared();
+        float ahead=0f;if(dist2>.0001f){Vector3 dir=delta;dir.Normalize();ahead=Math.Max(0f,Vector3.Dot(dir,forward));}
+        // Prefer nearby assets and the camera's forward half-space so walking/driving toward a cold block prepares
+        // it before it actually enters the frustum. The factor affects order only, never visibility.
+        float score=dist2*(1f-.45f*ahead);
+        if(cameraWarmupQueued.Add(entry.Model))candidates.Add((entry.Model,score));
+      }
+      cameraWarmupQueued.Clear();
+      foreach(var candidate in candidates.OrderBy(x=>x.Score).Take(48))if(cameraWarmupQueued.Add(candidate.Model))cameraWarmupModels.Enqueue(candidate.Model);
+      cameraWarmupAnchor=camera.Position;cameraWarmupRoomName=cameraRoom?.RoomName??String.Empty;
+    }
+
+    private void ProcessCameraWarmup(Room cameraRoom,HashSet<string> visible,WorldRenderSettings s){
+      if(s==null||s.Mode==WorldRenderMode.Map||!s.ShowModels){cameraWarmupModels.Clear();cameraWarmupQueued.Clear();return;}
+      string roomName=cameraRoom?.RoomName??String.Empty;
+      bool invalidAnchor=!IsFinite(cameraWarmupAnchor);
+      bool moved=invalidAnchor||(camera.Position-cameraWarmupAnchor).LengthSquared()>=64f; // rebuild every ~8 world units
+      if(moved||!String.Equals(roomName,cameraWarmupRoomName,StringComparison.OrdinalIgnoreCase))RebuildCameraWarmupQueue(cameraRoom,visible,s);
+      if(cameraWarmupModels.Count==0)return;
+      // Prepare at most one cold model per frame. A model may involve several DDS uploads; spreading them avoids
+      // the much larger "new block entered view" burst where dozens were previously prepared synchronously in Draw.
+      GR2 model=cameraWarmupModels.Dequeue();var seen=new HashSet<GR2>();WarmTeleportModel(model,seen);
+      if(cameraWarmupModels.Count==0)cameraWarmupQueued.Clear();
+    }
+
+    private IEnumerable<RenderEntry> NearbyRenderEntries(byte kind,float range,bool cameraFrustum=true,HashSet<string> visible=null){
+      // A small active room set is much cheaper to walk than Corellia's entire spatial grid. This bypasses
+      // non-active cells before distance/frustum/LOD/material work and includes global/path-follower entries because
+      // every RenderEntry is also registered in renderEntriesByRoom.
+      if(visible!=null&&visible.Count>0&&visible.Count<=64){
+        foreach(string roomName in visible){
+          if(!renderEntriesByRoom.TryGetValue(roomName,out List<RenderEntry> roomEntries))continue;
+          foreach(RenderEntry entry in roomEntries){
+            if(entry==null||entry.Kind!=kind)continue;
+            if(SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
+          }
+        }
+        yield break;
+      }
+
       float query=Math.Max(0f,range)+RenderIndexedRadiusLimit+RangeCullPadding;int minX=RenderCell(camera.Position.X-query),maxX=RenderCell(camera.Position.X+query),minZ=RenderCell(camera.Position.Z-query),maxZ=RenderCell(camera.Position.Z+query);
-      for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++)if(renderGrid.TryGetValue((x,z),out List<RenderEntry> bucket))foreach(RenderEntry entry in bucket)if(entry.Kind==kind&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
+      long cellCount=(long)(maxX-minX+1)*(maxZ-minZ+1);
+      // Very large authored far distances can span tens of thousands of empty hash-grid cells. Once probing the
+      // rectangle is more expensive than walking the populated buckets, scan the populated buckets instead; the
+      // exact sphere/frustum tests below remain authoritative, so this changes cost only, never visibility.
+      if(cellCount>Math.Max(256L,(long)renderGrid.Count*3L)){
+        foreach(List<RenderEntry> bucket in renderGrid.Values)foreach(RenderEntry entry in bucket)if(entry.Kind==kind&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
+      } else {
+        for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++)if(renderGrid.TryGetValue((x,z),out List<RenderEntry> bucket))foreach(RenderEntry entry in bucket)if(entry.Kind==kind&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
+      }
       foreach(RenderEntry entry in renderGlobal)if(entry.Kind==kind&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
+    }
+
+    private IEnumerable<RenderEntry> MapVisibleRenderEntries(byte kind){
+      // The full-map renderer used to walk every room and every placement on every frame, then reject almost all
+      // of them with MapSphereVisible(). On large planets that CPU traversal dominated even when the GPU had very
+      // little to draw. Query the same fixed spatial index by the current orthographic viewport first; the final
+      // sphere check is unchanged, so this is a pure broad-phase optimization with identical visible results.
+      float halfW=Math.Max(.001f,mapVisibleWidth*.5f),halfH=Math.Max(.001f,mapVisibleHeight*.5f);
+      float pad=RenderIndexedRadiusLimit+RangeCullPadding;
+      int minX=RenderCell(mapCenter.X-halfW-pad),maxX=RenderCell(mapCenter.X+halfW+pad);
+      int minZ=RenderCell(mapCenter.Y-halfH-pad),maxZ=RenderCell(mapCenter.Y+halfH+pad);
+      long cellCount=(long)(maxX-minX+1)*(maxZ-minZ+1);
+      if(cellCount>Math.Max(256L,(long)renderGrid.Count*3L)){
+        foreach(List<RenderEntry> bucket in renderGrid.Values)
+          foreach(RenderEntry entry in bucket)
+            if(entry.Kind==kind&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
+      } else {
+        for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++)
+          if(renderGrid.TryGetValue((x,z),out List<RenderEntry> bucket))
+            foreach(RenderEntry entry in bucket)
+              if(entry.Kind==kind&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
+      }
+      // Very large placements and path followers live outside the fixed grid. There are normally only a handful;
+      // keep testing them individually so map behaviour remains exact.
+      foreach(RenderEntry entry in renderGlobal)if(entry.Kind==kind&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
     }
     private bool SphereWithinDistance(Vector3 center,float radius,float range){
       if(!IsFinite(center))return false;float limit=Math.Max(0f,range)+Math.Max(0f,radius)+RangeCullPadding;return (center-camera.Position).LengthSquared()<=limit*limit;
@@ -1431,25 +2522,207 @@ namespace PugTools {
 
     private static bool ContainsRoom(Room r,Vector3 p,float margin){return p.X>=r.VisibilityMin.X-margin&&p.X<=r.VisibilityMax.X+margin&&p.Y>=r.VisibilityMin.Y-margin&&p.Y<=r.VisibilityMax.Y+margin&&p.Z>=r.VisibilityMin.Z-margin&&p.Z<=r.VisibilityMax.Z+margin;}
     private static bool ContainsRoomXZ(Room r,Vector3 p,float margin){return r!=null&&p.X>=r.VisibilityMin.X-margin&&p.X<=r.VisibilityMax.X+margin&&p.Z>=r.VisibilityMin.Z-margin&&p.Z<=r.VisibilityMax.Z+margin;}
-    private HashSet<string> BuildVisibleRoomSet(Room current, WorldRenderSettings s){
-      if(s.Mode==WorldRenderMode.Map||!s.EnableRoomVisibility||current==null||IsEverywhereRoom(current))return null;
-      // PugTools does not have Jedipedia's native dPVS object/portal query yet. The room DAT visible list
-      // alone is NOT a replacement outdoors: it changes abruptly when the free camera crosses a cell and
-      // was the reason entire terrain/model chunks vanished while flying. Outdoors, rely on conservative
-      // room + instance frustum culling instead. The authored list is kept for enclosed interior cells.
-      if(current.OutdoorsVisible)return null;
+
+    private static string ParsePortalTargetRoom(string raw){
+      if(String.IsNullOrWhiteSpace(raw))return null;string text=raw.Trim();int split=text.IndexOfAny(new[]{' ','\t','\r','\n'});
+      if(split>0){string first=text.Substring(0,split);if(first.All(Char.IsDigit))text=text.Substring(split+1).Trim();}
+      string normalized=NormalizeRoom(text);return String.IsNullOrWhiteSpace(normalized)?null:normalized;
+    }
+
+    private void BuildPortalVisibilityGraph(){
+      roomPortals.Clear();if(area==null||rooms==null||rooms.Count==0)return;
+      var byName=rooms.Where(r=>r!=null).GroupBy(r=>NormalizeRoom(r.RoomName),StringComparer.OrdinalIgnoreCase).ToDictionary(g=>g.Key,g=>g.First(),StringComparer.OrdinalIgnoreCase);
+      foreach(Room source in rooms){
+        if(source==null||IsEverywhereRoom(source))continue;
+        foreach(AssetInstance inst in source.InstancesById.Values){
+          if(inst==null||inst.PathFollowerBoundaryExcluded||String.IsNullOrWhiteSpace(inst.PortalTarget))continue;
+          if(!area.AssetIdMap.TryGetValue(inst.assetID,out AreaAsset asset))continue;
+          string ext=(asset.Extension??String.Empty).Trim().TrimStart('.');string path=NormalizeAssetPath(asset.Path);
+          if(!String.Equals(ext,"p",StringComparison.OrdinalIgnoreCase)||!String.Equals(path,"engine/portal",StringComparison.OrdinalIgnoreCase))continue;
+          string targetName=ParsePortalTargetRoom(inst.PortalTarget);if(String.IsNullOrWhiteSpace(targetName))continue;
+          if(!byName.TryGetValue(targetName,out Room target)){
+            string leaf=targetName.IndexOf('/')>=0?targetName.Substring(targetName.LastIndexOf('/')+1):targetName;
+            target=rooms.FirstOrDefault(r=>r!=null&&String.Equals(NormalizeRoom(r.RoomName),leaf,StringComparison.OrdinalIgnoreCase));
+          }
+          if(target==null||ReferenceEquals(target,source))continue;
+          Matrix world=InstanceWorld(inst,source);Vector3 center=new Vector3(world.M41,world.M42,world.M43);
+          float sx=(float)Math.Sqrt(world.M11*world.M11+world.M12*world.M12+world.M13*world.M13);
+          float sy=(float)Math.Sqrt(world.M21*world.M21+world.M22*world.M22+world.M23*world.M23);
+          float sz=(float)Math.Sqrt(world.M31*world.M31+world.M32*world.M32+world.M33*world.M33);
+          float radius=.5f*(float)Math.Sqrt(sx*sx+sy*sy+sz*sz)+.15f;
+          string key=source.RoomName;if(!roomPortals.TryGetValue(key,out List<PortalVisibilityEntry> links))roomPortals[key]=links=new List<PortalVisibilityEntry>();
+          links.Add(new PortalVisibilityEntry{Source=source,Target=target,Instance=inst,Center=center,Radius=Math.Max(.15f,radius)});
+        }
+      }
+    }
+
+    private void BuildRoomStreamingGraph(){
+      roomStreamingNeighbors.Clear();if(rooms==null||rooms.Count==0)return;
+      var byName=rooms.Where(r=>r!=null&&!String.IsNullOrWhiteSpace(r.RoomName))
+        .GroupBy(r=>NormalizeRoom(r.RoomName),StringComparer.OrdinalIgnoreCase)
+        .ToDictionary(g=>g.Key,g=>g.First(),StringComparer.OrdinalIgnoreCase);
+      void Add(Room a,Room b){
+        if(a==null||b==null||ReferenceEquals(a,b)||String.IsNullOrWhiteSpace(a.RoomName)||String.IsNullOrWhiteSpace(b.RoomName))return;
+        if(!roomStreamingNeighbors.TryGetValue(a.RoomName,out HashSet<string> set))roomStreamingNeighbors[a.RoomName]=set=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        set.Add(b.RoomName);
+      }
+
+      // Portal links are true direct adjacency. Make them bidirectional for streaming: a portal can be authored on
+      // only one side while the player can still cross it in either direction.
+      foreach(List<PortalVisibilityEntry> links in roomPortals.Values)foreach(PortalVisibilityEntry portal in links){
+        if(portal?.Source==null||portal.Target==null)continue;Add(portal.Source,portal.Target);Add(portal.Target,portal.Source);
+      }
+
+      // DAT VisibleRooms is a visibility list rather than a strict adjacency list and can be huge outdoors.
+      // Keep only the nearest authored entries per room so a Corellia cell does not pull the entire planet into
+      // the working set merely because the client marks many distant cells as mutually visible.
+      foreach(Room room in rooms){
+        if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName)||room.VisibleRooms==null||room.VisibleRooms.Count==0)continue;
+        var authored=new List<(Room Room,float Gap)>();
+        foreach(string raw in room.VisibleRooms){
+          string key=NormalizeRoom(raw);if(String.IsNullOrWhiteSpace(key)||!byName.TryGetValue(key,out Room candidate)||candidate==null||ReferenceEquals(candidate,room))continue;
+          authored.Add((candidate,RoomBoundsGapSquared(room,candidate)));
+        }
+        foreach(var item in authored.OrderBy(x=>x.Gap).Take(12))Add(room,item.Room);
+      }
+
+      // Outdoor areas often have no explicit portal graph at all. Add a small number of physically touching/near
+      // cells from room bounds. O(n²) here is a one-time load step (Corellia is still only hundreds of rooms) and
+      // replaces far more expensive per-frame whole-room scans.
+      var usable=rooms.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName)&&HasUsableRoomBounds(r)).ToList();
+      const float maxGap=24f,maxVerticalGap=16f;float maxGapSq=maxGap*maxGap;
+      foreach(Room room in usable){
+        if(!room.OutdoorsVisible)continue;
+        var nearby=new List<(Room Room,float Gap)>();
+        foreach(Room candidate in usable){
+          if(ReferenceEquals(room,candidate)||!candidate.OutdoorsVisible)continue;
+          float dy=AxisGap(room.VisibilityMin.Y,room.VisibilityMax.Y,candidate.VisibilityMin.Y,candidate.VisibilityMax.Y);
+          if(dy>maxVerticalGap)continue;
+          float dx=AxisGap(room.VisibilityMin.X,room.VisibilityMax.X,candidate.VisibilityMin.X,candidate.VisibilityMax.X);
+          float dz=AxisGap(room.VisibilityMin.Z,room.VisibilityMax.Z,candidate.VisibilityMin.Z,candidate.VisibilityMax.Z);
+          float gap=dx*dx+dz*dz;if(gap<=maxGapSq)nearby.Add((candidate,gap));
+        }
+        foreach(var item in nearby.OrderBy(x=>x.Gap).Take(8)){Add(room,item.Room);Add(item.Room,room);}
+      }
+    }
+
+    private static float AxisGap(float amin,float amax,float bmin,float bmax){
+      if(amax<bmin)return bmin-amax;if(bmax<amin)return amin-bmax;return 0f;
+    }
+    private static float RoomBoundsGapSquared(Room a,Room b){
+      if(!HasUsableRoomBounds(a)||!HasUsableRoomBounds(b))return float.MaxValue;
+      float dx=AxisGap(a.VisibilityMin.X,a.VisibilityMax.X,b.VisibilityMin.X,b.VisibilityMax.X);
+      float dy=AxisGap(a.VisibilityMin.Y,a.VisibilityMax.Y,b.VisibilityMin.Y,b.VisibilityMax.Y);
+      float dz=AxisGap(a.VisibilityMin.Z,a.VisibilityMax.Z,b.VisibilityMin.Z,b.VisibilityMax.Z);
+      return dx*dx+dy*dy+dz*dz;
+    }
+
+    private HashSet<string> BuildLocalRoomStreamingSet(Room current,WorldRenderSettings s){
+      if(s==null||!s.EnableLocalRoomStreaming||s.Mode==WorldRenderMode.Map||current==null||IsEverywhereRoom(current))return null;
       var set=new HashSet<string>(StringComparer.OrdinalIgnoreCase){current.RoomName,"_everywhere_"};
-      foreach(string n in current.VisibleRooms){string room=NormalizeRoom(n);if(!string.IsNullOrEmpty(room))set.Add(room);}
-      string sky=ResolveSkyRoomName(current.EnvironmentScheme);if(s.ShowSky&&!string.IsNullOrEmpty(sky))set.Add(sky);return set;
+      if(roomStreamingNeighbors.TryGetValue(current.RoomName,out HashSet<string> neighbors))foreach(string roomName in neighbors)set.Add(roomName);
+      // Boundary continuity comes from the bidirectional portal links plus physically near outdoor cells built once
+      // in BuildRoomStreamingGraph(); do not scan every room again on every frame.
+      string sky=ResolveSkyRoomName(current.EnvironmentScheme);if(s.ShowSky&&!String.IsNullOrWhiteSpace(sky))set.Add(sky);
+      return set;
+    }
+
+    private bool RoomBoundsVisibleInCameraFrustum(Room room){
+      if(room==null||!IsFinite(room.VisibilityMin)||!IsFinite(room.VisibilityMax)||room.VisibilityMax.X<room.VisibilityMin.X||room.VisibilityMax.Y<room.VisibilityMin.Y||room.VisibilityMax.Z<room.VisibilityMin.Z)return true;
+      Vector3 pad=new Vector3(FrustumCullPadding,FrustumCullPadding,FrustumCullPadding);return camera.Visible(new BoundingBox(room.VisibilityMin-pad,room.VisibilityMax+pad));
+    }
+
+    private bool PortalVisibleInCameraFrustum(PortalVisibilityEntry portal){
+      if(portal==null)return false;float radius=Math.Max(.15f,portal.Radius);
+      // Very near portals must remain open even when their centre is technically behind the near plane; this avoids
+      // a room popping out exactly while the camera crosses the doorway. Otherwise use the same exact camera-frustum
+      // sphere test as the render spatial index.
+      float nearReach=radius+1.25f;if((portal.Center-camera.Position).LengthSquared()<=nearReach*nearReach)return true;
+      return SphereVisibleInCameraFrustum(portal.Center,radius)&&SphereWithinViewDistance(portal.Center,radius);
+    }
+
+    private static string VisibleRoomScope(HashSet<string> visible){
+      if(visible==null)return "*";if(visible.Count==0)return String.Empty;return String.Join(";",visible.OrderBy(x=>x,StringComparer.OrdinalIgnoreCase));
+    }
+
+    private HashSet<string> BuildVisibleRoomSet(Room current, WorldRenderSettings s){
+      if(s==null||s.Mode==WorldRenderMode.Map||current==null||IsEverywhereRoom(current))return null;
+      HashSet<string> streaming=BuildLocalRoomStreamingSet(current,s);
+      if(!s.EnableRoomVisibility)return streaming;
+
+      // The legacy Room culling layer deliberately fails open outdoors because a portal-only traversal cannot
+      // reproduce SWTOR's native dPVS landscape occlusion. Local room streaming is the safe outdoor working-set
+      // layer: when enabled it still limits Corellia-like planets to current + directly adjacent cells.
+      if(current.OutdoorsVisible)return streaming;
+
+      var set=new HashSet<string>(StringComparer.OrdinalIgnoreCase){current.RoomName,"_everywhere_"};
+      var queue=new Queue<(Room Room,int Depth)>();queue.Enqueue((current,0));const int maxPortalDepth=16;
+      while(queue.Count>0){
+        var node=queue.Dequeue();if(node.Room==null||node.Depth>=maxPortalDepth)continue;
+        if(roomPortals.TryGetValue(node.Room.RoomName,out List<PortalVisibilityEntry> links)){
+          foreach(PortalVisibilityEntry portal in links){
+            if(portal?.Target==null||!PortalVisibleInCameraFrustum(portal))continue;
+            if(set.Add(portal.Target.RoomName))queue.Enqueue((portal.Target,node.Depth+1));
+          }
+        }
+        // Room DAT VisibleRooms remains a conservative fallback for client builds whose portal placements are
+        // missing/incomplete. Apply it at every room reached by the traversal, not only at the camera room.
+        foreach(string n in node.Room.VisibleRooms){
+          string roomName=NormalizeRoom(n);if(String.IsNullOrEmpty(roomName))continue;
+          Room candidate=rooms.FirstOrDefault(r=>r!=null&&String.Equals(NormalizeRoom(r.RoomName),roomName,StringComparison.OrdinalIgnoreCase));
+          if(candidate==null||!RoomBoundsVisibleInCameraFrustum(candidate))continue;
+          if(set.Add(candidate.RoomName))queue.Enqueue((candidate,node.Depth+1));
+        }
+      }
+      string sky=ResolveSkyRoomName(current.EnvironmentScheme);if(s.ShowSky&&!string.IsNullOrEmpty(sky))set.Add(sky);
+      if(streaming!=null)set.IntersectWith(streaming);
+      return set;
     }
     private static string NormalizeRoom(string s)=>(s??"").Replace('\\','/').TrimStart('/').Replace(".dat","",StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
 
+    private GR2_Material EnsureMaterialParsed(GR2_Material material) {
+      if(material==null)return null;
+      materialLastUseFrame[material]=worldRenderFrame;
+      int mip=Math.Max(0,appliedTextureMipSkip);
+      try{
+        // ModelBrowserViewMaterial and a few metadata paths intentionally call ParseMAT(null,...). Such a material is
+        // "parsed" but has no D3D resources. Rehydrate its already-resolved paths instead of rendering the NPC/model
+        // flat grey. This is also safe after the world texture LRU has evicted a cold material.
+        if(!material.parsed)material.ParseMAT(Device,null,mip);
+        material.EnsureTextureResources(Device,mip);
+      } catch(Exception ex){System.Diagnostics.Debug.WriteLine("World material '"+material.materialName+"' failed: "+ex.Message);}
+      return material;
+    }
+
+    private void TrimMaterialTextureResidency(){
+      // Jedipedia streams/cache-evicts cold detail instead of keeping the entire planet resident. Do the equivalent
+      // for MAT-owned SRVs. Keep a generous hot set and never evict character-only complexion/facepaint overrides,
+      // which are authored outside the MAT and cannot be reconstructed by ParseMAT alone.
+      const int highWater=384,target=288;const long idleFrames=360;
+      var parsed=WorldMaterialResidencySet().Where(m=>m!=null&&m.parsed).ToList();
+      if(parsed.Count<=highWater)return;
+      long cutoff=worldRenderFrame-idleFrames;
+      foreach(GR2_Material material in parsed
+        .Where(m=>String.IsNullOrWhiteSpace(m.complexionDDS)&&String.IsNullOrWhiteSpace(m.facepaintDDS))
+        .OrderBy(m=>materialLastUseFrame.TryGetValue(m,out long frame)?frame:long.MinValue).ToList()){
+        if(parsed.Count<=target)break;
+        long last=materialLastUseFrame.TryGetValue(material,out long frame)?frame:long.MinValue;
+        if(last>cutoff)continue;
+        ReleaseOwnedMaterial(material);material.parsed=false;materialLastUseFrame.Remove(material);parsed.Remove(material);
+      }
+    }
+
     private GR2_Material ResolvePieceMaterial(GR2 model, GR2_Mesh_Piece piece) {
       if(model==null||piece==null)return null;
-      GR2_Material mat=null;
-      if(piece.matId>=0&&model.materials.ElementAtOrDefault(piece.matId)!=null)materials.TryGetValue(model.materials[piece.matId].materialName,out mat);
-      else if(model.materials.Count>0)materials.TryGetValue(model.materials[0].materialName,out mat);
-      return mat;
+      GR2_Material local=null;
+      if(piece.matId>=0&&piece.matId<model.materials.Count)local=model.materials[piece.matId];
+      else if(model.materials.Count>0)local=model.materials[0];
+      if(local==null)return null;
+      // Appearance/NPC variants can own a material object that is not registered in the area's global MAT map.
+      // Falling back to null here was the reason animated characters became flat grey after lazy material streaming.
+      GR2_Material resolved=local;
+      if(!String.IsNullOrWhiteSpace(local.materialName)&&materials.TryGetValue(local.materialName,out GR2_Material shared)&&shared!=null)resolved=shared;
+      return EnsureMaterialParsed(resolved);
     }
 
     private void BuildAuthoritativeSkyRoomSet(){
@@ -1497,6 +2770,104 @@ namespace PugTools {
     // that room's dPVS gate for the moving subtree; otherwise a ship disappears as soon as its owner room is culled.
     private bool InstanceRoomVisible(AssetInstance inst,Room room,HashSet<string> visible)=>inst!=null&&inst.PathFollowerAnimated||RoomVisible(room,visible);
 
+    private float GetOrthographicHalfHeight(WorldRenderSettings s){
+      float zoom=Math.Max(OrthographicZoomMin,Math.Min(OrthographicZoomMax,orthographicZoom));
+      return Math.Max(.001f,(float)Math.Tan(GetFieldOfViewRadians(s)*.5f)*OrthographicReferenceDistance*zoom);
+    }
+
+    private static float GetOrthographicReferenceHalfHeight(){
+      return (float)Math.Tan(SlimDXNet.MathF.ToRadians(50f)*.5f)*OrthographicReferenceDistance;
+    }
+
+    private float GetOrthographicMoveScale(WorldRenderSettings s){
+      return OrthographicMoveSpeedScale*GetOrthographicHalfHeight(s)/Math.Max(.001f,GetOrthographicReferenceHalfHeight());
+    }
+
+    private static Vector3 HorizontalUnit(Vector3 v,Vector3 fallback){
+      Vector3 h=new Vector3(v.X,0f,v.Z);
+      if(h.LengthSquared()<.000001f)h=new Vector3(fallback.X,0f,fallback.Z);
+      if(h.LengthSquared()<.000001f)h=Vector3.UnitZ;
+      h.Normalize();return h;
+    }
+
+    private void ApplyOrthographicOrientation(){
+      orthographicHeading=HorizontalUnit(orthographicHeading,Vector3.UnitZ);
+      orthographicPitch=Math.Max(OrthographicMinPitch,Math.Min(OrthographicMaxPitch,orthographicPitch));
+      float cp=(float)Math.Cos(orthographicPitch),sp=(float)Math.Sin(orthographicPitch);
+      Vector3 look=orthographicHeading*cp-Vector3.UnitY*sp;
+      Vector3 up=orthographicHeading*sp+Vector3.UnitY*cp;
+      camera.LookAt(camera.Position,camera.Position+look,up);
+    }
+
+    private void SetOrthographicMode(bool enabled){
+      if(orthographicActive==enabled)return;
+      if(enabled){
+        Vector3 perspectiveLook=camera.Look;if(!IsFinite(perspectiveLook)||perspectiveLook.LengthSquared()<.000001f)perspectiveLook=Vector3.UnitZ;else perspectiveLook.Normalize();
+        perspectivePitchBeforeOrthographic=(float)Math.Asin(Math.Max(-1f,Math.Min(1f,-perspectiveLook.Y)));havePerspectivePitchBeforeOrthographic=true;
+        orthographicHeading=HorizontalUnit(perspectiveLook,camera.Up);orthographicPitch=OrthographicMaxPitch;orthographicZoom=orthographicZoomTarget=1f;
+        orthographicActive=true;
+        ApplyOrthographicOrientation();
+        // Jedipedia samples the floor on the wheel notch, not on projection entry. Until then the camera tracks
+        // only the projection-box delta, so toggling ortho never unexpectedly drops the viewpoint through a roof.
+        orthographicFloorY=float.NaN;
+      }else{
+        orthographicActive=false;orthographicPanning=false;orthographicZoom=orthographicZoomTarget=1f;orthographicFloorY=float.NaN;
+        if(havePerspectivePitchBeforeOrthographic){
+          // Jedipedia restores only the old perspective pitch. Yaw changes made while in plan view deliberately
+          // survive the projection switch, so rotating the map also turns the perspective camera you return to.
+          float cp=(float)Math.Cos(perspectivePitchBeforeOrthographic),sp=(float)Math.Sin(perspectivePitchBeforeOrthographic);
+          Vector3 look=orthographicHeading*cp-Vector3.UnitY*sp;Vector3 up=orthographicHeading*sp+Vector3.UnitY*cp;
+          camera.LookAt(camera.Position,camera.Position+look,up);
+        }
+        havePerspectivePitchBeforeOrthographic=false;
+      }
+      appliedOrthographicHalfHeight=-1f;
+      InvalidateTemporalHistory();InvalidateObjectOcclusionVisibility();
+    }
+
+    private void UpdateOrthographicState(float dt,WorldRenderSettings s){
+      bool desired=s?.OrthographicProjection==true;
+      if(desired!=orthographicActive)SetOrthographicMode(desired);
+      if(!orthographicActive||!(dt>0f))return;
+      float oldHalf=GetOrthographicHalfHeight(s);
+      float current=Math.Max(OrthographicZoomMin,Math.Min(OrthographicZoomMax,orthographicZoom));
+      float target=Math.Max(OrthographicZoomMin,Math.Min(OrthographicZoomMax,orthographicZoomTarget));
+      float ease=1f-(float)Math.Exp(-dt/OrthographicZoomSmoothingSeconds);
+      if(Math.Abs(target/current-1f)>.0005f){
+        orthographicZoom=current*(float)Math.Pow(target/current,ease);
+        if(Math.Abs(target/orthographicZoom-1f)<.0005f)orthographicZoom=target;
+      }else orthographicZoom=target;
+      float newHalf=GetOrthographicHalfHeight(s);
+      if(float.IsNaN(orthographicFloorY)||float.IsInfinity(orthographicFloorY)){
+        if(Math.Abs(newHalf-oldHalf)>.000001f)camera.Position+=Vector3.UnitY*(newHalf-oldHalf);
+      }else{
+        float ceiling=Math.Max(OrthographicFloorClearance,activeClipDistance*OrthographicHeightClipShare);
+        float above=Math.Max(OrthographicFloorClearance,Math.Min(ceiling,OrthographicFloorClearance+newHalf*OrthographicHeightPerBox));
+        float targetY=orthographicFloorY+above;float gap=targetY-camera.Position.Y;
+        if(Math.Abs(gap)<.001f)camera.Position=new Vector3(camera.Position.X,targetY,camera.Position.Z);
+        else camera.Position+=Vector3.UnitY*(gap*ease);
+      }
+    }
+
+    private void ApplyCameraLens(WorldRenderSettings s,float cameraFar,bool force=false){
+      float fov=GetFieldOfViewRadians(s);float aspect=Math.Max(.01f,AspectRatio);bool ortho=orthographicActive&&s?.OrthographicProjection==true;
+      if(ortho){
+        float halfHeight=GetOrthographicHalfHeight(s);
+        if(!force&&appliedOrthographicProjection&&Math.Abs(appliedCameraFar-cameraFar)<.01f&&Math.Abs(camera.Aspect-aspect)<.0001f&&Math.Abs(camera.FovY-fov)<.0001f&&Math.Abs(appliedOrthographicHalfHeight-halfHeight)<.0001f)return;
+        camera.SetOrthographicLens(fov,aspect,halfHeight*2f*aspect,halfHeight*2f,.01f,cameraFar);
+        appliedOrthographicProjection=true;appliedOrthographicHalfHeight=halfHeight;
+      }else{
+        if(!force&&!appliedOrthographicProjection&&Math.Abs(appliedCameraFar-cameraFar)<.01f&&Math.Abs(camera.Aspect-aspect)<.0001f&&Math.Abs(camera.FovY-fov)<.0001f)return;
+        camera.SetLens(fov,aspect,.01f,cameraFar);appliedOrthographicProjection=false;appliedOrthographicHalfHeight=-1f;
+      }
+      appliedCameraFar=cameraFar;InvalidateTemporalHistory();
+    }
+
+    private static float GetFieldOfViewRadians(WorldRenderSettings s){
+      float degrees=Math.Max(50f,Math.Min(75f,s?.FieldOfViewDegrees??50f));
+      return SlimDXNet.MathF.ToRadians(degrees);
+    }
+
     private static float GetActiveClipDistance(AreaEnvironmentScheme env,WorldRenderSettings s){
       float scale=Math.Max(1f,Math.Min(10f,s?.ViewDistanceScale??DefaultViewDistanceScale));
       float authored=env?.ClipDistance??0f;
@@ -1515,9 +2886,7 @@ namespace PugTools {
     private void UpdateActiveClipDistance(AreaEnvironmentScheme env,WorldRenderSettings s){
       activeClipDistance=GetActiveClipDistance(env,s);
       float cameraFar=GetCameraFarDistance(activeClipDistance,s);
-      if(Math.Abs(appliedCameraFar-cameraFar)<.01f&&Math.Abs(camera.Aspect-AspectRatio)<.0001f)return;
-      camera.SetLens(camera.FovY>0?camera.FovY:.25f*SlimDXNet.MathF.PI,AspectRatio,.01f,cameraFar);
-      appliedCameraFar=cameraFar;InvalidateTemporalHistory();
+      ApplyCameraLens(s,cameraFar);
     }
 
     private bool RoomWithinCameraRange(Room room){
@@ -1591,30 +2960,41 @@ namespace PugTools {
       center=Vector3.TransformCoordinate((min+max)*.5f,world);radius=(max-min).Length()*.5f*MatrixMaxScale(world);return true;
     }
 
+    private bool MapSphereVisible(Vector3 center,float radius){
+      if(!IsFinite(center))return true;
+      float r=Math.Max(0f,radius),halfW=Math.Max(.001f,mapVisibleWidth*.5f),halfH=Math.Max(.001f,mapVisibleHeight*.5f);
+      return center.X+r>=mapCenter.X-halfW&&center.X-r<=mapCenter.X+halfW&&center.Z+r>=mapCenter.Y-halfH&&center.Z-r<=mapCenter.Y+halfH;
+    }
+
     private bool ShadowRangeVisible(Vector3 center,float radius,float far){float d=far+radius+2f;return (center-camera.Position).LengthSquared()<=d*d;}
 
     private void DrawTerrain(Matrix vp,HashSet<string> visible,WorldRenderSettings s,AreaEnvironmentScheme cameraEnv,bool sceneShadows){
       if(s.Mode==WorldRenderMode.Map){
-        foreach(Room room in rooms){
-          if(skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible))continue;
-          ApplyRoomEnvironment(room,cameraEnv,s,sceneShadows);
-          foreach(AssetInstance inst in room.InstancesById.Values)if(InstanceVisibleOnMap(inst)&&inst.hasHeightMap&&inst.VBO!=null)DrawTerrainInstance(inst,room,vp,visible,s);
+        Room mapActiveRoom=null;
+        foreach(RenderEntry entry in MapVisibleRenderEntries(RenderKindTerrain)){
+          Room room=entry.Room;AssetInstance inst=entry.Instance;
+          if(room==null||inst==null||skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible)||!InstanceVisibleOnMap(inst)||!inst.hasHeightMap||inst.VBO==null)continue;
+          if(!ReferenceEquals(mapActiveRoom,room)){ApplyRoomEnvironment(room,cameraEnv,s,sceneShadows);mapActiveRoom=room;}
+          DrawTerrainInstance(inst,room,vp,visible,s);
         }
         return;
       }
       // Normal perspective rendering never walks every terrain placement on the planet. The spatial index is
       // queried by the exact View budget, then each candidate still gets a sphere/range test in NearbyRenderEntries.
       Room activeRoom=null;
-      foreach(RenderEntry entry in NearbyRenderEntries(RenderKindTerrain,camera.FarZ)){
+      foreach(RenderEntry entry in NearbyRenderEntries(RenderKindTerrain,camera.FarZ,true,visible)){
         Room room=entry.Room;AssetInstance inst=entry.Instance;
-        if(room==null||!InstanceVisibleInWorld(inst)||skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible)||inst.VBO==null)continue;
+        if(room==null||!InstanceVisibleInWorld(inst,s)||skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible)||inst.VBO==null)continue;
         if(!ReferenceEquals(activeRoom,room)){ApplyRoomEnvironment(room,cameraEnv,s,sceneShadows);activeRoom=room;}
         DrawTerrainInstance(inst,room,vp,visible,s);
       }
     }
 
     private void DrawTerrainInstance(AssetInstance inst,Room room,Matrix vp,HashSet<string> visible,WorldRenderSettings s){
-      Matrix world=InstanceWorld(inst,room);fx.SetWorld(world);fx.SetViewProj(vp);SetNearestLocalLights(new Vector3(world.M41,world.M42,world.M43),room,s,visible,true);
+      Matrix world=InstanceWorld(inst,room);fx.SetWorld(world);fx.SetViewProj(vp);
+      Vector3 terrainLightPoint=new Vector3(world.M41,world.M42,world.M43);float terrainLightRadius=0f;
+      if(TryTerrainSphere(inst,room,out Vector3 terrainCenter,out float terrainRadius)){terrainLightPoint=terrainCenter;terrainLightRadius=terrainRadius;}
+      SetNearestLocalLights(terrainLightPoint,room,s,visible,true,false,false,terrainLightRadius);
       ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(inst.VBO,PosNormalTexTan.Stride,0));
       terrainGpu.TryGetValue(inst,out TerrainGpu gpu);
       TerrainLodRange lod=SelectTerrainLod(inst,room,gpu,s);
@@ -1629,6 +3009,8 @@ namespace PugTools {
         fx.SetMaterial(null);fx.Wire.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed(drawCount,drawStart,0);return;
       }
 
+      EnsureTerrainTextures(inst,gpu);
+
       // Jedipedia's terrain path first lays down black + depth, then sums every splat layer with ONE/ONE.
       // That guarantees complete coverage even when the first material's mask is zero at a texel.
       fx.SetMaterial(null);fx.TerrainCoverage.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed(drawCount,drawStart,0);
@@ -1636,13 +3018,23 @@ namespace PugTools {
       if(layers==null||layers.Count==0){
         GR2_Material fallback=GetTerrainMaterial("terrain_checkered");
         fx.SetTerrain(fallback,null,gpu?.ColorMap,1f,new Vector2(2f/Math.Max(1u,inst.HeightMap.width),2f/Math.Max(1u,inst.HeightMap.depth)));
-        PickTerrainTech(s,true,false).GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed(drawCount,drawStart,0);return;
+        PickTerrainTech(s,true,false).GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed(drawCount,drawStart,0);
+        DrawTerrainLocalLightOverflow(drawCount,drawStart);return;
       }
       foreach(TerrainLayerMask layer in layers){
         GR2_Material mat=GetTerrainMaterial(layer.MaterialName);ShaderResourceView mask=null;if(gpu!=null)gpu.Masks.TryGetValue(layer.MaterialName,out mask);
         fx.SetTerrain(mat,mask,gpu?.ColorMap,1f,new Vector2(2f/Math.Max(1u,inst.HeightMap.width),2f/Math.Max(1u,inst.HeightMap.depth)));
         PickTerrainTech(s,true,false).GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed(drawCount,drawStart,0);
+        DrawTerrainLocalLightOverflow(drawCount,drawStart);
       }
+    }
+
+    private void DrawTerrainLocalLightOverflow(int drawCount,int drawStart){
+      LocalLightSelection selection=currentLocalLightSelection;if(selection==null||selection.Count<=LocalLightBaseSlots)return;
+      for(int offset=LocalLightBaseSlots;offset<selection.Count;offset+=LocalLightBaseSlots){
+        if(BindLocalLightChunk(selection,offset)<=0)break;fx.TerrainLocalLightAdd.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed(drawCount,drawStart,0);
+      }
+      InvalidateTrackedLocalLightBinding();BindLocalLightSelection(selection);
     }
 
     private TerrainLodRange SelectTerrainLod(AssetInstance inst,Room room,TerrainGpu gpu,WorldRenderSettings s){
@@ -1653,27 +3045,41 @@ namespace PugTools {
       float rx=Math.Max(0,(hm.width-1)*.1f),rz=Math.Max(0,(hm.depth-1)*.1f),ry=Math.Max(0,(hm.MaxElevation-hm.MinElevation)*.5f);
       float sx=(float)Math.Sqrt(world.M11*world.M11+world.M12*world.M12+world.M13*world.M13),sy=(float)Math.Sqrt(world.M21*world.M21+world.M22*world.M22+world.M23*world.M23),sz=(float)Math.Sqrt(world.M31*world.M31+world.M32*world.M32+world.M33*world.M33);
       float maxScale=Math.Max(.0001f,Math.Max(sx,Math.Max(sy,sz)));float radius=(float)Math.Sqrt(rx*rx+ry*ry+rz*rz)*maxScale;
-      float distance=Math.Max(0,(camera.Position-center).Length()-radius);int level=0;while(level<terrainLodDistances.Length&&distance>=terrainLodDistances[level])level++;
+      // In orthographic mode screen size no longer depends on physical camera distance. Jedipedia feeds its LOD
+      // system an equivalent perspective distance derived from the zoom box so zooming still selects sensible LODs.
+      float distance=orthographicActive?Math.Max(0f,OrthographicReferenceDistance*orthographicZoom-radius):Math.Max(0,(camera.Position-center).Length()-radius);
+      int level=0;while(level<terrainLodDistances.Length&&distance>=terrainLodDistances[level])level++;
       return gpu.LodRanges[Math.Min(level,gpu.LodRanges.Length-1)];
     }
 
     private EffectTechnique PickTerrainTech(WorldRenderSettings s,bool additive,bool dummy){if(s.Mode==WorldRenderMode.Wireframe)return fx.Wire;bool lit=s.Mode!=WorldRenderMode.Unlit&&s.EnableLighting;return lit?(additive?fx.TerrainAddLit:fx.TerrainLit):(additive?fx.TerrainAddUnlit:fx.TerrainUnlit);}
+
+    private const float DynamicDetailRenderDistance = 7.5f;
 
     private void DrawDynamicDetails(Matrix vp,HashSet<string> visible,WorldRenderSettings s,AreaEnvironmentScheme cameraEnv,bool sceneShadows){
       if(area==null||dynamicDetailLayout==null)return;
       ImmediateContext.InputAssembler.InputLayout=dynamicDetailLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
       try{
         Room activeRoom=null;
-        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindTerrain,10f)){
+        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindTerrain,DynamicDetailRenderDistance,true,visible)){
           Room room=entry.Room;AssetInstance inst=entry.Instance;
-          if(room==null||!InstanceVisibleInWorld(inst)||skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible)||inst.HeightMap?.DynamicDetails==null||inst.HeightMap.DynamicDetails.Count==0)continue;
-          float distance=DynamicDetailTerrainDistance(inst,room);if(distance>=10f)continue;
+          if(room==null||!InstanceVisibleInWorld(inst,s)||skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible)||inst.HeightMap?.DynamicDetails==null||inst.HeightMap.DynamicDetails.Count==0)continue;
+          float distance=DynamicDetailTerrainDistance(inst,room);if(distance>=DynamicDetailRenderDistance)continue;
           if(!ReferenceEquals(activeRoom,room)){ApplyRoomEnvironment(room,cameraEnv,s,sceneShadows);activeRoom=room;}
           List<DynamicDetailGpu> batches=EnsureDynamicDetails(inst);List<DynamicDetailMeshBatch> meshBatches=EnsureDynamicDetailMeshes(inst);if((batches==null||batches.Count==0)&&meshBatches.Count==0)continue;
           Matrix world=entry.World;fx.SetWorld(world);fx.SetViewProj(vp);SetNearestLocalLights(new Vector3(world.M41,world.M42,world.M43),room,s,visible,true);
           foreach(DynamicDetailGpu batch in batches){
             if(batch.Buffer==null||batch.Count<=0||batch.Material==null)continue;
-            fx.SetMaterial(batch.Material);fx.SetDynamicDetail(camera.Right,batch.AtlasMode,batch.Wind,batch.Material.vegetationParams2.Z,batch.TextureSize);
+            // DYD batches retain a material reference for the life of the terrain tile. The texture LRU may evict
+            // that MAT while the batch remains alive, so re-touch/reparse it before drawing. Otherwise vegetation
+            // becomes the opaque green fallback quads seen after the streaming changes.
+            GR2_Material dynamicMaterial=EnsureMaterialParsed(batch.Material);
+            // Billboard DYD without its diffuse/alpha texture is not a useful fallback: it becomes a solid green
+            // rectangle. Fail open by omitting only that broken grass card until its MAT can be streamed again.
+            if(dynamicMaterial==null||dynamicMaterial.diffuseSRV==null)continue;
+            if(dynamicMaterial.alphaTestValue<=0)dynamicMaterial.alphaTestValue=.5f;
+            else if(dynamicMaterial.alphaTestValue>1)dynamicMaterial.alphaTestValue=Math.Min(1f,dynamicMaterial.alphaTestValue/255f);
+            fx.SetMaterial(dynamicMaterial);fx.SetDynamicDetail(camera.Right,batch.AtlasMode,batch.Wind,dynamicMaterial.vegetationParams2.Z,batch.TextureSize);
             ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(batch.Buffer,48,0));
             fx.DynamicDetail.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(batch.Count,0);
           }
@@ -1686,7 +3092,7 @@ namespace PugTools {
       } finally { ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList; }
     }
 
-    // Jedipedia admits DYD for a whole terrain tile when the tile's horizontal AABB is within 10 world units.
+    // Keep billboard vegetation to a game-like near-field draw distance; geometry/terrain itself remains unchanged.
     private float DynamicDetailTerrainDistance(AssetInstance inst,Room room){
       HeightMap hm=inst?.HeightMap;if(hm==null)return float.MaxValue;Matrix world=InstanceWorld(inst,room);
       Vector3 center=Vector3.TransformCoordinate(new Vector3(0,(hm.MinElevation+hm.MaxElevation)*.5f,0),world);
@@ -1782,10 +3188,43 @@ namespace PugTools {
     }
 
     private GR2_Material GetDynamicDetailMaterial(string name){
-      if(string.IsNullOrWhiteSpace(name))return null;if(materials.TryGetValue(name,out GR2_Material shared))return shared;if(dynamicDetailMaterials.TryGetValue(name,out GR2_Material material))return material;
-      material=new GR2_Material(name);try{material.ParseMAT(Device);}catch(Exception ex){System.Diagnostics.Debug.WriteLine("Could not load DYD material "+name+": "+ex.Message);}if(material.alphaTestValue<=0)material.alphaTestValue=.5f;else if(material.alphaTestValue>1)material.alphaTestValue=Math.Min(1f,material.alphaTestValue/255f);dynamicDetailMaterials[name]=material;return material;
+      if(string.IsNullOrWhiteSpace(name))return null;
+      GR2_Material material=null;
+      if(materials.TryGetValue(name,out GR2_Material shared))material=EnsureMaterialParsed(shared);
+      else if(dynamicDetailMaterials.TryGetValue(name,out GR2_Material cached))material=EnsureMaterialParsed(cached);
+      else {material=new GR2_Material(name);dynamicDetailMaterials[name]=material;material=EnsureMaterialParsed(material);}
+      if(material==null)return null;
+      if(material.alphaTestValue<=0)material.alphaTestValue=.5f;else if(material.alphaTestValue>1)material.alphaTestValue=Math.Min(1f,material.alphaTestValue/255f);
+      return material;
     }
     private static void ReleaseOwnedMaterial(GR2_Material m){if(m==null)return;Release(ref m.ageSRV);Release(ref m.complexionSRV);Release(ref m.diffuseSRV);Release(ref m.diffuse2SRV);Release(ref m.facepaintSRV);Release(ref m.glossSRV);Release(ref m.paletteMaskSRV);Release(ref m.paletteSRV);Release(ref m.rotationSRV);Release(ref m.waterSurfaceSRV);}
+
+    private void DrawOccluderPrepass(Matrix vp,HashSet<string> visible,WorldRenderSettings s){
+      if(occluderRenderEntries.Count==0)return;
+      ClearLocalLightBinding();fx.SetViewProj(vp);fx.SetPlaceableBlueGlow(false);
+      ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
+      foreach(RenderEntry entry in occluderRenderEntries){
+        if(entry?.Room==null||entry.Instance==null||entry.Model==null||!entry.Model.enabled||!RoomVisible(entry.Room,visible))continue;
+        if(IsSpeedTreeInstance(entry.Instance)&&!s.ShowSpeedTrees)continue;
+        if(!SphereWithinDistance(entry.Center,entry.Radius,camera.FarZ)||!SphereVisibleInCameraFrustum(entry.Center,entry.Radius))continue;
+        Matrix world=entry.World;fx.SetWorld(world);DrawModelOccluderDepth(entry.Model,world,false);
+      }
+    }
+
+    private void DrawModelOccluderDepth(GR2 model,Matrix world,bool placementOccluderOnly){
+      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=SelectModelLodLevel(model,world,false);
+      foreach(GR2_Mesh mesh in model.meshes){
+        if(mesh==null||mesh.vertBuffer==null||mesh.idxBuffer==null)continue;
+        // Dedicated dPVS occlusion geometry is Granny LOD -3. An OCCLUDER_ONLY placement makes its ordinary
+        // selected visual mesh an occluder as well, while collision (-1) and portal (-2) helpers remain excluded.
+        bool draw=mesh.lod==-3||(placementOccluderOnly&&mesh.lod>=0&&mesh.LodLevel==selectedLod);if(!draw)continue;
+        ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));
+        ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
+        fx.OccluderDepth.GetPassByIndex(0).Apply(ImmediateContext);
+        foreach(GR2_Mesh_Piece piece in mesh.meshPieces)ImmediateContext.DrawIndexed((int)piece.numPieceFaces*3,(int)piece.startIndex*3,0);
+      }
+      foreach(GR2 attached in model.attachedModels)DrawModelOccluderDepth(attached,world,placementOccluderOnly);
+    }
 
     private void DrawSky(AreaEnvironmentScheme env,WorldRenderSettings s){
       string activeSky=ResolveSkyRoomName(env);
@@ -1796,7 +3235,7 @@ namespace PugTools {
       Matrix skyCameraInv=Matrix.Identity;bool hasSkyCamera=TryGetSkyCameraInverse(room,out skyCameraInv);
       Matrix skyVp=GetSkyViewProjection();
       foreach(AssetInstance inst in room.InstancesById.Values){
-        if(!InstanceVisibleInWorld(inst)||inst.hasHeightMap||inst.hasWater||!models.TryGetValue(inst.assetID,out GR2 model)||!model.enabled)continue;
+        if(!InstanceVisibleInWorld(inst,s)||inst.hasHeightMap||inst.hasWater||!models.TryGetValue(inst.assetID,out GR2 model)||!model.enabled)continue;
         Matrix world=InstanceWorldForSky(inst,room);if(hasSkyCamera)world*=skyCameraInv;
         DrawModel(model,world,skyVp,s,true,null);
       }
@@ -1804,14 +3243,17 @@ namespace PugTools {
 
     private void DrawModels(Matrix vp,HashSet<string> visible,WorldRenderSettings s,AreaEnvironmentScheme env,bool sceneShadows){
       if(s.Mode==WorldRenderMode.Map){
-        foreach(Room room in rooms){
-          if(skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible))continue;
-          ApplyRoomEnvironment(room,env,s,sceneShadows);
-          foreach(AssetInstance inst in room.InstancesById.Values){
-            if(!InstanceVisibleOnMap(inst)||inst.hasHeightMap||inst.hasWater||!models.TryGetValue(inst.assetID,out GR2 model)||!model.enabled)continue;
-            Matrix world=InstanceWorld(inst,room);SetNearestLocalLights(new Vector3(world.M41,world.M42,world.M43),room,s,visible,false);
-            AreaEnvironmentMaterial envMat=area?.GetEnvironmentMaterial(room,inst);DrawModel(model,world,vp,s,false,envMat);
-          }
+        Room mapActiveRoom=null;
+        foreach(RenderEntry entry in MapVisibleRenderEntries(RenderKindModel)){
+          Room room=entry.Room;AssetInstance inst=entry.Instance;GR2 model=entry.Model;
+          if(room==null||inst==null||model==null||!model.enabled||skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible)||!InstanceVisibleOnMap(inst)||inst.hasHeightMap||inst.hasWater)continue;
+          bool speedTree=IsSpeedTreeInstance(inst);if(speedTree&&!s.ShowSpeedTrees)continue;
+          Matrix world=entry.World;if(!MapModelVisibleForCurrentMap(inst,model,world))continue;
+          if(!ReferenceEquals(mapActiveRoom,room)){ApplyRoomEnvironment(room,env,s,sceneShadows);mapActiveRoom=room;}
+          // Local lighting is intentionally disabled in map mode by SetNearestLocalLights, but keep the same call
+          // path so future map-light settings do not diverge from the normal model renderer.
+          SetNearestLocalLights(entry.Center,room,s,visible,false,false,false,Math.Max(0f,entry.Radius),speedTree);
+          AreaEnvironmentMaterial envMat=area?.GetEnvironmentMaterial(room,inst);DrawModel(model,world,vp,s,false,envMat);
         }
         return;
       }
@@ -1820,38 +3262,49 @@ namespace PugTools {
       // thousands of repeated rocks, trees and props, so distance culling alone still leaves the D3D11 render
       // thread draw-call bound. PugTools already had an instanced input path for DYD meshes; reuse it for safe
       // ordinary models and split batches by room + local-light cell so shared uniforms stay correct.
-      var batches=new Dictionary<(Room Room,GR2 Model,int Lod,int X,int Y,int Z),ModelInstanceBatch>();
+      var batches=new Dictionary<(Room Room,GR2 Model,int Lod,int X,int Y,int Z,bool SpeedTree),ModelInstanceBatch>();
       var singles=new List<(RenderEntry Entry,int Lod)>();
       bool splitLights=s.EnableLocalLights&&s.EnableLighting&&s.Mode!=WorldRenderMode.Unlit&&s.Mode!=WorldRenderMode.Wireframe&&s.Mode!=WorldRenderMode.Heightmap;
-      foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,camera.FarZ)){
+      foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,camera.FarZ,true,visible)){
         Room room=entry.Room;AssetInstance inst=entry.Instance;GR2 model=entry.Model;
-        if(room==null||inst==null||model==null||!model.enabled||skyRoomNames.Contains(room.RoomName)||!InstanceRoomVisible(inst,room,visible))continue;
+        if(room==null||inst==null||model==null||!model.enabled||skyRoomNames.Contains(room.RoomName)||!InstanceRoomVisible(inst,room,visible)||!InstanceVisibleInWorld(inst,s))continue;
+        if(!RenderEntryVisibleByOcclusion(entry,s))continue;
+        bool speedTree=IsSpeedTreeInstance(inst);if(speedTree&&!s.ShowSpeedTrees)continue;
         // Jedipedia's model LOD is not cosmetic: below the lowest schema threshold the asset stops contributing.
         // This removes the sea of tiny props that remained CPU/GPU work in v7 even after distance culling.
         if(ShouldCullModelByLod(model,entry.World,false,inst.LodFactor))continue;int lod=SelectModelLodLevel(model,entry.World,false,inst.LodFactor);
         if(!ModelCanUseRegularInstancing(model)||!MatrixHasNearlyUniformScale(entry.World)){singles.Add((entry,lod));continue;}
-        Vector3 p=new Vector3(entry.World.M41,entry.World.M42,entry.World.M43);
-        int lx=splitLights?LightCell(p.X):0,ly=splitLights?LightCell(p.Y):0,lz=splitLights?LightCell(p.Z):0;
-        var key=(room,model,lod,lx,ly,lz);
-        if(!batches.TryGetValue(key,out ModelInstanceBatch batch)){batch=new ModelInstanceBatch{Room=room,Model=model,LodLevel=lod,LightSample=p};batches[key]=batch;}
+        Vector3 p=entry.Center;float lightRadius=Math.Max(0f,entry.Radius);
+        bool splitThisLight=splitLights&&ReceiverCouldHaveIndexedLocalLights(p,lightRadius);
+        int lx=splitThisLight?LightSelectionCell(p.X):0,ly=splitThisLight?LightSelectionCell(p.Y):0,lz=splitThisLight?LightSelectionCell(p.Z):0;
+        var key=(room,model,lod,lx,ly,lz,speedTree);
+        if(!batches.TryGetValue(key,out ModelInstanceBatch batch)){batch=new ModelInstanceBatch{Room=room,Model=model,LodLevel=lod,LightSample=p,LightRadius=lightRadius,SpeedTree=speedTree};batches[key]=batch;}
+        else if(lightRadius>batch.LightRadius)batch.LightRadius=lightRadius;
         batch.Worlds.Add(entry.World);
       }
 
       Room activeRoom=null;
       foreach(var single in singles){
         RenderEntry entry=single.Entry;Room room=entry.Room;AssetInstance inst=entry.Instance;if(!ReferenceEquals(activeRoom,room)){ApplyRoomEnvironment(room,env,s,sceneShadows);activeRoom=room;}
-        Matrix world=entry.World;SetNearestLocalLights(new Vector3(world.M41,world.M42,world.M43),room,s,visible,false);
+        Matrix world=entry.World;bool speedTree=IsSpeedTreeInstance(inst);SetNearestLocalLights(entry.Center,room,s,visible,false,false,false,Math.Max(0f,entry.Radius),speedTree);
         AreaEnvironmentMaterial envMat=area?.GetEnvironmentMaterial(room,inst);DrawModel(entry.Model,world,vp,s,false,envMat,single.Lod);
       }
+      regularModelFrameInstances.Clear();
+      foreach(ModelInstanceBatch batch in batches.Values){
+        if(batch.Worlds.Count<2)continue;
+        batch.StartInstance=regularModelFrameInstances.Count;
+        regularModelFrameInstances.AddRange(batch.Worlds);
+      }
+      Buffer sharedInstanceBuffer=regularModelFrameInstances.Count>0?UploadRegularModelInstances(regularModelFrameInstances):null;
       foreach(ModelInstanceBatch batch in batches.Values){
         if(batch.Worlds.Count<2){
           Matrix world=batch.Worlds[0];if(!ReferenceEquals(activeRoom,batch.Room)){ApplyRoomEnvironment(batch.Room,env,s,sceneShadows);activeRoom=batch.Room;}
-          SetNearestLocalLights(new Vector3(world.M41,world.M42,world.M43),batch.Room,s,visible,false);DrawModel(batch.Model,world,vp,s,false,null,batch.LodLevel);continue;
+          SetNearestLocalLights(batch.LightSample,batch.Room,s,visible,false,false,false,batch.LightRadius,batch.SpeedTree);DrawModel(batch.Model,world,vp,s,false,null,batch.LodLevel);continue;
         }
         if(!ReferenceEquals(activeRoom,batch.Room)){ApplyRoomEnvironment(batch.Room,env,s,sceneShadows);activeRoom=batch.Room;}
-        SetNearestLocalLights(batch.LightSample,batch.Room,s,visible,false);
-        Buffer instanceBuffer=UploadRegularModelInstances(batch.Worlds);if(instanceBuffer==null){foreach(Matrix world in batch.Worlds)DrawModel(batch.Model,world,vp,s,false,null,batch.LodLevel);continue;}
-        ImmediateContext.InputAssembler.InputLayout=instancedLayout;DrawInstancedModel(batch.Model,instanceBuffer,batch.Worlds.Count,Matrix.Identity,vp,s,batch.LodLevel,batch.Worlds[0]);
+        SetNearestLocalLights(batch.LightSample,batch.Room,s,visible,false,false,false,batch.LightRadius,batch.SpeedTree);
+        if(sharedInstanceBuffer==null){foreach(Matrix world in batch.Worlds)DrawModel(batch.Model,world,vp,s,false,null,batch.LodLevel);continue;}
+        ImmediateContext.InputAssembler.InputLayout=instancedLayout;DrawInstancedModel(batch.Model,sharedInstanceBuffer,batch.Worlds.Count,Matrix.Identity,vp,s,batch.LodLevel,batch.Worlds[0],true,batch.StartInstance);
       }
       ImmediateContext.InputAssembler.InputLayout=inputLayout;
     }
@@ -1946,7 +3399,7 @@ namespace PugTools {
     }
 
     private void DrawDecorationHookModel(GR2 model,Matrix world,Matrix vp,WorldRenderSettings s,Vector4 fallbackTint,int forcedLod=-1){
-      if(model==null)return;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,false);fx.SetWorld(world);fx.SetViewProj(vp);
+      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,false);fx.SetWorld(world);fx.SetViewProj(vp);
       foreach(var mesh in model.meshes){if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
         foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat))continue;fx.SetMaterial(mat);
           // The hook VFX use authored diffuseFlatColorProp where available. Older/client-specific hook MATs sometimes
@@ -1970,7 +3423,7 @@ namespace PugTools {
       if(!s.ShowDecorationHooks||decorationHookRenderEntries.Count==0)return;
       // Jedipedia's hook arm is never entered for a local-light sub-pass. Clear any receiver light state left by
       // the normal model pass before drawing the colored placement fields.
-      fx.ClearLocalLights();lastLocalLightCount=0;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
+      fx.ClearLocalLights();currentLocalLightSelection=LocalLightSelection.Empty;lastLocalLightCount=0;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
       Room activeRoom=null;
       foreach(DecorationHookRenderEntry entry in decorationHookRenderEntries){
         if(entry==null||entry.Room==null||entry.Model==null||!entry.Model.enabled||!InstanceRoomVisible(entry.Instance,entry.Room,visible))continue;
@@ -2025,6 +3478,13 @@ namespace PugTools {
       visualLodLevels[model]=levels;return levels;
     }
 
+    private static bool ModelHasOcclusionGeometry(GR2 model){
+      if(model==null)return false;
+      if(model.meshes!=null&&model.meshes.Any(mesh=>mesh!=null&&mesh.lod==-3&&mesh.meshVerts!=null&&mesh.meshVertIndex!=null))return true;
+      if(model.attachedModels!=null)foreach(GR2 attached in model.attachedModels)if(ModelHasOcclusionGeometry(attached))return true;
+      return false;
+    }
+
     private static bool IsCollisionMesh(GR2 model,GR2_Mesh mesh){
       if(mesh==null)return false;string name=(mesh.meshName??string.Empty).ToLowerInvariant();string path=NormalizeAssetPath(model?.filename);
       return mesh.lod==-1||name=="collision"||path.Contains("designblockout/cover_objects/")||path.Contains("superexclusion")||name.Contains("superexclusion");
@@ -2040,7 +3500,8 @@ namespace PugTools {
       Vector3 min=new Vector3(box.minX,box.minY,box.minZ),max=new Vector3(box.maxX,box.maxY,box.maxZ);if(!IsFinite(min)||!IsFinite(max)||min.X>max.X||min.Y>max.Y||min.Z>max.Z)return false;
       Vector3 localCenter=(min+max)*.5f,center=Vector3.TransformCoordinate(localCenter,world);float radius=(max-min).Length()*.5f;if(radius<=.0001f||float.IsNaN(radius)||float.IsInfinity(radius))return false;
       float factor=Math.Max(0f,float.IsNaN(lodFactor)||float.IsInfinity(lodFactor)?1f:lodFactor);
-      float distance=Math.Max((camera.Position-center).Length(),.0001f);projectedSize=radius*factor*GrannyLodProjectedSizeScale/distance;return true;
+      float distance=orthographicActive?Math.Max(OrthographicReferenceDistance*orthographicZoom,.0001f):Math.Max((camera.Position-center).Length(),.0001f);
+      projectedSize=radius*factor*GrannyLodProjectedSizeScale/distance;return true;
     }
 
     private int SelectModelLodLevel(GR2 model,Matrix world,bool mapOrSky,float lodFactor=1f){
@@ -2079,7 +3540,7 @@ namespace PugTools {
     private bool ModelCanUseRegularInstancing(GR2 model,HashSet<GR2> seen){
       if(model==null||!seen.Add(model))return true;
       foreach(var mesh in model.meshes){if(IsNonVisualMesh(model,mesh))continue;foreach(var piece in mesh.meshPieces){
-        GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat))continue;
+        GR2_Material mat=ResolvePieceMaterial(model,piece);
         string alpha=mat?.alphaMode??"None";if(!string.Equals(alpha,"None",StringComparison.OrdinalIgnoreCase)&&!string.Equals(alpha,"Test",StringComparison.OrdinalIgnoreCase))return false;
         string derived=mat?.derived??String.Empty;if(string.Equals(derived,"Skydome",StringComparison.OrdinalIgnoreCase)||string.Equals(derived,"UberEnvBlend",StringComparison.OrdinalIgnoreCase)||string.Equals(derived,"OpacityFade",StringComparison.OrdinalIgnoreCase)||string.Equals(derived,"Distortion",StringComparison.OrdinalIgnoreCase)||string.Equals(derived,"_FinalBlend",StringComparison.OrdinalIgnoreCase)||string.Equals(derived,"Water",StringComparison.OrdinalIgnoreCase))return false;
       }}
@@ -2087,7 +3548,7 @@ namespace PugTools {
       return true;
     }
 
-    private Buffer UploadRegularModelInstances(List<Matrix> worlds){
+    private Buffer UploadRegularModelInstances(IList<Matrix> worlds){
       int count=worlds?.Count??0;if(count<=0)return null;
       if(regularModelInstanceBuffer==null||regularModelInstanceCapacity<count){
         Release(ref regularModelInstanceBuffer);int capacity=64;while(capacity<count&&capacity<65536)capacity*=2;if(capacity<count)capacity=count;
@@ -2098,23 +3559,49 @@ namespace PugTools {
         data[o++]=m.M11;data[o++]=m.M12;data[o++]=m.M13;data[o++]=m.M14;data[o++]=m.M21;data[o++]=m.M22;data[o++]=m.M23;data[o++]=m.M24;
         data[o++]=m.M31;data[o++]=m.M32;data[o++]=m.M33;data[o++]=m.M34;data[o++]=m.M41;data[o++]=m.M42;data[o++]=m.M43;data[o++]=m.M44;
       }
-      try{DataBox mapped=ImmediateContext.MapSubresource(regularModelInstanceBuffer,MapMode.WriteDiscard,SlimDX.Direct3D11.MapFlags.None);mapped.Data.WriteRange(data);ImmediateContext.UnmapSubresource(regularModelInstanceBuffer,0);return regularModelInstanceBuffer;}
+      try{DataBox mapped=ImmediateContext.MapSubresource(regularModelInstanceBuffer,MapMode.WriteDiscard,SlimDX.Direct3D11.MapFlags.None);mapped.Data.WriteRange(data,0,count*16);ImmediateContext.UnmapSubresource(regularModelInstanceBuffer,0);return regularModelInstanceBuffer;}
       catch(Exception ex){System.Diagnostics.Debug.WriteLine("Regular world instancing upload failed: "+ex.Message);return null;}
     }
-    private void DrawModel(GR2 model,Matrix world,Matrix vp,WorldRenderSettings s,bool sky,AreaEnvironmentMaterial envMat,int forcedLod=-1){
-      if(model==null)return;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,sky||s.Mode==WorldRenderMode.Map);fx.SetWorld(world);fx.SetViewProj(vp);
+    private void DrawModel(GR2 model,Matrix world,Matrix vp,WorldRenderSettings s,bool sky,AreaEnvironmentMaterial envMat,int forcedLod=-1,bool blueGlow=false,bool allowLocalLightOverflow=true){
+      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,sky||s.Mode==WorldRenderMode.Map);fx.SetWorld(world);fx.SetViewProj(vp);fx.SetPlaceableBlueGlow(blueGlow&&!sky&&s.Mode!=WorldRenderMode.Map);
       foreach(var mesh in model.meshes){if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
-        foreach(var piece in mesh.meshPieces){GR2_Material mat=null;if(piece.matId>=0&&model.materials.ElementAtOrDefault(piece.matId)!=null)materials.TryGetValue(model.materials[piece.matId].materialName,out mat);else if(model.materials.Count>0)materials.TryGetValue(model.materials[0].materialName,out mat);if(IsMaterialHiddenFromWorld(mat))continue;fx.SetMaterial(mat);
+        foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat,s))continue;fx.SetMaterial(mat);
           if(!sky&&mat!=null&&string.Equals(mat.derived,"UberEnvBlend",StringComparison.OrdinalIgnoreCase)&&envMat!=null)fx.SetEnvironmentBlend(envMat,mat,LoadTexture(envMat.BlendDiffuse),LoadTexture(envMat.BlendNormal));
           var tech=PickModelTech(s,mat,sky);tech.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed((int)piece.numPieceFaces*3,(int)piece.startIndex*3,0);}}
-      foreach(var a in model.attachedModels)DrawModel(a,world,vp,s,sky,envMat);
+      foreach(var a in model.attachedModels)DrawModel(a,world,vp,s,sky,envMat,-1,blueGlow,false);
+      if(allowLocalLightOverflow&&!sky&&HasLocalLightOverflow)DrawModelLocalLightOverflow(model,world,vp,s,envMat,forcedLod);
     }
-    private static bool IsMaterialHiddenFromWorld(GR2_Material mat){
+
+    private static bool MaterialReceivesAdditiveLocalLight(GR2_Material mat){
+      string alpha=mat?.alphaMode??"None";return string.Equals(alpha,"None",StringComparison.OrdinalIgnoreCase)||string.Equals(alpha,"Test",StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void DrawModelLocalLightOverflow(GR2 model,Matrix world,Matrix vp,WorldRenderSettings s,AreaEnvironmentMaterial envMat,int forcedLod=-1){
+      LocalLightSelection selection=currentLocalLightSelection;if(model==null||selection==null||selection.Count<=LocalLightBaseSlots)return;
+      fx.SetPlaceableBlueGlow(false);
+      for(int offset=LocalLightBaseSlots;offset<selection.Count;offset+=LocalLightBaseSlots){
+        if(BindLocalLightChunk(selection,offset)<=0)break;DrawModelLocalLightPassRecursive(model,world,vp,s,envMat,forcedLod);
+      }
+      InvalidateTrackedLocalLightBinding();BindLocalLightSelection(selection);
+    }
+
+    private void DrawModelLocalLightPassRecursive(GR2 model,Matrix world,Matrix vp,WorldRenderSettings s,AreaEnvironmentMaterial envMat,int forcedLod=-1){
+      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,false);fx.SetWorld(world);fx.SetViewProj(vp);
+      foreach(var mesh in model.meshes){if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
+        foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat,s)||!MaterialReceivesAdditiveLocalLight(mat))continue;fx.SetMaterial(mat);
+          if(mat!=null&&string.Equals(mat.derived,"UberEnvBlend",StringComparison.OrdinalIgnoreCase)&&envMat!=null)fx.SetEnvironmentBlend(envMat,mat,LoadTexture(envMat.BlendDiffuse),LoadTexture(envMat.BlendNormal));
+          fx.LocalLightAdd.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed((int)piece.numPieceFaces*3,(int)piece.startIndex*3,0);}}
+      foreach(var a in model.attachedModels)DrawModelLocalLightPassRecursive(a,world,vp,s,envMat,-1);
+    }
+    private static bool IsMaterialHiddenFromWorld(GR2_Material mat,WorldRenderSettings s=null){
       if(mat==null)return false;
       string visibility=mat.visibility??String.Empty;
-      // Jedipedia's ordinary in-game view hides both EditorOnly utility geometry and Hidden collision/occluder
-      // materials. These are the source of conspicuous authoring placeholders such as yellow "Converting" blocks.
-      return visibility.Equals("EditorOnly",StringComparison.OrdinalIgnoreCase)||visibility.Equals("Hidden",StringComparison.OrdinalIgnoreCase);
+      bool showHidden=s?.ShowHiddenGeometry==true;
+      // With the top-level Show tier removed, hidden/editor geometry is controlled only by its Utilities submenu
+      // checkbox. This avoids the previous double-enable requirement.
+      if(visibility.Equals("EditorOnly",StringComparison.OrdinalIgnoreCase))return !showHidden;
+      if(visibility.Equals("Hidden",StringComparison.OrdinalIgnoreCase))return !showHidden;
+      return false;
     }
 
     private EffectTechnique PickModelTech(WorldRenderSettings s,GR2_Material mat,bool sky){
@@ -2125,31 +3612,54 @@ namespace PugTools {
       return !string.Equals(alpha,"None",StringComparison.OrdinalIgnoreCase)?fx.AlphaLit:fx.Lit;
     }
 
+    private EffectTechnique PickSkinnedModelTech(WorldRenderSettings s,GR2_Material mat){
+      if(s.Mode==WorldRenderMode.Wireframe)return fx.SkinnedWire;if(s.Mode==WorldRenderMode.Unlit||!s.EnableLighting)return fx.SkinnedUnlit;
+      string alpha=mat?.alphaMode??"None";if(string.Equals(alpha,"Test",StringComparison.OrdinalIgnoreCase))return fx.SkinnedAlphaTestLit;
+      if(string.Equals(alpha,"Add",StringComparison.OrdinalIgnoreCase))return fx.SkinnedAddLit;
+      if(string.Equals(alpha,"Multiply",StringComparison.OrdinalIgnoreCase))return fx.SkinnedMultiplyLit;
+      return !string.Equals(alpha,"None",StringComparison.OrdinalIgnoreCase)?fx.SkinnedAlphaLit:fx.SkinnedLit;
+    }
+
     private EffectTechnique PickInstancedModelTech(WorldRenderSettings s,GR2_Material mat){
       if(s.Mode==WorldRenderMode.Wireframe)return fx.InstancedWire;if(s.Mode==WorldRenderMode.Unlit||!s.EnableLighting)return fx.InstancedUnlit;
       string alpha=mat?.alphaMode??"None";if(string.Equals(alpha,"Test",StringComparison.OrdinalIgnoreCase))return fx.InstancedAlphaTestLit;
       return !string.Equals(alpha,"None",StringComparison.OrdinalIgnoreCase)?fx.InstancedAlphaLit:fx.InstancedLit;
     }
 
-    private void DrawInstancedModel(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,Matrix vp,WorldRenderSettings s,int forcedLod=-1,Matrix? lodReferenceWorld=null){
-      if(model==null||instanceBuffer==null||instanceCount<=0)return;Matrix reference=lodReferenceWorld??parentWorld;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,s.Mode==WorldRenderMode.Map);fx.SetWorld(parentWorld);fx.SetViewProj(vp);
+    private void DrawInstancedModel(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,Matrix vp,WorldRenderSettings s,int forcedLod=-1,Matrix? lodReferenceWorld=null,bool allowLocalLightOverflow=true,int startInstance=0){
+      if(model==null||instanceBuffer==null||instanceCount<=0)return;EnsureModelGeometryPrepared(model);Matrix reference=lodReferenceWorld??parentWorld;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,s.Mode==WorldRenderMode.Map);fx.SetWorld(parentWorld);fx.SetViewProj(vp);
       foreach(var mesh in model.meshes){
         if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;
         ImmediateContext.InputAssembler.SetVertexBuffers(0,new[]{new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0),new VertexBufferBinding(instanceBuffer,64,0)});ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
-        foreach(var piece in mesh.meshPieces){GR2_Material mat=null;if(piece.matId>=0&&model.materials.ElementAtOrDefault(piece.matId)!=null)materials.TryGetValue(model.materials[piece.matId].materialName,out mat);else if(model.materials.Count>0)materials.TryGetValue(model.materials[0].materialName,out mat);if(IsMaterialHiddenFromWorld(mat))continue;fx.SetMaterial(mat);
-          PickInstancedModelTech(s,mat).GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexedInstanced((int)piece.numPieceFaces*3,instanceCount,(int)piece.startIndex*3,0,0);}
+        foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat,s))continue;fx.SetMaterial(mat);
+          PickInstancedModelTech(s,mat).GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexedInstanced((int)piece.numPieceFaces*3,instanceCount,(int)piece.startIndex*3,0,startInstance);}
       }
-      foreach(var a in model.attachedModels)DrawInstancedModel(a,instanceBuffer,instanceCount,parentWorld,vp,s,-1,reference);
+      foreach(var a in model.attachedModels)DrawInstancedModel(a,instanceBuffer,instanceCount,parentWorld,vp,s,-1,reference,false,startInstance);
+      if(allowLocalLightOverflow&&HasLocalLightOverflow)DrawInstancedModelLocalLightOverflow(model,instanceBuffer,instanceCount,parentWorld,vp,s,forcedLod,reference,startInstance);
     }
 
-    private void DrawInstancedModelShadow(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,int forcedLod=-1,Matrix? lodReferenceWorld=null){
-      if(model==null||instanceBuffer==null||instanceCount<=0)return;Matrix reference=lodReferenceWorld??parentWorld;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);fx.SetWorld(parentWorld);
+    private void DrawInstancedModelLocalLightOverflow(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,Matrix vp,WorldRenderSettings s,int forcedLod,Matrix reference,int startInstance){
+      LocalLightSelection selection=currentLocalLightSelection;if(model==null||selection==null||selection.Count<=LocalLightBaseSlots)return;
+      for(int offset=LocalLightBaseSlots;offset<selection.Count;offset+=LocalLightBaseSlots){if(BindLocalLightChunk(selection,offset)<=0)break;DrawInstancedModelLocalLightPassRecursive(model,instanceBuffer,instanceCount,parentWorld,vp,s,forcedLod,reference,startInstance);}
+      InvalidateTrackedLocalLightBinding();BindLocalLightSelection(selection);
+    }
+
+    private void DrawInstancedModelLocalLightPassRecursive(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,Matrix vp,WorldRenderSettings s,int forcedLod,Matrix reference,int startInstance){
+      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);fx.SetWorld(parentWorld);fx.SetViewProj(vp);
+      foreach(var mesh in model.meshes){if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;
+        ImmediateContext.InputAssembler.SetVertexBuffers(0,new[]{new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0),new VertexBufferBinding(instanceBuffer,64,0)});ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
+        foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat,s)||!MaterialReceivesAdditiveLocalLight(mat))continue;fx.SetMaterial(mat);fx.InstancedLocalLightAdd.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexedInstanced((int)piece.numPieceFaces*3,instanceCount,(int)piece.startIndex*3,0,startInstance);}}
+      foreach(var a in model.attachedModels)DrawInstancedModelLocalLightPassRecursive(a,instanceBuffer,instanceCount,parentWorld,vp,s,-1,reference,startInstance);
+    }
+
+    private void DrawInstancedModelShadow(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,int forcedLod=-1,Matrix? lodReferenceWorld=null,int startInstance=0){
+      if(model==null||instanceBuffer==null||instanceCount<=0)return;EnsureModelGeometryPrepared(model);Matrix reference=lodReferenceWorld??parentWorld;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);fx.SetWorld(parentWorld);
       foreach(var mesh in model.meshes){
         if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;
         ImmediateContext.InputAssembler.SetVertexBuffers(0,new[]{new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0),new VertexBufferBinding(instanceBuffer,64,0)});ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
-        foreach(var piece in mesh.meshPieces){GR2_Material mat=null;if(piece.matId>=0&&model.materials.ElementAtOrDefault(piece.matId)!=null)materials.TryGetValue(model.materials[piece.matId].materialName,out mat);else if(model.materials.Count>0)materials.TryGetValue(model.materials[0].materialName,out mat);if(IsMaterialHiddenFromWorld(mat))continue;fx.SetMaterial(mat);fx.InstancedShadow.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexedInstanced((int)piece.numPieceFaces*3,instanceCount,(int)piece.startIndex*3,0,0);}
+        foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat))continue;fx.SetMaterial(mat);fx.InstancedShadow.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexedInstanced((int)piece.numPieceFaces*3,instanceCount,(int)piece.startIndex*3,0,startInstance);}
       }
-      foreach(var a in model.attachedModels)DrawInstancedModelShadow(a,instanceBuffer,instanceCount,parentWorld,-1,reference);
+      foreach(var a in model.attachedModels)DrawInstancedModelShadow(a,instanceBuffer,instanceCount,parentWorld,-1,reference,startInstance);
     }
 
     private static string NormalizeAssetPath(string p)=>(p??string.Empty).Trim().Replace('\\','/').TrimStart('/').ToLowerInvariant();
@@ -2186,7 +3696,9 @@ namespace PugTools {
       // The backdrop has its own depth pass which is cleared before world geometry. Give it a generous independent
       // far plane so a large authored skydome cannot disappear just because the user selected a short View distance.
       // This does not increase world draw distance or hurt the world's depth precision.
-      Matrix skyProjection=Matrix.PerspectiveFovRH(camera.FovY>0?camera.FovY:.25f*SlimDXNet.MathF.PI,Math.Max(.01f,camera.Aspect),.01f,SkyFarDistance);
+      Matrix skyProjection;
+      if(orthographicActive&&camera.NearWindowHeight>.0001f)skyProjection=Matrix.OrthoRH(Math.Max(.001f,camera.NearWindowWidth),Math.Max(.001f,camera.NearWindowHeight),.01f,SkyFarDistance);
+      else skyProjection=Matrix.PerspectiveFovRH(camera.FovY>0?camera.FovY:.25f*SlimDXNet.MathF.PI,Math.Max(.01f,camera.Aspect),.01f,SkyFarDistance);
       return rotationOnly*skyProjection;
     }
 
@@ -2213,9 +3725,9 @@ namespace PugTools {
         }
       } else {
         Room activeRoom=null;
-        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindWater,camera.FarZ)){
+        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindWater,camera.FarZ,true,visible)){
           Room room=entry.Room;AssetInstance inst=entry.Instance;
-          if(room==null||!InstanceVisibleInWorld(inst)||skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible)||inst.VBO==null)continue;
+          if(room==null||!InstanceVisibleInWorld(inst,s)||skyRoomNames.Contains(room.RoomName)||!RoomVisible(room,visible)||inst.VBO==null)continue;
           if(!ReferenceEquals(activeRoom,room)){SetWaterRoomEnvironment(room,s);activeRoom=room;}
           DrawWaterInstance(inst,room,entry.World,vp,visible,s);
         }
@@ -2227,7 +3739,7 @@ namespace PugTools {
       fx.SetEnvironment(waterEnv,s.EnableLighting,s.EnableFog,false,s.ViewDistanceScale);fx.SetIllumination(LoadTexture(waterEnv.IlluminationMap));fx.SetScrolling(waterEnv,elapsed,LoadTexture(waterEnv.ScrollingTexture),LoadTexture(waterEnv.ScrollingMask));
     }
     private void DrawWaterInstance(AssetInstance inst,Room room,Matrix waterWorld,Matrix vp,HashSet<string> visible,WorldRenderSettings s){
-      waterGpu.TryGetValue(inst,out WaterGpu gpu);AreaEnvironmentScheme waterEnv=room.EnvironmentScheme??area?.GetEnvironmentScheme("area")??new AreaEnvironmentScheme();ShaderResourceView environmentMap=LoadTexture(waterEnv.EnvironmentMap);
+      waterGpu.TryGetValue(inst,out WaterGpu gpu);EnsureWaterTextures(inst,gpu);AreaEnvironmentScheme waterEnv=room.EnvironmentScheme??area?.GetEnvironmentScheme("area")??new AreaEnvironmentScheme();ShaderResourceView environmentMap=LoadTexture(waterEnv.EnvironmentMap);
       fx.SetWorld(waterWorld);fx.SetViewProj(vp);fx.SetMaterial(null);SetNearestLocalLights(new Vector3(waterWorld.M41,waterWorld.M42,waterWorld.M43),room,s,visible,false,true);
       fx.SetWater(inst,elapsed,gpu?.Normal1??defaultWaterNormal,gpu?.Normal2??gpu?.Normal1??defaultWaterNormal,gpu?.DepthMap??defaultWaterDepth,gpu?.SurfaceMap,environmentMap);
       ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(inst.VBO,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(inst.IBO,Format.R16_UInt,0);
@@ -2235,10 +3747,49 @@ namespace PugTools {
     }
 
     private void DrawMapArt(Matrix vp){
+      if(!mapArtPrepared)BuildMapArt();
       if(mapArtGpu.Count==0)return;
       ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;fx.SetWorld(Matrix.Identity);fx.SetViewProj(vp);
       foreach(var g in mapArtGpu){if(g.Texture==null||g.Buffer==null)continue;fx.SetMapArt(g.Texture,.82f);ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(g.Buffer,PosNormalTexTan.Stride,0));fx.MapArt.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(g.Count,0);}
       fx.ClearMapArt();
+    }
+
+    private void DrawMapPlayerMarker(Matrix vp) {
+      if(!mapOpen||ClientWidth<=0||ClientHeight<=0)return;
+      const float pivotX=11f,pivotY=6f,width=22f,height=27f;
+      MapNoteIconGpu gpu=EnsureMapNoteIconGpu("player-marker",6);
+      if(gpu?.Buffer==null||gpu.Texture==null)return;
+
+      Vector3 position=camera.Position,look=-camera.Look;
+      Vector2 forward=new Vector2(look.X,look.Z);
+      if(forward.LengthSquared()<.000001f)forward=new Vector2(0,-1);else forward.Normalize();
+      Vector2 side=new Vector2(-forward.Y,forward.X);
+      float worldPerPixelX=Math.Max(.00001f,mapVisibleWidth/Math.Max(1f,ClientWidth));
+      float worldPerPixelZ=Math.Max(.00001f,mapVisibleHeight/Math.Max(1f,ClientHeight));
+      float y=mapCameraPosition.Y-1f;
+      Vector2 p=new Vector2(position.X,position.Z);
+      Vector2 Corner(float imageX,float imageY){
+        float dx=(imageX-pivotX)*worldPerPixelX,dy=(imageY-pivotY)*worldPerPixelZ;
+        return p+side*dx+forward*dy;
+      }
+      Vector2 tl=Corner(0,0),tr=Corner(width,0),br=Corner(width,height),bl=Corner(0,height);
+      var normal=new Vector3(0,1,0);var tangent=new Vector3(1,0,0);
+      var verts=new[]{
+        new PosNormalTexTan(new Vector3(tl.X,y,tl.Y),normal,new Vector2(0,0),tangent),
+        new PosNormalTexTan(new Vector3(tr.X,y,tr.Y),normal,new Vector2(1,0),tangent),
+        new PosNormalTexTan(new Vector3(br.X,y,br.Y),normal,new Vector2(1,1),tangent),
+        new PosNormalTexTan(new Vector3(tl.X,y,tl.Y),normal,new Vector2(0,0),tangent),
+        new PosNormalTexTan(new Vector3(br.X,y,br.Y),normal,new Vector2(1,1),tangent),
+        new PosNormalTexTan(new Vector3(bl.X,y,bl.Y),normal,new Vector2(0,1),tangent)
+      };
+      try{
+        DataBox mapped=ImmediateContext.MapSubresource(gpu.Buffer,MapMode.WriteDiscard,SlimDX.Direct3D11.MapFlags.None);
+        mapped.Data.WriteRange(verts);ImmediateContext.UnmapSubresource(gpu.Buffer,0);
+        ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
+        ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(gpu.Buffer,PosNormalTexTan.Stride,0));
+        fx.SetWorld(Matrix.Identity);fx.SetViewProj(vp);fx.SetPlaceableBlueGlow(false);fx.SetMapArt(gpu.Texture,1f);
+        fx.MapArt.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(6,0);fx.ClearMapArt();
+      }catch(Exception ex){System.Diagnostics.Debug.WriteLine("Map player marker draw failed: "+ex.Message);}
     }
 
     private void DrawLines(List<LineGpu> list,Matrix vp,float range){if(list.Count==0)return;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.LineList;fx.SetWorld(Matrix.Identity);fx.SetViewProj(vp);fx.SetMaterial(null);foreach(var g in list){if(range<float.MaxValue&&!SphereWithinDistance(g.Center,g.Radius,range))continue;fx.SetOverlay(g.Color);ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(g.Buffer,PosNormalTexTan.Stride,0));fx.Overlay.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(g.Count,0);}ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;}
@@ -2248,81 +3799,171 @@ namespace PugTools {
       localLightGrid.Clear();localLightGlobal.Clear();localLightSelectionCache.Clear();localLightVisibilityScope=null;
       foreach(Room room in rooms){
         foreach(AssetInstance inst in room.InstancesById.Values){
-          if(!InstanceVisibleInWorld(inst)||!inst.IsLocalLight)continue;
+          bool litAsset=area!=null&&area.AssetIdMap.TryGetValue(inst.assetID,out AreaAsset lightAsset)&&
+            string.Equals((lightAsset.Extension??String.Empty).Trim().TrimStart('.'),"lit",StringComparison.OrdinalIgnoreCase);
+          // Jedipedia also recognizes the .lit asset itself, even when a particular placement omitted LightType.
+          if(!InstanceVisibleInWorld(inst)||(!inst.IsLocalLight&&!litAsset))continue;
           Matrix m=InstanceWorld(inst,room);Vector3 pos=new Vector3(m.M41,m.M42,m.M43);Vector3 d=Vector3.TransformNormal(new Vector3(0,0,1),m);if(d.LengthSquared()<.0001f)d=new Vector3(0,-1,0);else d.Normalize();
           bool directional=string.Equals(inst.LocalLightType,"DIRECTIONAL",StringComparison.OrdinalIgnoreCase);float range=Math.Max(.0001f,inst.LocalLightRange);
-          ShaderResourceView illuminationMap=LoadTexture(inst.LocalLightIlluminationMap);ShaderResourceView falloffMap=LoadTexture(inst.LocalLightFalloff);ShaderResourceView rampMap=LoadTexture(inst.LocalLightRampMap);
+          // The authored Range scales the placement's three basis axes. Using Range alone here caused scaled .lit
+          // volumes to be rejected long before their projector reached a receiver.
+          float sx=(float)Math.Sqrt(m.M11*m.M11+m.M12*m.M12+m.M13*m.M13)*range;
+          float sy=(float)Math.Sqrt(m.M21*m.M21+m.M22*m.M22+m.M23*m.M23)*range;
+          float sz=(float)Math.Sqrt(m.M31*m.M31+m.M32*m.M32+m.M33*m.M33)*range;
+          float broadRange=Math.Max(.0001f,Math.Max(sx,Math.Max(sy,sz)));
           float type=directional?1f:(string.Equals(inst.LocalLightType,"SPOT",StringComparison.OrdinalIgnoreCase)?2f:0f);
           var entry=new LocalLightEntry{
-            Room=room,Instance=inst,Position=pos,RangeSquared=range*range,Directional=directional,RestrictToRoom=inst.LocalLightRestrictToRoom,
-            DoHeightmaps=inst.LocalLightDoHeightmaps,DoGranny=inst.LocalLightDoGranny,DoWater=inst.LocalLightDoWater,
-            PosRange=new Vector4(pos,range),ColorIntensity=new Vector4(inst.LocalLightColor.X,inst.LocalLightColor.Y,inst.LocalLightColor.Z,inst.LocalLightIntensity),DirType=new Vector4(d,type),
-            ProjectorInv=BuildLocalLightProjectorInverse(m,range),IlluminationMap=illuminationMap,FalloffMap=falloffMap,RampMap=rampMap,
-            ProjectorParams=new Vector4(inst.LocalLightSourceOffset,illuminationMap!=null?1:0,falloffMap!=null?1:0,rampMap!=null?1:0)
+            Room=room,Instance=inst,Position=pos,RangeSquared=broadRange*broadRange,Directional=directional,RestrictToRoom=inst.LocalLightRestrictToRoom,
+            DoHeightmaps=inst.LocalLightDoHeightmaps,DoGranny=inst.LocalLightDoGranny,DoSpeedTree=inst.LocalLightDoSpeedTree,DoCharacters=inst.LocalLightDoCharacters,DoWater=inst.LocalLightDoWater,
+            PosRange=new Vector4(pos,broadRange),ColorIntensity=new Vector4(inst.LocalLightColor.X,inst.LocalLightColor.Y,inst.LocalLightColor.Z,inst.LocalLightIntensity),DirType=new Vector4(d,type),
+            ProjectorInv=BuildLocalLightProjectorInverse(m,range),
+            IlluminationPath=NormalizeTexturePath(inst.LocalLightIlluminationMap),FalloffPath=NormalizeTexturePath(inst.LocalLightFalloff),RampPath=NormalizeTexturePath(inst.LocalLightRampMap),
+            ProjectorParams=new Vector4(inst.LocalLightSourceOffset,0,0,0)
           };
-          if(directional||range>LocalLightGridRangeLimit){localLightGlobal.Add(entry);continue;}
-          int minX=LightCell(pos.X-range),maxX=LightCell(pos.X+range),minZ=LightCell(pos.Z-range),maxZ=LightCell(pos.Z+range);
+          if(directional||broadRange>LocalLightGridRangeLimit){localLightGlobal.Add(entry);continue;}
+          int minX=LightCell(pos.X-broadRange),maxX=LightCell(pos.X+broadRange),minZ=LightCell(pos.Z-broadRange),maxZ=LightCell(pos.Z+broadRange);
           for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++){
             var key=(x,z);if(!localLightGrid.TryGetValue(key,out List<LocalLightEntry> bucket))localLightGrid[key]=bucket=new List<LocalLightEntry>();bucket.Add(entry);
           }
         }
       }
-      lastLocalLightCount=-1;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
+      currentLocalLightSelection=LocalLightSelection.Empty;lastLocalLightCount=-1;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
     }
     private static int LightCell(float coordinate)=>(int)Math.Floor(coordinate/LocalLightCellSize);
+    private static int LightSelectionCell(float coordinate)=>(int)Math.Floor(coordinate/LocalLightSelectionCellSize);
 
-    private void SetNearestLocalLights(Vector3 p,Room receiverRoom,WorldRenderSettings s,HashSet<string> visible,bool heightmap,bool water=false){
+    private bool ReceiverCouldHaveIndexedLocalLights(Vector3 p,float receiverRadius){
+      // The old instancing key split every model into a 1-unit XYZ light cell whenever local lighting was enabled,
+      // even in outdoor cells with no local lights at all. That effectively disabled instancing on large planets and
+      // left the D3D11 render thread draw-call bound. The 32-unit light grid already covers every light's authored
+      // range, so an empty set of overlapped buckets proves the receiver's selection is empty. Such receivers can
+      // share one batch without changing a single lighting result. Global/dynamic lights conservatively keep the
+      // fine split because they are not represented by those fixed buckets.
+      if(localLightGlobal.Count>0||dynamicSpnLocalLights.Count>0)return true;
+      float radius=Math.Max(0f,receiverRadius);
+      int minX=LightCell(p.X-radius),maxX=LightCell(p.X+radius),minZ=LightCell(p.Z-radius),maxZ=LightCell(p.Z+radius);
+      long cells=(long)(maxX-minX+1)*(maxZ-minZ+1);
+      if(cells>Math.Max(128L,(long)localLightGrid.Count*3L))return localLightGrid.Count>0;
+      for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++)if(localLightGrid.TryGetValue((x,z),out List<LocalLightEntry> bucket)&&bucket.Count>0)return true;
+      return false;
+    }
+
+    private void SetNearestLocalLights(Vector3 p,Room receiverRoom,WorldRenderSettings s,HashSet<string> visible,bool heightmap,bool water=false,bool character=false,float receiverRadius=0f,bool speedTree=false){
       if(!s.EnableLocalLights||!s.EnableLighting||s.Mode==WorldRenderMode.Unlit||s.Mode==WorldRenderMode.Wireframe||s.Mode==WorldRenderMode.Heightmap||s.Mode==WorldRenderMode.Map){ClearLocalLightBinding();return;}
 
-      int cellX=LightCell(p.X),cellY=LightCell(p.Y),cellZ=LightCell(p.Z);
-      byte receiverKind=water?(byte)2:(heightmap?(byte)1:(byte)0);
+      receiverRadius=Math.Max(0f,receiverRadius);
+      int cellX=LightSelectionCell(p.X),cellY=LightSelectionCell(p.Y),cellZ=LightSelectionCell(p.Z);
+      int radiusKey=(int)Math.Ceiling(Math.Min(receiverRadius,2048f)*2f); // half-unit radius buckets
+      byte receiverKind=speedTree?(byte)4:(character?(byte)3:(water?(byte)2:(heightmap?(byte)1:(byte)0)));
       string receiverName=receiverRoom?.RoomName??String.Empty;
-      var cacheKey=(cellX,cellY,cellZ,receiverName,receiverKind);
+      var cacheKey=(cellX,cellY,cellZ,radiusKey,receiverName,receiverKind);
 
       if(!localLightSelectionCache.TryGetValue(cacheKey,out LocalLightSelection selection)){
-        for(int i=0;i<4;i++){localLightBest[i]=null;localLightBestDistance[i]=float.MaxValue;}
+        for(int i=0;i<MaxReceiverLocalLights;i++){localLightBest[i]=null;localLightBestDistance[i]=float.MaxValue;}
         int count=0;
-        // Quantize the receiver position to the centre of a 32-unit cell. This deliberately trades a tiny
-        // amount of per-object light ordering precision for a very large reduction in CPU work: every mesh
-        // in the same cell/room now shares one four-light list for the frame instead of sorting it again.
-        Vector3 samplePoint=new Vector3((cellX+.5f)*LocalLightCellSize,(cellY+.5f)*LocalLightCellSize,(cellZ+.5f)*LocalLightCellSize);
-        if(localLightGrid.TryGetValue((cellX,cellZ),out List<LocalLightEntry> bucket)){
-          for(int i=0;i<bucket.Count;i++)count=ConsiderLocalLight(bucket[i],samplePoint,receiverRoom,visible,heightmap,water,count);
+        // The 32-unit buckets are only a broad phase. Test the receiver's REAL centre/bounds against every
+        // light whose broad sphere overlaps one of the receiver's XZ cells, just as Jedipedia does.
+        int minGridX=LightCell(p.X-receiverRadius),maxGridX=LightCell(p.X+receiverRadius);
+        int minGridZ=LightCell(p.Z-receiverRadius),maxGridZ=LightCell(p.Z+receiverRadius);
+        localLightCandidateScratch.Clear();
+        long lightCellCount=(long)(maxGridX-minGridX+1)*(maxGridZ-minGridZ+1);
+        if(lightCellCount>Math.Max(128L,(long)localLightGrid.Count*3L)){
+          foreach(List<LocalLightEntry> bucket in localLightGrid.Values)for(int i=0;i<bucket.Count;i++)if(localLightCandidateScratch.Add(bucket[i]))
+            count=ConsiderLocalLight(bucket[i],p,receiverRadius,receiverRoom,visible,heightmap,water,character,speedTree,count);
+        } else {
+          for(int gz=minGridZ;gz<=maxGridZ;gz++)for(int gx=minGridX;gx<=maxGridX;gx++){
+            if(!localLightGrid.TryGetValue((gx,gz),out List<LocalLightEntry> bucket))continue;
+            for(int i=0;i<bucket.Count;i++)if(localLightCandidateScratch.Add(bucket[i]))
+              count=ConsiderLocalLight(bucket[i],p,receiverRadius,receiverRoom,visible,heightmap,water,character,speedTree,count);
+          }
         }
-        for(int i=0;i<localLightGlobal.Count;i++)count=ConsiderLocalLight(localLightGlobal[i],samplePoint,receiverRoom,visible,heightmap,water,count);
+        for(int i=0;i<localLightGlobal.Count;i++)count=ConsiderLocalLight(localLightGlobal[i],p,receiverRadius,receiverRoom,visible,heightmap,water,character,speedTree,count);
+        for(int i=0;i<dynamicSpnLocalLights.Count;i++)count=ConsiderLocalLight(dynamicSpnLocalLights[i],p,receiverRadius,receiverRoom,visible,heightmap,water,character,speedTree,count);
         selection=LocalLightSelection.From(localLightBest,count);
+        // Camera tours can otherwise leave one quantized receiver key per visited position in RAM forever. The
+        // cache is only an acceleration structure, so a coarse cap has no visual/functional effect.
+        if(localLightSelectionCache.Count>=16384)localLightSelectionCache.Clear();
         localLightSelectionCache[cacheKey]=selection;
       }
 
-      BindLocalLightSelection(selection);
+      currentLocalLightSelection=selection??LocalLightSelection.Empty;
+      BindLocalLightSelection(currentLocalLightSelection);
     }
 
     private void BindLocalLightSelection(LocalLightSelection selection){
-      int count=selection.Count;
+      selection??=LocalLightSelection.Empty;int count=Math.Min(LocalLightBaseSlots,selection.Count);
       bool unchanged=count==lastLocalLightCount;
       if(unchanged)for(int i=0;i<count;i++)if(!ReferenceEquals(lastLocalLightSelection[i],selection.Get(i))){unchanged=false;break;}
       if(unchanged)return;
-
-      for(int n=0;n<4;n++){
-        LocalLightEntry e=n<count?selection.Get(n):null;lastLocalLightSelection[n]=e;
-        if(e!=null){localLightPosRangeScratch[n]=e.PosRange;localLightColorScratch[n]=e.ColorIntensity;localLightDirScratch[n]=e.DirType;localLightProjectorScratch[n]=e.ProjectorInv;localLightProjectorParamsScratch[n]=e.ProjectorParams;localLightIlluminationScratch[n]=e.IlluminationMap;localLightFalloffScratch[n]=e.FalloffMap;localLightRampScratch[n]=e.RampMap;}
-        else {localLightPosRangeScratch[n]=new Vector4();localLightColorScratch[n]=new Vector4();localLightDirScratch[n]=new Vector4();localLightProjectorScratch[n]=Matrix.Identity;localLightProjectorParamsScratch[n]=new Vector4();localLightIlluminationScratch[n]=null;localLightFalloffScratch[n]=null;localLightRampScratch[n]=null;}
-      }
-      lastLocalLightCount=count;
-      fx.SetLocalLights(localLightPosRangeScratch,localLightColorScratch,localLightDirScratch,localLightProjectorScratch,localLightProjectorParamsScratch,localLightIlluminationScratch,localLightFalloffScratch,localLightRampScratch,count);
+      BindLocalLightChunk(selection,0,true);
     }
 
-    private int ConsiderLocalLight(LocalLightEntry e,Vector3 p,Room receiverRoom,HashSet<string> visible,bool heightmap,bool water,int count){
-      if(e==null||!RoomVisible(e.Room,visible)||(water?!e.DoWater:(heightmap?!e.DoHeightmaps:!e.DoGranny))||(e.RestrictToRoom&&receiverRoom!=e.Room))return count;
-      float dist=e.Directional?-1f:(e.Position-p).LengthSquared();if(!e.Directional&&dist>e.RangeSquared)return count;
+    private int BindLocalLightChunk(LocalLightSelection selection,int offset,bool trackBase=false){
+      selection??=LocalLightSelection.Empty;int count=Math.Max(0,Math.Min(LocalLightBaseSlots,selection.Count-Math.Max(0,offset)));
+      boundLocalLightTexturePaths.Clear();
+      for(int n=0;n<LocalLightBaseSlots;n++){
+        LocalLightEntry e=n<count?selection.Get(offset+n):null;if(trackBase)lastLocalLightSelection[n]=e;
+        if(e!=null){
+          ShaderResourceView illumination=LoadTexture(e.IlluminationPath),falloff=LoadTexture(e.FalloffPath),ramp=LoadTexture(e.RampPath);
+          if(illumination!=null&&!String.IsNullOrWhiteSpace(e.IlluminationPath))boundLocalLightTexturePaths.Add(e.IlluminationPath);
+          if(falloff!=null&&!String.IsNullOrWhiteSpace(e.FalloffPath))boundLocalLightTexturePaths.Add(e.FalloffPath);
+          if(ramp!=null&&!String.IsNullOrWhiteSpace(e.RampPath))boundLocalLightTexturePaths.Add(e.RampPath);
+          localLightPosRangeScratch[n]=e.PosRange;localLightColorScratch[n]=e.ColorIntensity;localLightDirScratch[n]=e.DirType;localLightProjectorScratch[n]=e.ProjectorInv;
+          localLightProjectorParamsScratch[n]=new Vector4(e.ProjectorParams.X,illumination!=null?1:0,falloff!=null?1:0,ramp!=null?1:0);
+          localLightIlluminationScratch[n]=illumination;localLightFalloffScratch[n]=falloff;localLightRampScratch[n]=ramp;
+        }
+        else {localLightPosRangeScratch[n]=new Vector4();localLightColorScratch[n]=new Vector4();localLightDirScratch[n]=new Vector4();localLightProjectorScratch[n]=Matrix.Identity;localLightProjectorParamsScratch[n]=new Vector4();localLightIlluminationScratch[n]=null;localLightFalloffScratch[n]=null;localLightRampScratch[n]=null;}
+      }
+      fx.SetLocalLights(localLightPosRangeScratch,localLightColorScratch,localLightDirScratch,localLightProjectorScratch,localLightProjectorParamsScratch,localLightIlluminationScratch,localLightFalloffScratch,localLightRampScratch,count);
+      if(trackBase)lastLocalLightCount=count;return count;
+    }
+
+    private bool HasLocalLightOverflow => currentLocalLightSelection!=null&&currentLocalLightSelection.Count>LocalLightBaseSlots;
+    private void InvalidateTrackedLocalLightBinding(){lastLocalLightCount=-1;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);}
+
+    private int ConsiderLocalLight(LocalLightEntry e,Vector3 p,float receiverRadius,Room receiverRoom,HashSet<string> visible,bool heightmap,bool water,bool character,bool speedTree,int count){
+      if(e==null||!RoomVisible(e.Room,visible)||(speedTree?!e.DoSpeedTree:(character?!e.DoCharacters:(water?!e.DoWater:(heightmap?!e.DoHeightmaps:!e.DoGranny))))||(e.RestrictToRoom&&receiverRoom!=e.Room))return count;
+      float dist=-1f;
+      if(!e.Directional){
+        Vector3 delta=e.Position-p;float centerDistSq=delta.LengthSquared();
+        float lightRadius=(float)Math.Sqrt(Math.Max(0f,e.RangeSquared));
+        float reach=lightRadius+receiverRadius;
+        if(centerDistSq>reach*reach)return count;
+        // Jedipedia rejects a receiver against the actual authored projector BEFORE choosing the nearest lights.
+        // Without this, four nearby projectors that do not cover the receiver can occupy all four shader slots;
+        // the shader then masks them to zero and a fifth light that really illuminates the surface is never bound.
+        if(!LocalLightProjectorIntersectsSphere(e,p,receiverRadius))return count;
+        // Rank by distance to the receiver surface. A light touching a large room shell should beat an
+        // unrelated light that merely happens to be closer to that shell's distant placement origin.
+        float centerDist=(float)Math.Sqrt(Math.Max(0f,centerDistSq));
+        float surfaceDist=Math.Max(0f,centerDist-receiverRadius);
+        dist=surfaceDist*surfaceDist;
+      }
       int insert=count;
-      if(count<4)count++;else {if(dist>=localLightBestDistance[3])return count;insert=3;}
-      while(insert>0&&dist<localLightBestDistance[insert-1]){if(insert<4){localLightBestDistance[insert]=localLightBestDistance[insert-1];localLightBest[insert]=localLightBest[insert-1];}insert--;}
+      if(count<MaxReceiverLocalLights)count++;else {if(dist>=localLightBestDistance[MaxReceiverLocalLights-1])return count;insert=MaxReceiverLocalLights-1;}
+      while(insert>0&&dist<localLightBestDistance[insert-1]){if(insert<MaxReceiverLocalLights){localLightBestDistance[insert]=localLightBestDistance[insert-1];localLightBest[insert]=localLightBest[insert-1];}insert--;}
       localLightBestDistance[insert]=dist;localLightBest[insert]=e;return count;
     }
 
+    private static bool LocalLightProjectorIntersectsSphere(LocalLightEntry light,Vector3 center,float radius){
+      if(light==null||light.Directional)return true;
+      Matrix inv=light.ProjectorInv;
+      // BuildLocalLightProjectorInverse is affine. Fail open if a malformed asset ever produces a projective matrix;
+      // the pixel shader remains the final authority and a conservative false positive is harmless.
+      if(Math.Abs(inv.M14)>.000001f||Math.Abs(inv.M24)>.000001f||Math.Abs(inv.M34)>.000001f||Math.Abs(inv.M44)<.000001f)return true;
+      Vector3 local;try{local=Vector3.TransformCoordinate(center,inv);}catch{return true;}
+      if(!IsFinite(local))return true;
+      // A sphere becomes an ellipsoid under a non-uniform inverse transform. The Frobenius norm is a cheap upper
+      // bound of the largest singular value, so this local sphere can only be larger than the true ellipsoid and
+      // therefore cannot incorrectly cull an actually lit receiver. Jedipedia also pads by 0.05 world units.
+      float scale=(float)Math.Sqrt(inv.M11*inv.M11+inv.M12*inv.M12+inv.M13*inv.M13+inv.M21*inv.M21+inv.M22*inv.M22+inv.M23*inv.M23+inv.M31*inv.M31+inv.M32*inv.M32+inv.M33*inv.M33);
+      if(!Single.IsFinite(scale)||scale<=0f)return true;float r=(Math.Max(0f,radius)+.05f)*scale;
+      float sourceOffset=Single.IsFinite(light.ProjectorParams.X)?Math.Min(1f,light.ProjectorParams.X):0f;float minZ=sourceOffset-1f;
+      return local.X+r>=-1f&&local.X-r<=1f&&local.Y+r>=-1f&&local.Y-r<=1f&&local.Z+r>=minZ&&local.Z-r<=1f;
+    }
+
     private void ClearLocalLightBinding(){
-      if(lastLocalLightCount==0)return;fx.ClearLocalLights();lastLocalLightCount=0;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
+      currentLocalLightSelection=LocalLightSelection.Empty;boundLocalLightTexturePaths.Clear();if(lastLocalLightCount==0)return;fx.ClearLocalLights();lastLocalLightCount=0;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
     }
 
     private static Matrix BuildLocalLightProjectorInverse(Matrix world,float range){
@@ -2341,16 +3982,16 @@ namespace PugTools {
     private void DrawShadowGeometry(HashSet<string> visible,WorldRenderSettings s,string skyRoom,float cascadeFar){
       // Shadow cascades are tiny (<=25 units) compared with an open-world planet. Query the same spatial index as
       // the main pass instead of walking every instance four separate times each frame.
-      foreach(RenderEntry entry in NearbyRenderEntries(RenderKindTerrain,cascadeFar,false)){
+      foreach(RenderEntry entry in NearbyRenderEntries(RenderKindTerrain,cascadeFar,false,visible)){
         Room room=entry.Room;AssetInstance inst=entry.Instance;
-        if(room==null||!InstanceVisibleInWorld(inst)||!RoomVisible(room,visible)||skyRoomNames.Contains(room.RoomName)||(!string.IsNullOrEmpty(skyRoom)&&room.RoomName==skyRoom))continue;
+        if(room==null||!InstanceVisibleInWorld(inst,s)||!RoomVisible(room,visible)||skyRoomNames.Contains(room.RoomName)||(!string.IsNullOrEmpty(skyRoom)&&room.RoomName==skyRoom))continue;
         Matrix world=entry.World;fx.SetWorld(world);
         if(s.ShowTerrain&&inst.VBO!=null){
           ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(inst.VBO,PosNormalTexTan.Stride,0));terrainGpu.TryGetValue(inst,out TerrainGpu tg);TerrainLodRange lod=SelectTerrainLod(inst,room,tg,s);Buffer terrainIbo=tg?.LodIndexBuffer??inst.IBO;
           if(terrainIbo!=null){ImmediateContext.InputAssembler.SetIndexBuffer(terrainIbo,Format.R16_UInt,0);fx.Shadow.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed(lod.Count>0?lod.Count:inst.numFaces,lod.Count>0?lod.StartIndex:0,0);}
         }
-        if(s.ShowDynamicDetails&&inst.HeightMap?.DynamicDetails!=null&&DynamicDetailTerrainDistance(inst,room)<10f){
-          List<DynamicDetailGpu> batches=EnsureDynamicDetails(inst);if(batches!=null&&batches.Count>0){ImmediateContext.InputAssembler.InputLayout=dynamicDetailLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;foreach(DynamicDetailGpu batch in batches){if(batch.Buffer==null||batch.Count<=0||batch.Material==null)continue;fx.SetMaterial(batch.Material);fx.SetDynamicDetail(camera.Right,batch.AtlasMode,batch.Wind,batch.Material.vegetationParams2.Z,batch.TextureSize);ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(batch.Buffer,48,0));fx.DynamicDetailShadow.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(batch.Count,0);}}
+        if(s.ShowDynamicDetails&&inst.HeightMap?.DynamicDetails!=null&&DynamicDetailTerrainDistance(inst,room)<DynamicDetailRenderDistance){
+          List<DynamicDetailGpu> batches=EnsureDynamicDetails(inst);if(batches!=null&&batches.Count>0){ImmediateContext.InputAssembler.InputLayout=dynamicDetailLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;foreach(DynamicDetailGpu batch in batches){if(batch.Buffer==null||batch.Count<=0||batch.Material==null)continue;GR2_Material dynamicMaterial=EnsureMaterialParsed(batch.Material);if(dynamicMaterial==null||dynamicMaterial.diffuseSRV==null)continue;fx.SetMaterial(dynamicMaterial);fx.SetDynamicDetail(camera.Right,batch.AtlasMode,batch.Wind,dynamicMaterial.vegetationParams2.Z,batch.TextureSize);ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(batch.Buffer,48,0));fx.DynamicDetailShadow.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(batch.Count,0);}}
           List<DynamicDetailMeshBatch> meshBatches=EnsureDynamicDetailMeshes(inst);if(meshBatches.Count>0){ImmediateContext.InputAssembler.InputLayout=instancedLayout;foreach(DynamicDetailMeshBatch meshBatch in meshBatches)if(meshBatch.Model!=null&&meshBatch.Model.enabled&&meshBatch.InstanceBuffer!=null&&meshBatch.InstanceCount>0)DrawInstancedModelShadow(meshBatch.Model,meshBatch.InstanceBuffer,meshBatch.InstanceCount,world);}
         }
       }
@@ -2359,33 +4000,41 @@ namespace PugTools {
         // a planet with thousands of repeated props still paid four complete model draw-call streams per frame even
         // though the shadow radius is only 1.5..25 units. The spatial query limits candidates first, then batching
         // collapses the remaining repeated placements to one draw per model/submesh.
-        var shadowBatches=new Dictionary<(GR2 Model,int Lod),List<Matrix>>();var shadowSingles=new List<(RenderEntry Entry,int Lod)>();
-        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,cascadeFar,false)){
+        var shadowBatches=new Dictionary<(GR2 Model,int Lod),ModelInstanceBatch>();var shadowSingles=new List<(RenderEntry Entry,int Lod)>();
+        foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,cascadeFar,false,visible)){
           Room room=entry.Room;GR2 model=entry.Model;
-          if(room==null||model==null||!model.enabled||!InstanceRoomVisible(entry.Instance,room,visible)||skyRoomNames.Contains(room.RoomName)||(!string.IsNullOrEmpty(skyRoom)&&room.RoomName==skyRoom))continue;
+          if(room==null||model==null||!model.enabled||!InstanceRoomVisible(entry.Instance,room,visible)||!InstanceVisibleInWorld(entry.Instance,s)||skyRoomNames.Contains(room.RoomName)||(!string.IsNullOrEmpty(skyRoom)&&room.RoomName==skyRoom))continue;
+          if(IsSpeedTreeInstance(entry.Instance)&&!s.ShowSpeedTrees)continue;
           float lodFactor=entry.Instance?.LodFactor??1f;if(ShouldCullModelByLod(model,entry.World,false,lodFactor))continue;int lod=SelectModelLodLevel(model,entry.World,false,lodFactor);
           if(ModelCanUseRegularInstancing(model)&&MatrixHasNearlyUniformScale(entry.World)){
-            var key=(model,lod);if(!shadowBatches.TryGetValue(key,out List<Matrix> worlds))shadowBatches[key]=worlds=new List<Matrix>();worlds.Add(entry.World);
+            var key=(model,lod);if(!shadowBatches.TryGetValue(key,out ModelInstanceBatch batch))shadowBatches[key]=batch=new ModelInstanceBatch{Model=model,LodLevel=lod};batch.Worlds.Add(entry.World);
           }else shadowSingles.Add((entry,lod));
         }
         ImmediateContext.InputAssembler.InputLayout=inputLayout;
         foreach(var single in shadowSingles){fx.SetWorld(single.Entry.World);DrawModelShadow(single.Entry.Model,single.Lod,single.Entry.World);}
-        foreach(var pair in shadowBatches){
-          GR2 model=pair.Key.Model;int lod=pair.Key.Lod;
-          if(pair.Value.Count<2){fx.SetWorld(pair.Value[0]);ImmediateContext.InputAssembler.InputLayout=inputLayout;DrawModelShadow(model,lod,pair.Value[0]);continue;}
-          Buffer instanceBuffer=UploadRegularModelInstances(pair.Value);if(instanceBuffer==null){foreach(Matrix world in pair.Value){fx.SetWorld(world);ImmediateContext.InputAssembler.InputLayout=inputLayout;DrawModelShadow(model,lod,world);}continue;}
-          ImmediateContext.InputAssembler.InputLayout=instancedLayout;DrawInstancedModelShadow(model,instanceBuffer,pair.Value.Count,Matrix.Identity,lod,pair.Value[0]);
+        regularModelFrameInstances.Clear();
+        foreach(ModelInstanceBatch batch in shadowBatches.Values){
+          if(batch.Worlds.Count<2)continue;
+          batch.StartInstance=regularModelFrameInstances.Count;
+          regularModelFrameInstances.AddRange(batch.Worlds);
+        }
+        Buffer sharedShadowInstances=regularModelFrameInstances.Count>0?UploadRegularModelInstances(regularModelFrameInstances):null;
+        foreach(ModelInstanceBatch batch in shadowBatches.Values){
+          GR2 model=batch.Model;int lod=batch.LodLevel;
+          if(batch.Worlds.Count<2){fx.SetWorld(batch.Worlds[0]);ImmediateContext.InputAssembler.InputLayout=inputLayout;DrawModelShadow(model,lod,batch.Worlds[0]);continue;}
+          if(sharedShadowInstances==null){foreach(Matrix world in batch.Worlds){fx.SetWorld(world);ImmediateContext.InputAssembler.InputLayout=inputLayout;DrawModelShadow(model,lod,world);}continue;}
+          ImmediateContext.InputAssembler.InputLayout=instancedLayout;DrawInstancedModelShadow(model,sharedShadowInstances,batch.Worlds.Count,Matrix.Identity,lod,batch.Worlds[0],batch.StartInstance);
         }
       }
       ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
     }
     private void DrawModelShadow(GR2 model,int forcedLod=-1,Matrix? lodReferenceWorld=null){
-      if(model==null)return;Matrix reference=lodReferenceWorld??Matrix.Identity;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);
+      if(model==null)return;EnsureModelGeometryPrepared(model);Matrix reference=lodReferenceWorld??Matrix.Identity;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);
       foreach(var mesh in model.meshes){
         if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;
         ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
         foreach(var piece in mesh.meshPieces){
-          GR2_Material mat=null;if(piece.matId>=0&&model.materials.ElementAtOrDefault(piece.matId)!=null)materials.TryGetValue(model.materials[piece.matId].materialName,out mat);else if(model.materials.Count>0)materials.TryGetValue(model.materials[0].materialName,out mat);
+          GR2_Material mat=ResolvePieceMaterial(model,piece);
           if(IsMaterialHiddenFromWorld(mat))continue;
           bool alpha=mat!=null&&!string.IsNullOrEmpty(mat.alphaMode)&&mat.alphaMode!="None";if(alpha)fx.SetMaterial(mat);
           (alpha?fx.AlphaShadow:fx.Shadow).GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed((int)piece.numPieceFaces*3,(int)piece.startIndex*3,0);
@@ -2394,11 +4043,92 @@ namespace PugTools {
       foreach(var a in model.attachedModels)DrawModelShadow(a,-1,reference);
     }
 
-    private void BuildModelGeometry(){var built=new HashSet<GR2>();foreach(var model in models.Values)BuildModelGeometry(model,built,false);foreach(var model in dynamicDetailMeshModels.Values)BuildModelGeometry(model,built,false);foreach(var model in strongholdHookModels.Values)BuildModelGeometry(model,built,false);BuildJedipediaFeatureGeometry(built);}
+    private void BuildModelGeometry(){
+      // GR2 CPU data remains available for exact picking, animation and later streaming, but immutable D3D buffers
+      // are now uploaded only when a model actually enters a visible draw pass. This removes the former whole-world
+      // GPU upload pause and prevents off-screen assets from consuming VRAM just because their area was loaded.
+      modelGeometryPrepared.Clear();
+    }
+    private bool ModelGeometryBuffersReady(GR2 model){
+      if(model==null)return false;
+      foreach(GR2_Mesh mesh in model.meshes)if(mesh!=null&&!IsNonVisualMesh(model,mesh)&&mesh.meshVerts!=null&&mesh.meshVerts.Count>0&&mesh.meshVertIndex!=null&&mesh.meshVertIndex.Count>0&&(mesh.vertBuffer==null||mesh.idxBuffer==null))return false;
+      foreach(GR2 attached in model.attachedModels)if(attached!=null&&!ModelGeometryBuffersReady(attached))return false;
+      return true;
+    }
+    private void EnsureModelGeometryPrepared(GR2 model){
+      if(model==null)return;
+      MarkModelGeometryUsed(model);
+      if(modelGeometryPrepared.Contains(model)&&ModelGeometryBuffersReady(model))return;
+      var built=new HashSet<GR2>();BuildModelGeometry(model,built,false);foreach(GR2 prepared in built)modelGeometryPrepared.Add(prepared);
+    }
+    private void MarkModelGeometryUsed(GR2 model){
+      if(model==null)return;
+      modelGeometryLastUseFrame[model]=worldRenderFrame;
+      foreach(GR2 attached in model.attachedModels)MarkModelGeometryUsed(attached);
+    }
+    private static bool ModelHasAnyGpuBuffers(GR2 model){
+      if(model==null)return false;
+      foreach(GR2_Mesh mesh in model.meshes)if(mesh!=null&&(mesh.vertBuffer!=null||mesh.idxBuffer!=null))return true;
+      foreach(GR2 attached in model.attachedModels)if(ModelHasAnyGpuBuffers(attached))return true;
+      return false;
+    }
+    private static bool ModelTreeContains(GR2 root,GR2 model){
+      if(root==null||model==null)return false;if(ReferenceEquals(root,model))return true;
+      foreach(GR2 attached in root.attachedModels)if(ModelTreeContains(attached,model))return true;
+      return false;
+    }
+    private void ForgetPreparedModelGeometry(GR2 model){
+      if(model==null)return;modelGeometryPrepared.Remove(model);modelGeometryLastUseFrame.Remove(model);
+      foreach(GR2 attached in model.attachedModels)ForgetPreparedModelGeometry(attached);
+    }
+    private IEnumerable<GR2> WorldModelResidencyRoots(){
+      foreach(GR2 model in models.Values)if(model!=null)yield return model;
+      if(utilityMarkerModels!=null)foreach(GR2 model in utilityMarkerModels.Values)if(model!=null)yield return model;
+      if(npcPlacements!=null)foreach(WorldNpcPlacement placement in npcPlacements)if(placement?.Models!=null)foreach(GR2 model in placement.Models)if(model!=null)yield return model;
+      if(spnPlacements!=null)foreach(WorldSpnPlacement placement in spnPlacements)if(placement?.Models!=null)foreach(GR2 model in placement.Models)if(model!=null)yield return model;
+      foreach(GR2 model in dynamicDetailMeshModels.Values)if(model!=null)yield return model;
+      foreach(GR2 model in strongholdHookModels.Values)if(model!=null)yield return model;
+      if(taxiRideVehicleModel!=null)yield return taxiRideVehicleModel;
+    }
+    private IEnumerable<GR2_Material> WorldMaterialResidencySet(){
+      var seenMaterials=new HashSet<GR2_Material>();
+      foreach(GR2_Material material in materials.Values)if(material!=null&&seenMaterials.Add(material))yield return material;
+      foreach(GR2_Material material in terrainMaterials.Values)if(material!=null&&seenMaterials.Add(material))yield return material;
+      foreach(GR2_Material material in dynamicDetailMaterials.Values)if(material!=null&&seenMaterials.Add(material))yield return material;
+
+      // Models loaded for population appearances can own per-NPC palette/complexion materials.  Walk attached
+      // models as well, but de-duplicate both models and materials because attachments often intentionally share them.
+      var seenModels=new HashSet<GR2>();var pending=new Stack<GR2>();
+      foreach(GR2 root in WorldModelResidencyRoots())if(root!=null)pending.Push(root);
+      while(pending.Count>0){
+        GR2 model=pending.Pop();if(model==null||!seenModels.Add(model))continue;
+        if(model.materials!=null)foreach(GR2_Material material in model.materials)if(material!=null&&seenMaterials.Add(material))yield return material;
+        if(model.attachedModels!=null)foreach(GR2 attached in model.attachedModels)if(attached!=null)pending.Push(attached);
+      }
+    }
+    private void TrimModelGeometryResidency(){
+      // Keep visible geometry on the GPU, but do not let a long camera tour make every model visited since area
+      // load permanently resident. Include population/SPN/helper models as well as static room assets: NPC-heavy
+      // sessions were otherwise still able to accumulate their entire visited population in VRAM. CPU GR2 data is
+      // retained so exact picking and a later re-upload remain lossless.
+      const int highWater=384,target=256;const long idleFrames=600;
+      List<GR2> resident=WorldModelResidencyRoots().Where(ModelHasAnyGpuBuffers).Distinct().ToList();
+      if(resident.Count<=highWater)return;
+      GR2 selected=selectedWorldRenderEntry?.Model;long cutoff=worldRenderFrame-idleFrames;
+      foreach(GR2 model in resident.OrderBy(m=>modelGeometryLastUseFrame.TryGetValue(m,out long frame)?frame:long.MinValue).ToList()){
+        if(resident.Count<=target)break;
+        if(selected!=null&&ModelTreeContains(model,selected))continue;
+        long last=modelGeometryLastUseFrame.TryGetValue(model,out long frame)?frame:long.MinValue;
+        if(last>cutoff)continue;
+        ReleaseModelBuffers(model);ForgetPreparedModelGeometry(model);resident.Remove(model);
+      }
+    }
     private void BuildModelGeometry(GR2 model,HashSet<GR2> built,bool attachment){
-      if(!built.Add(model))return;
+      if(model==null||!built.Add(model))return;
       foreach(var mesh in model.meshes){
         if(IsNonVisualMesh(model,mesh))continue;
+        if(mesh.vertBuffer!=null&&mesh.idxBuffer!=null)continue;
+        Release(ref mesh.vertBuffer);Release(ref mesh.idxBuffer);
         var verts=new PosNormalTexTan[mesh.meshVerts.Count];
         for(int i=0;i<verts.Length;i++){
           var v=mesh.meshVerts[i];Vector3 p=new Vector3(v.X,v.Y,v.Z);
@@ -2416,9 +4146,34 @@ namespace PugTools {
     private void BuildTerrainResources(){
       foreach(Room r in rooms)foreach(AssetInstance i in r.InstancesById.Values){
         if(!i.hasHeightMap||i.HeightMap==null)continue;var g=new TerrainGpu();
-        g.ColorMap=CreateTexture(i.HeightMap.TerrainColorMapRgba,(int)i.HeightMap.width,(int)i.HeightMap.depth,Format.R8G8B8A8_UNorm,4);
-        foreach(var l in i.HeightMap.TerrainLayers){g.Masks[l.MaterialName]=CreateTexture(l.Weights,l.Width,l.Height,Format.R8_UNorm,1);GetTerrainMaterial(l.MaterialName);}
         BuildTerrainLods(i,g);terrainGpu[i]=g;
+      }
+    }
+
+    private void EnsureTerrainTextures(AssetInstance inst,TerrainGpu gpu){
+      if(inst?.HeightMap==null||gpu==null)return;gpu.LastUseFrame=worldRenderFrame;if(gpu.TexturesPrepared)return;
+      HeightMap hm=inst.HeightMap;
+      gpu.ColorMap=CreateTexture(hm.TerrainColorMapRgba,(int)hm.width,(int)hm.depth,Format.R8G8B8A8_UNorm,4);
+      foreach(TerrainLayerMask layer in hm.TerrainLayers){
+        if(layer==null||String.IsNullOrWhiteSpace(layer.MaterialName))continue;
+        ShaderResourceView old;if(gpu.Masks.TryGetValue(layer.MaterialName,out old))old?.Dispose();
+        gpu.Masks[layer.MaterialName]=CreateTexture(layer.Weights,layer.Width,layer.Height,Format.R8_UNorm,1);
+      }
+      gpu.TexturesPrepared=true;
+    }
+
+    private void TrimTerrainTextureResidency(WorldRenderSettings s){
+      const int highWater=96,target=64;
+      List<TerrainGpu> resident=terrainGpu.Values.Where(x=>x!=null&&x.TexturesPrepared).Distinct().ToList();
+      if(resident.Count<=highWater)return;
+      // In perspective mode, map-only tiles can be dropped immediately as long as they were not used this frame.
+      // During a whole-area map render every visible tile is needed, so avoid destructive per-frame stream thrash.
+      bool map=s?.Mode==WorldRenderMode.Map;
+      foreach(TerrainGpu gpu in resident.OrderBy(x=>x.LastUseFrame).ToList()){
+        if(resident.Count<=target)break;
+        if(gpu.LastUseFrame>=worldRenderFrame-1)continue;
+        if(map&&gpu.LastUseFrame>worldRenderFrame-360)continue;
+        gpu.ReleaseTextures();resident.Remove(gpu);
       }
     }
     private void BuildTerrainLods(AssetInstance i,TerrainGpu g){
@@ -2446,19 +4201,35 @@ namespace PugTools {
       defaultWaterDepth=CreateTexture(new byte[]{255,255,255,160},1,1,Format.R8G8B8A8_UNorm,4);
       foreach(Room room in rooms)foreach(AssetInstance i in room.InstancesById.Values){
         if(!i.hasWater)continue;
-        var g=new WaterGpu();
-        g.Normal1=LoadTexture(i.WaterNormalMap1);
-        g.Normal2=LoadTexture(i.WaterNormalMap2)??g.Normal1;
-        g.DepthMap=CreateWaterDepthTexture(i.WaterDepthData);
-        if(g.DepthMap!=null)g.OwnsDepthMap=true;else g.DepthMap=defaultWaterDepth;
-        g.SurfaceMap=LoadTexture(i.WaterSurfaceMap);
-        if(g.SurfaceMap==null&&i.WaterTextureIndex>=0){
-          string terrainName=null;
-          if(area?.TerrainTextureNames.TryGetValue((uint)i.WaterTextureIndex,out string byId)==true)terrainName=byId;
-          else if(area!=null&&i.WaterTextureIndex<area.TerrainTextures.Count)terrainName=area.TerrainTextures[i.WaterTextureIndex].Name;
-          if(!string.IsNullOrEmpty(terrainName))g.SurfaceMap=GetTerrainMaterial(terrainName).waterSurfaceSRV;
-        }
-        waterGpu[i]=g;
+        waterGpu[i]=new WaterGpu();
+      }
+    }
+    private void EnsureWaterTextures(AssetInstance inst,WaterGpu gpu){
+      if(inst==null||gpu==null)return;gpu.LastUseFrame=worldRenderFrame;
+      // Shared normal/surface maps are touched on every visible draw so the global texture LRU cannot invalidate a
+      // WaterGpu reference. The per-instance depth map is decoded only while this water body is actually resident.
+      gpu.Normal1=LoadTexture(inst.WaterNormalMap1);
+      gpu.Normal2=LoadTexture(inst.WaterNormalMap2)??gpu.Normal1;
+      gpu.SurfaceMap=LoadTexture(inst.WaterSurfaceMap);
+      if(!gpu.TexturesPrepared){
+        gpu.DepthMap=CreateWaterDepthTexture(inst.WaterDepthData);
+        if(gpu.DepthMap!=null)gpu.OwnsDepthMap=true;else gpu.DepthMap=defaultWaterDepth;
+        gpu.TexturesPrepared=true;
+      }
+      if(gpu.SurfaceMap==null&&inst.WaterTextureIndex>=0){
+        string terrainName=null;
+        if(area?.TerrainTextureNames.TryGetValue((uint)inst.WaterTextureIndex,out string byId)==true)terrainName=byId;
+        else if(area!=null&&inst.WaterTextureIndex<area.TerrainTextures.Count)terrainName=area.TerrainTextures[inst.WaterTextureIndex].Name;
+        if(!string.IsNullOrEmpty(terrainName))gpu.SurfaceMap=GetTerrainMaterial(terrainName).waterSurfaceSRV;
+      }
+    }
+    private void TrimWaterTextureResidency(WorldRenderSettings s){
+      const int highWater=48,target=32;const long idleFrames=360;
+      List<WaterGpu> resident=waterGpu.Values.Where(g=>g!=null&&g.TexturesPrepared).Distinct().ToList();if(resident.Count<=highWater)return;
+      bool map=s?.Mode==WorldRenderMode.Map;long cutoff=worldRenderFrame-idleFrames;
+      foreach(WaterGpu gpu in resident.OrderBy(g=>g.LastUseFrame).ToList()){
+        if(resident.Count<=target)break;if(gpu.LastUseFrame>=worldRenderFrame-1)continue;if(map&&gpu.LastUseFrame>cutoff)continue;
+        gpu.ReleaseTextures();resident.Remove(gpu);
       }
     }
     private ShaderResourceView CreateWaterDepthTexture(byte[] raw){
@@ -2474,10 +4245,8 @@ namespace PugTools {
     private ShaderResourceView CreateTexture(byte[] bytes,int w,int h,Format fmt,int bpp){if(bytes==null||w<=0||h<=0)return null;var desc=new Texture2DDescription{Width=w,Height=h,MipLevels=1,ArraySize=1,Format=fmt,SampleDescription=new SampleDescription(1,0),Usage=ResourceUsage.Immutable,BindFlags=BindFlags.ShaderResource,CpuAccessFlags=CpuAccessFlags.None,OptionFlags=ResourceOptionFlags.None};using var ds=new DataStream(bytes,false,false);using var tex=new Texture2D(Device,desc,new DataRectangle(w*bpp,ds));return new ShaderResourceView(Device,tex);}
     private GR2_Material GetTerrainMaterial(string name){
       name=ResolveTerrainMaterialName(name);
-      if(terrainMaterials.TryGetValue(name,out GR2_Material m))return m;
-      m=new GR2_Material(name);
-      try{m.ParseMAT(Device);}catch(Exception ex){System.Diagnostics.Debug.WriteLine("World terrain material '"+name+"' failed: "+ex.Message);}
-      terrainMaterials[name]=m;return m;
+      if(terrainMaterials.TryGetValue(name,out GR2_Material m))return EnsureMaterialParsed(m);
+      m=new GR2_Material(name);terrainMaterials[name]=m;return EnsureMaterialParsed(m);
     }
     private string ResolveTerrainMaterialName(string name){
       string exact=NormalizeTerrainMaterialName(name);
@@ -2502,19 +4271,229 @@ namespace PugTools {
       return string.IsNullOrWhiteSpace(n)?"terrain_checkered":n.ToLowerInvariant();
     }
 
-    private ShaderResourceView LoadTexture(string raw){string path=NormalizeTexturePath(raw);if(path==null)return null;if(textureCache.TryGetValue(path,out ShaderResourceView v))return v;try{var file=area?.FindFile(path);if(file==null)return null;using Stream s=file.OpenCopyInMemory();v=ShaderResourceView.FromStream(Device,s,(int)s.Length);textureCache[path]=v;return v;}catch{return null;}}
+    private ShaderResourceView LoadTexture(string raw,bool pin=false){
+      string path=NormalizeTexturePath(raw);if(path==null)return null;
+      if(textureCache.TryGetValue(path,out ShaderResourceView v)){textureLastUseFrame[path]=worldRenderFrame;if(pin)pinnedTexturePaths.Add(path);return v;}
+      try{using var file=area?.FindFile(path);if(file==null)return null;using Stream stream=file.OpenCopyInMemory();int mip=ClampDdsFirstMipLevel(stream,Math.Max(0,appliedTextureMipSkip));
+        if(mip>0){ImageLoadInformation info=ImageLoadInformation.FromDefaults();info.FirstMipLevel=mip;v=ShaderResourceView.FromStream(Device,stream,(int)stream.Length,info);}
+        else v=ShaderResourceView.FromStream(Device,stream,(int)stream.Length);
+        textureCache[path]=v;textureLastUseFrame[path]=worldRenderFrame;if(pin)pinnedTexturePaths.Add(path);return v;
+      }catch(Exception ex){System.Diagnostics.Debug.WriteLine("World texture failed "+path+": "+ex.Message);return null;}
+    }
+    private void TrimSharedTextureResidency(){
+      // Environment, scrolling and blend maps are fetched from the shared cache and can vary by room. Evict only
+      // cold transient entries; persistent records explicitly pin their SRVs so this never leaves a dangling water,
+      // static-light or map-art reference behind.
+      const int highWater=192,target=128;const long idleFrames=360;
+      if(textureCache.Count<=highWater)return;long cutoff=worldRenderFrame-idleFrames;
+      foreach(string path in textureCache.Keys
+        .Where(p=>!pinnedTexturePaths.Contains(p)&&!boundLocalLightTexturePaths.Contains(p))
+        .OrderBy(p=>textureLastUseFrame.TryGetValue(p,out long frame)?frame:long.MinValue).ToList()){
+        if(textureCache.Count<=target)break;
+        long last=textureLastUseFrame.TryGetValue(path,out long frame)?frame:long.MinValue;
+        if(last>cutoff||last>=worldRenderFrame-1)continue;
+        if(textureCache.TryGetValue(path,out ShaderResourceView texture))texture?.Dispose();
+        textureCache.Remove(path);textureLastUseFrame.Remove(path);
+      }
+    }
+    private static int ClampDdsFirstMipLevel(Stream stream,int requested){
+      if(requested<=0||stream==null||!stream.CanSeek)return 0;long old=stream.Position;try{if(stream.Length<32)return 0;byte[] h=new byte[32];stream.Position=0;int read=stream.Read(h,0,h.Length);if(read<h.Length||BitConverter.ToUInt32(h,0)!=0x20534444)return 0;uint count=BitConverter.ToUInt32(h,28);if(count==0)count=1;return Math.Min(requested,Math.Max(0,(int)count-1));}catch{return 0;}finally{try{stream.Position=old;}catch{}}
+    }
+    private static int TextureMipSkip(WorldTextureQuality quality){return quality==WorldTextureQuality.Low?2:quality==WorldTextureQuality.Medium?1:0;}
+
+    private void EnsureTextureQualityResources(WorldRenderSettings current){
+      int desired=TextureMipSkip(current?.TextureQuality??WorldTextureQuality.High);if(desired==appliedTextureMipSkip)return;ReloadWorldTextureResources(desired);
+    }
+
+    private void ReloadWorldTextureResources(int desiredMipSkip){
+      bool rebuildMapArt=mapArtPrepared;
+      foreach(var value in textureCache.Values)value?.Dispose();textureCache.Clear();textureLastUseFrame.Clear();pinnedTexturePaths.Clear();boundLocalLightTexturePaths.Clear();
+      appliedTextureMipSkip=Math.Max(0,desiredMipSkip);
+      foreach(GR2_Material material in WorldMaterialResidencySet().ToList()){
+        // Preserve parsed MAT state and appearance overrides. EnsureTextureResources recreates all owned SRVs at the
+        // new mip level from their resolved paths, including NPC complexion/facepaint textures, without reparsing the
+        // base MAT and accidentally discarding the appearance-specific values.
+        ReleaseOwnedMaterial(material);materialLastUseFrame.Remove(material);
+      }
+      foreach(var gpu in waterGpu.Values)gpu.Dispose();waterGpu.Clear();Release(ref defaultWaterNormal);Release(ref defaultWaterDepth);BuildWaterResources();
+      foreach(var art in mapArtGpu)art.Dispose();mapArtGpu.Clear();mapArtPrepared=false;if(rebuildMapArt)BuildMapArt();
+      BuildLocalLightIndex();localLightSelectionCache.Clear();dynamicSpnLocalLights.Clear();
+      InvalidateTemporalHistory();InvalidateObjectOcclusionVisibility();
+    }
+
+    private void EnsureShadowQualityResources(WorldRenderSettings current){
+      WorldShadowQuality desired=current?.ShadowQuality??WorldShadowQuality.Off;
+      if(desired==appliedShadowQuality)return;
+      appliedShadowQuality=desired;
+      if(desired==WorldShadowQuality.High){shadowDistances[0]=1.5f;shadowDistances[1]=4.5f;shadowDistances[2]=25f;shadowDistances[3]=50f;}
+      else {shadowDistances[0]=1.5f;shadowDistances[1]=4.5f;shadowDistances[2]=12.5f;shadowDistances[3]=25f;}
+
+      ReleaseShadowMaps();
+      if(desired==WorldShadowQuality.Off){InvalidateTemporalHistory();return;}
+
+      int requestedResolution=desired==WorldShadowQuality.High?4096:2048;
+      if(!TryCreateShadowMaps(requestedResolution)&&desired==WorldShadowQuality.High){
+        System.Diagnostics.Debug.WriteLine("4096 sun-shadow allocation failed; falling back to 2048 while keeping the High cascade range.");
+        TryCreateShadowMaps(2048);
+      }
+      InvalidateTemporalHistory();
+    }
+
+    private bool TryCreateShadowMaps(int resolution){
+      ReleaseShadowMaps();
+      try{
+        for(int i=0;i<shadowMaps.Length;i++)shadowMaps[i]=new ShadowMap(Device,resolution,resolution);
+        appliedShadowResolution=resolution;
+        return true;
+      }catch(Exception ex){
+        System.Diagnostics.Debug.WriteLine("Sun-shadow allocation "+resolution+"x"+resolution+" failed: "+ex.Message);
+        ReleaseShadowMaps();
+        return false;
+      }
+    }
+
+    private void ReleaseShadowMaps(){
+      for(int i=0;i<shadowMaps.Length;i++){shadowMaps[i]?.Dispose();shadowMaps[i]=null;}
+      appliedShadowResolution=0;
+    }
+
     private static string NormalizeTexturePath(string raw){if(string.IsNullOrWhiteSpace(raw))return null;string p=raw.Trim().Replace('\\','/');if(p.EndsWith(".tex",StringComparison.OrdinalIgnoreCase))p=p.Substring(0,p.Length-4);if(!p.EndsWith(".dds",StringComparison.OrdinalIgnoreCase))p+=".dds";if(p.StartsWith("resources/",StringComparison.OrdinalIgnoreCase))p="/"+p;else if(!p.StartsWith("/resources/",StringComparison.OrdinalIgnoreCase))p="/resources/"+p.TrimStart('/');return p.ToLowerInvariant();}
 
     private void BuildRoads(){if(area==null)return;foreach(AreaPath p in area.Paths.Where(x=>x.IsMapRoad&&x.Points.Count>1)){var pts=new List<Vector3>();for(int i=0;i<p.Points.Count-1;i++){pts.Add(p.Points[i].Position);pts.Add(p.Points[i+1].Position);}if(p.Circular){pts.Add(p.Points[^1].Position);pts.Add(p.Points[0].Position);}roadGpu.Add(BuildLine(pts,p.Color));}}
-    private void BuildMapNotes(){if(area==null)return;foreach(AreaMapNote n in area.MapNotes){float r=.75f;var p=n.Position;noteGpu.Add(BuildLine(new[]{p-new Vector3(r,0,0),p+new Vector3(r,0,0),p-new Vector3(0,0,r),p+new Vector3(0,0,r)},new Vector4(1,.75f,.1f,1)));}if(area.ArrivalPoint!=null){var p=area.ArrivalPoint.Position;float r=1.2f;noteGpu.Add(BuildLine(new[]{p-new Vector3(r,0,0),p+new Vector3(r,0,0),p-new Vector3(0,0,r),p+new Vector3(0,0,r)},new Vector4(.2f,1,.2f,1)));}}
+    private void BuildMapNotes(){
+      if(area==null)return;
+      foreach(AreaMapNote n in area.MapNotes){
+        // Known note classes are rendered as one batched GPU sprite group, so do not allocate the old per-note line
+        // buffer for them. Large areas can contain thousands of notes and the dead buffers were pure VRAM/load-time cost.
+        if(MapNoteIconKey(n?.Icon)!=null)continue;
+        float r=.75f;var p=n.Position;
+        mapNoteFallbackGpu.Add(BuildLine(new[]{p-new Vector3(r,0,0),p+new Vector3(r,0,0),p-new Vector3(0,0,r),p+new Vector3(0,0,r)},new Vector4(1,.75f,.1f,1)));
+      }
+      if(area.ArrivalPoint!=null){
+        var p=area.ArrivalPoint.Position;float r=1.2f;
+        mapNoteFallbackGpu.Add(BuildLine(new[]{p-new Vector3(r,0,0),p+new Vector3(r,0,0),p-new Vector3(0,0,r),p+new Vector3(0,0,r)},new Vector4(.2f,1,.2f,1)));
+      }
+    }
+
+    private static string MapNoteIconKey(string icon){
+      if(String.IsNullOrWhiteSpace(icon))return null;
+      string value=icon.Trim().ToLowerInvariant();
+      if(value.Contains("bind"))return "bindpoint";
+      if(value.Contains("maplink")||value=="defaultmaplink")return "maplink";
+      if(value.Contains("quest"))return "quest";
+      if(value.Contains("taxi"))return "taxi";
+      if(value.Contains("wonka")||value.Contains("elevator")||value.Contains("lift"))return "wonkavator";
+      return null;
+    }
+
+    private static bool MapNoteCategoryEnabled(AreaMapNote note,WorldRenderSettings s){
+      if(note==null||s==null||!s.ShowMapNotes)return false;
+      string key=MapNoteIconKey(note.Icon);
+      switch(key){
+        case "bindpoint": return s.ShowMapIconBindpoints;
+        case "maplink": return s.ShowMapIconMapLinks;
+        case "quest": return s.ShowMapIconQuests;
+        case "taxi": return s.ShowMapIconTaxi;
+        case "wonkavator": return s.ShowMapIconWonkavator;
+        default: return s.ShowMapIconOther;
+      }
+    }
+
+    private static Size MapNoteIconPixelSize(string key){
+      switch(key){
+        case "maplink": return new Size(24,26);
+        case "quest": return new Size(23,23);
+        case "wonkavator": return new Size(24,34);
+        default: return new Size(20,20);
+      }
+    }
+
+    private static string MapNoteIconFileName(string key){
+      if(String.IsNullOrWhiteSpace(key))return null;
+      return String.Equals(key,"player-marker",StringComparison.OrdinalIgnoreCase)?"player-marker.png":"mpn-"+key+".png";
+    }
+
+    private MapNoteIconGpu EnsureMapNoteIconGpu(string key,int requiredVertices){
+      if(String.IsNullOrWhiteSpace(key)||requiredVertices<=0||Device==null)return null;
+      if(!mapNoteIconGpu.TryGetValue(key,out MapNoteIconGpu gpu)){
+        string file=MapNoteIconFileName(key);
+        string path=Path.Combine(AppContext.BaseDirectory,"Resources","WorldMapIcons",file??String.Empty);
+        if(!File.Exists(path))return null;
+        try{
+          using Stream stream=File.OpenRead(path);
+          gpu=new MapNoteIconGpu{Key=key,Texture=ShaderResourceView.FromStream(Device,stream,(int)stream.Length)};
+          mapNoteIconGpu[key]=gpu;
+        }catch(Exception ex){System.Diagnostics.Debug.WriteLine("Map-note icon load failed "+path+": "+ex.Message);return null;}
+      }
+      if(gpu.Texture==null)return null;
+      if(gpu.Buffer==null||gpu.Capacity<requiredVertices){
+        gpu.Buffer?.Dispose();gpu.Buffer=null;
+        int capacity=96;while(capacity<requiredVertices&&capacity<65536)capacity*=2;if(capacity<requiredVertices)capacity=requiredVertices;
+        var bd=new BufferDescription(PosNormalTexTan.Stride*capacity,ResourceUsage.Dynamic,BindFlags.VertexBuffer,CpuAccessFlags.Write,ResourceOptionFlags.None,0);
+        gpu.Buffer=new Buffer(Device,bd){DebugName="World map note icons "+key};gpu.Capacity=capacity;
+      }
+      return gpu;
+    }
+
+    private void DrawMapNoteIcons(Matrix vp,WorldRenderSettings s){
+      if(area?.MapNotes==null||area.MapNotes.Count==0||ClientWidth<=0||ClientHeight<=0||s==null||!s.ShowMapNotes)return;
+      float worldPerPixelX=Math.Max(.00001f,mapVisibleWidth/Math.Max(1f,ClientWidth));
+      float worldPerPixelZ=Math.Max(.00001f,mapVisibleHeight/Math.Max(1f,ClientHeight));
+      // Cull note sprites before allocating/uploading their dynamic vertex arrays. Large worlds can contain thousands
+      // of mapnotes but only a small fraction intersects the current M-map viewport.
+      float marginX=40f*worldPerPixelX,marginZ=40f*worldPerPixelZ;
+      float minX=mapCenter.X-mapVisibleWidth*.5f-marginX,maxX=mapCenter.X+mapVisibleWidth*.5f+marginX;
+      float minZ=mapCenter.Y-mapVisibleHeight*.5f-marginZ,maxZ=mapCenter.Y+mapVisibleHeight*.5f+marginZ;
+      var groups=area.MapNotes
+        .Where(n=>n!=null&&MapNoteCategoryEnabled(n,s)&&n.Position.X>=minX&&n.Position.X<=maxX&&n.Position.Z>=minZ&&n.Position.Z<=maxZ)
+        .Select(n=>(Note:n,Key:MapNoteIconKey(n.Icon)))
+        .Where(x=>x.Key!=null)
+        .GroupBy(x=>x.Key,StringComparer.OrdinalIgnoreCase);
+      float y=boundsMax.Y+3.5f;
+      var normal=new Vector3(0,1,0);var tangent=new Vector3(1,0,0);
+      ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
+      fx.SetWorld(Matrix.Identity);fx.SetViewProj(vp);
+      foreach(var group in groups){
+        var notes=group.Select(x=>x.Note).ToList();if(notes.Count==0)continue;
+        int vertexCount=checked(notes.Count*6);MapNoteIconGpu gpu=EnsureMapNoteIconGpu(group.Key,vertexCount);if(gpu?.Buffer==null||gpu.Texture==null)continue;
+        Size px=MapNoteIconPixelSize(group.Key);float hx=px.Width*worldPerPixelX*.5f,hz=px.Height*worldPerPixelZ*.5f;
+        var verts=new PosNormalTexTan[vertexCount];int o=0;
+        foreach(AreaMapNote note in notes){
+          Vector3 p=note.Position;p.Y=y;
+          // SWTOR's icon bitmaps are authored opposite the top-down D3D quad winding used by this viewer. Apply the
+          // missing half-turn globally, then layer the authored map-link yaw on top. This matches the WinForms minimap.
+          float angle=(float)Math.PI;
+          if(String.Equals(group.Key,"maplink",StringComparison.OrdinalIgnoreCase))angle-=note.Rotation.Y*(float)Math.PI/180f;
+          float c=(float)Math.Cos(angle),sn=(float)Math.Sin(angle);
+          Vector2 tl=RotateMapIconOffset(-hx,hz,c,sn),tr=RotateMapIconOffset(hx,hz,c,sn),br=RotateMapIconOffset(hx,-hz,c,sn),bl=RotateMapIconOffset(-hx,-hz,c,sn);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tl.X,y,p.Z+tl.Y),normal,new Vector2(0,0),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tr.X,y,p.Z+tr.Y),normal,new Vector2(1,0),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+br.X,y,p.Z+br.Y),normal,new Vector2(1,1),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tl.X,y,p.Z+tl.Y),normal,new Vector2(0,0),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+br.X,y,p.Z+br.Y),normal,new Vector2(1,1),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+bl.X,y,p.Z+bl.Y),normal,new Vector2(0,1),tangent);
+        }
+        try{
+          DataBox mapped=ImmediateContext.MapSubresource(gpu.Buffer,MapMode.WriteDiscard,SlimDX.Direct3D11.MapFlags.None);
+          mapped.Data.WriteRange(verts);ImmediateContext.UnmapSubresource(gpu.Buffer,0);
+          fx.SetMapArt(gpu.Texture,1f);ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(gpu.Buffer,PosNormalTexTan.Stride,0));
+          fx.MapArt.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(vertexCount,0);
+        }catch(Exception ex){System.Diagnostics.Debug.WriteLine("Map-note icon draw failed: "+ex.Message);}
+      }
+      fx.ClearMapArt();
+    }
+
+    private static Vector2 RotateMapIconOffset(float x,float z,float cosine,float sine){return new Vector2(x*cosine-z*sine,x*sine+z*cosine);}
+
     private void BuildMapArt(){
+      if(mapArtPrepared)return;mapArtPrepared=true;
       if(area?.MapPages==null||area.MapPages.Count==0)return;
       var pages=area.MapPages.Where(p=>p.HasImage&&!string.IsNullOrWhiteSpace(p.ImagePath)).ToList();
       // Most SWTOR areas contain a root map plus zoomed child pages. Showing both at once causes
       // duplicate artwork, so prefer root pages and fall back to all pages where no root is authored.
       var roots=pages.Where(p=>p.ParentId==0).ToList();if(roots.Count>0)pages=roots;
       foreach(AreaMapPage page in pages){
-        ShaderResourceView texture=LoadTexture(page.ImagePath);if(texture==null)continue;
+        ShaderResourceView texture=LoadTexture(page.ImagePath,true);if(texture==null)continue;
         float minX=Math.Min(page.Min.X,page.Max.X),maxX=Math.Max(page.Min.X,page.Max.X);
         float minZ=Math.Min(page.Min.Z,page.Max.Z),maxZ=Math.Max(page.Min.Z,page.Max.Z);
         if(maxX-minX<.001f||maxZ-minZ<.001f)continue;
@@ -2540,6 +4519,54 @@ namespace PugTools {
       foreach(Room r in rooms){if(r==null||skyRoomNames.Contains(r.RoomName))continue;if(IsFinite(r.VisibilityMin)&&IsFinite(r.VisibilityMax)){Expand(ref min,ref max,r.VisibilityMin);Expand(ref min,ref max,r.VisibilityMax);any=true;}foreach(AssetInstance i in r.InstancesById.Values){if(i.PathFollowerBoundaryExcluded)continue;Matrix m=InstanceWorld(i,r);Vector3 p=new Vector3(m.M41,m.M42,m.M43);Expand(ref min,ref max,p);any=true;if(i.HeightMap!=null){Expand(ref min,ref max,p+new Vector3(-i.HeightMap.width*.1f,i.HeightMap.MinElevation,-i.HeightMap.depth*.1f));Expand(ref min,ref max,p+new Vector3(i.HeightMap.width*.1f,i.HeightMap.MaxElevation,i.HeightMap.depth*.1f));}}}if(area!=null){foreach(var p in area.Paths)foreach(var q in p.Points){Expand(ref min,ref max,q.Position);any=true;}foreach(var page in area.MapPages){Expand(ref min,ref max,page.Min);Expand(ref min,ref max,page.Max);any=true;}}if(any){boundsMin=min;boundsMax=max;}}
     private static bool IsFinite(Vector3 v)=>!float.IsNaN(v.X)&&!float.IsInfinity(v.X)&&!float.IsNaN(v.Y)&&!float.IsInfinity(v.Y)&&!float.IsNaN(v.Z)&&!float.IsInfinity(v.Z);
     private static void Expand(ref Vector3 min,ref Vector3 max,Vector3 p){min.X=Math.Min(min.X,p.X);min.Y=Math.Min(min.Y,p.Y);min.Z=Math.Min(min.Z,p.Z);max.X=Math.Max(max.X,p.X);max.Y=Math.Max(max.Y,p.Y);max.Z=Math.Max(max.Z,p.Z);}
+    private MapBoundsOverride CurrentMapBoundsOverride(){
+      if(area==null)return null;MapBoundsOverrides.TryGetValue(area.Id.ToString(),out MapBoundsOverride value);return value;
+    }
+
+    private string MapAssetFileName(AssetInstance inst,GR2 model){
+      string path=null;
+      if(area!=null&&inst!=null&&area.AssetIdMap.TryGetValue(inst.assetID,out AreaAsset asset)&&asset!=null){
+        path=asset.Path;string ext=(asset.Extension??String.Empty).Trim().TrimStart('.');
+        if(!String.IsNullOrWhiteSpace(ext)&&!String.IsNullOrWhiteSpace(path)&&!path.EndsWith("."+ext,StringComparison.OrdinalIgnoreCase))path+="."+ext;
+      }
+      if(String.IsNullOrWhiteSpace(path))path=model?.filename;
+      string normalized=NormalizeAssetPath(path);int slash=normalized.LastIndexOf('/');return slash>=0?normalized.Substring(slash+1):normalized;
+    }
+
+    private bool MapOverrideHidesAsset(MapBoundsOverride mapOverride,AssetInstance inst,GR2 model){
+      if(mapOverride==null||mapOverride.HideAssets.Count==0)return false;string name=MapAssetFileName(inst,model);
+      if(String.IsNullOrWhiteSpace(name))return false;
+      foreach(string hidden in mapOverride.HideAssets)if(name.IndexOf(hidden,StringComparison.OrdinalIgnoreCase)>=0)return true;
+      return false;
+    }
+
+    private static float MapModelMaxDimension(GR2 model,Matrix world){
+      GR2_Bounding_Box box=model?.globalBox;if(box==null)return 0f;
+      Vector3 min=new Vector3(box.minX,box.minY,box.minZ),max=new Vector3(box.maxX,box.maxY,box.maxZ);if(!IsFinite(min)||!IsFinite(max))return 0f;
+      Vector3 size=max-min;return Math.Max(size.X,Math.Max(size.Y,size.Z))*MatrixMaxScale(world);
+    }
+
+    private bool MapModelVisibleForCurrentMap(AssetInstance inst,GR2 model,Matrix world){
+      if(TryModelSphere(model,world,out Vector3 center,out float radius)&&!MapSphereVisible(center,radius))return false;
+      if(mapShowEntireArea||!mapHasClusterExtent)return true;MapBoundsOverride mapOverride=CurrentMapBoundsOverride();if(mapOverride==null)return true;
+      if(MapOverrideHidesAsset(mapOverride,inst,model))return false;
+      if(mapOverride.HideLargeObjects&&MapModelMaxDimension(model,world)>mapOverride.LargeObjectSize)return false;
+      return true;
+    }
+
+    private bool ApplyMeasuredMapBoundsOverride(MapBoundsOverride mapOverride,bool hasAutomaticCrop,float fullMinX,float fullMaxX,float fullMinZ,float fullMaxZ,
+      ref float minX,ref float maxX,ref float minZ,ref float maxZ){
+      if(mapOverride==null||!mapOverride.HasMeasuredBounds)return hasAutomaticCrop;
+      float beforeMinX=minX,beforeMaxX=maxX,beforeMinZ=minZ,beforeMaxZ=maxZ;
+      float ClampX(float value)=>Math.Max(fullMinX,Math.Min(fullMaxX,value));
+      float ClampZ(float value)=>Math.Max(fullMinZ,Math.Min(fullMaxZ,value));
+      if(mapOverride.MinX.HasValue)minX=ClampX(mapOverride.MinX.Value);if(mapOverride.MaxX.HasValue)maxX=ClampX(mapOverride.MaxX.Value);
+      if(mapOverride.MinZ.HasValue)minZ=ClampZ(mapOverride.MinZ.Value);if(mapOverride.MaxZ.HasValue)maxZ=ClampZ(mapOverride.MaxZ.Value);
+      if(maxX<=minX||maxZ<=minZ){minX=beforeMinX;maxX=beforeMaxX;minZ=beforeMinZ;maxZ=beforeMaxZ;return hasAutomaticCrop;}
+      bool changed=Math.Abs(minX-beforeMinX)>.0001f||Math.Abs(maxX-beforeMaxX)>.0001f||Math.Abs(minZ-beforeMinZ)>.0001f||Math.Abs(maxZ-beforeMaxZ)>.0001f;
+      return hasAutomaticCrop||changed;
+    }
+
     private void ResetMapCamera(){
       float minX=boundsMin.X,maxX=boundsMax.X,minZ=boundsMin.Z,maxZ=boundsMax.Z;
       bool havePrimaryExtent=false;
@@ -2564,16 +4591,133 @@ namespace PugTools {
       // Include normal-sized world renderables as well. Several phase/space maps contain architecture or water
       // outside the HMS footprint. Ignore absurd helper/malformed spheres so one broken bound cannot shrink the
       // useful map to a dot. Skyscene rooms never enter the render index, so their giant domes do not affect fit.
-      foreach(RenderEntry entry in renderGlobal.Concat(renderGrid.Values.SelectMany(x=>x))){
+      var uniqueRenderEntries=new HashSet<RenderEntry>();
+      foreach(RenderEntry entry in renderGlobal)if(entry!=null)uniqueRenderEntries.Add(entry);
+      foreach(var bucket in renderGrid.Values)foreach(RenderEntry entry in bucket)if(entry!=null)uniqueRenderEntries.Add(entry);
+      foreach(RenderEntry entry in uniqueRenderEntries){
         if(entry==null||!IsFinite(entry.Center)||entry.Radius<0f||entry.Radius>4096f)continue;
         IncludeXZ(entry.Center.X-entry.Radius,entry.Center.Z-entry.Radius);IncludeXZ(entry.Center.X+entry.Radius,entry.Center.Z+entry.Radius);
       }
       if(!havePrimaryExtent){minX=boundsMin.X;maxX=boundsMax.X;minZ=boundsMin.Z;maxZ=boundsMax.Z;}
       if(maxX-minX<1f){minX-=5f;maxX+=5f;}if(maxZ-minZ<1f){minZ-=5f;maxZ+=5f;}
-      mapExtentMinX=minX;mapExtentMaxX=maxX;mapExtentMinZ=minZ;mapExtentMaxZ=maxZ;
-      mapCenter=new Vector2((minX+maxX)*.5f,(minZ+maxZ)*.5f);
+
+      mapFullExtentMinX=minX;mapFullExtentMaxX=maxX;mapFullExtentMinZ=minZ;mapFullExtentMaxZ=maxZ;
+      MapBoundsOverride mapOverride=CurrentMapBoundsOverride();
+      bool automaticCrop=TryBuildMapClusterExtent(uniqueRenderEntries,minX,maxX,minZ,maxZ,mapOverride,
+        out mapClusterExtentMinX,out mapClusterExtentMaxX,out mapClusterExtentMinZ,out mapClusterExtentMaxZ);
+      mapHasClusterExtent=ApplyMeasuredMapBoundsOverride(mapOverride,automaticCrop,minX,maxX,minZ,maxZ,
+        ref mapClusterExtentMinX,ref mapClusterExtentMaxX,ref mapClusterExtentMinZ,ref mapClusterExtentMaxZ);
+      ApplyMapExtentSelection();
+      mapCenter=new Vector2((mapExtentMinX+mapExtentMaxX)*.5f,(mapExtentMinZ+mapExtentMaxZ)*.5f);
       mapZoom=1f;
       UpdateMapCamera();
+    }
+
+    private static float MapBoundsFootprint(float minX,float maxX,float minZ,float maxZ){
+      return Math.Max(0f,maxX-minX)*Math.Max(0f,maxZ-minZ);
+    }
+
+    private static void MapBoundsOfBoxes(IList<MapBoundsBox> boxes,out float minX,out float maxX,out float minZ,out float maxZ){
+      minX=minZ=float.MaxValue;maxX=maxZ=float.MinValue;
+      foreach(MapBoundsBox box in boxes){
+        if(box==null)continue;
+        minX=Math.Min(minX,box.MinX);maxX=Math.Max(maxX,box.MaxX);
+        minZ=Math.Min(minZ,box.MinZ);maxZ=Math.Max(maxZ,box.MaxZ);
+      }
+    }
+
+    private static List<MapBoundsBox> MapTrimWidestGap(List<MapBoundsBox> boxes,int minKeep){
+      int removable=boxes.Count-minKeep;if(removable<1)return null;
+      float bestGap=-1f;List<MapBoundsBox> best=null;
+      foreach(bool xAxis in new[]{true,false}){
+        List<MapBoundsBox> sorted=boxes.OrderBy(box=>xAxis?box.X:box.Z).ToList();
+        int last=sorted.Count-1;
+        float span=(xAxis?sorted[last].X:sorted[last].Z)-(xAxis?sorted[0].X:sorted[0].Z);
+        float minGap=span*MapClusterMinGap;if(!(minGap>0f))continue;
+        for(int count=1;count<=removable;count++){
+          float lowGap=(xAxis?sorted[count].X:sorted[count].Z)-(xAxis?sorted[count-1].X:sorted[count-1].Z);
+          if(lowGap>=minGap&&lowGap>bestGap){bestGap=lowGap;best=sorted.Skip(count).ToList();}
+          float highGap=(xAxis?sorted[last-count+1].X:sorted[last-count+1].Z)-(xAxis?sorted[last-count].X:sorted[last-count].Z);
+          if(highGap>=minGap&&highGap>bestGap){bestGap=highGap;best=sorted.Take(last-count+1).ToList();}
+        }
+      }
+      return best;
+    }
+
+    private bool TryBuildMapClusterExtent(IEnumerable<RenderEntry> renderEntries,float fullMinX,float fullMaxX,float fullMinZ,float fullMaxZ,MapBoundsOverride mapOverride,
+      out float minX,out float maxX,out float minZ,out float maxZ){
+      minX=fullMinX;maxX=fullMaxX;minZ=fullMinZ;maxZ=fullMaxZ;
+      var boxes=new List<MapBoundsBox>();
+
+      // Heightmaps are the ground, not scenery. Keep their tiles in the clustering input so open-world planets form
+      // one continuous distribution and cannot be "helpfully" cropped down to a city or prop cluster.
+      foreach(HeightMapFloorEntry entry in heightMapFloors){
+        if(entry==null)continue;
+        boxes.Add(new MapBoundsBox{MinX=entry.WorldMinX,MaxX=entry.WorldMaxX,MinZ=entry.WorldMinZ,MaxZ=entry.WorldMaxZ,
+          X=(entry.WorldMinX+entry.WorldMaxX)*.5f,Z=(entry.WorldMinZ+entry.WorldMaxZ)*.5f,Large=false});
+      }
+      bool hiddenAssetsSteerBounds=mapOverride==null||!mapOverride.HasMeasuredBounds;
+      float largeObjectSize=mapOverride?.LargeObjectSize??MapClusterLargeObjectSize;
+      foreach(RenderEntry entry in renderEntries){
+        if(entry==null||!IsFinite(entry.Center)||entry.Radius<0f||entry.Radius>4096f)continue;
+        if(entry.Kind==RenderKindModel&&entry.Model!=null&&MapOverrideHidesAsset(mapOverride,entry.Instance,entry.Model)&&!hiddenAssetsSteerBounds)continue;
+        float minBoxX,maxBoxX,minBoxZ,maxBoxZ;bool large=false;
+        if(entry.Kind==RenderKindModel&&entry.Model!=null&&TryModelWorldXZBounds(entry.Model,entry.World,out minBoxX,out maxBoxX,out minBoxZ,out maxBoxZ)){
+          large=MapModelMaxDimension(entry.Model,entry.World)>largeObjectSize;
+        }else{
+          float r=Math.Max(.001f,entry.Radius);minBoxX=entry.Center.X-r;maxBoxX=entry.Center.X+r;minBoxZ=entry.Center.Z-r;maxBoxZ=entry.Center.Z+r;
+        }
+        boxes.Add(new MapBoundsBox{MinX=minBoxX,MaxX=maxBoxX,MinZ=minBoxZ,MaxZ=maxBoxZ,
+          X=(minBoxX+maxBoxX)*.5f,Z=(minBoxZ+maxBoxZ)*.5f,Large=large});
+      }
+      if(boxes.Count<8)return false;
+
+      List<MapBoundsBox> kept=boxes;
+      List<MapBoundsBox> small=boxes.Where(box=>!box.Large).ToList();
+      if(small.Count>=MapClusterMinSmallCount&&small.Count>=boxes.Count*MapClusterMinSmallShare)kept=small;
+      int minKeep=(int)Math.Ceiling(kept.Count*MapClusterCoverage);
+      bool changed=!ReferenceEquals(kept,boxes);
+      for(int pass=0;pass<MapClusterMaxPasses;pass++){
+        List<MapBoundsBox> trimmed=MapTrimWidestGap(kept,minKeep);
+        if(trimmed==null)break;
+        kept=trimmed;changed=true;
+      }
+      if(!changed||kept.Count==0)return false;
+
+      MapBoundsOfBoxes(kept,out float cropMinX,out float cropMaxX,out float cropMinZ,out float cropMaxZ);
+      if(!float.IsFinite(cropMinX)||!float.IsFinite(cropMaxX)||!float.IsFinite(cropMinZ)||!float.IsFinite(cropMaxZ)||
+         cropMaxX<=cropMinX||cropMaxZ<=cropMinZ)return false;
+      float fullFootprint=MapBoundsFootprint(fullMinX,fullMaxX,fullMinZ,fullMaxZ);
+      float cropFootprint=MapBoundsFootprint(cropMinX,cropMaxX,cropMinZ,cropMaxZ);
+      if(fullFootprint<=0f||cropFootprint>fullFootprint*MapClusterMaxFootprint)return false;
+
+      minX=Math.Max(fullMinX,cropMinX);maxX=Math.Min(fullMaxX,cropMaxX);
+      minZ=Math.Max(fullMinZ,cropMinZ);maxZ=Math.Min(fullMaxZ,cropMaxZ);
+      return maxX-minX>=1f&&maxZ-minZ>=1f;
+    }
+
+    private void ApplyMapExtentSelection(){
+      bool full=mapShowEntireArea||!mapHasClusterExtent;
+      mapExtentMinX=full?mapFullExtentMinX:mapClusterExtentMinX;
+      mapExtentMaxX=full?mapFullExtentMaxX:mapClusterExtentMaxX;
+      mapExtentMinZ=full?mapFullExtentMinZ:mapClusterExtentMinZ;
+      mapExtentMaxZ=full?mapFullExtentMaxZ:mapClusterExtentMaxZ;
+    }
+
+    public bool MapHasSmartCrop=>mapHasClusterExtent;
+    public bool MapShowEntireArea=>mapShowEntireArea;
+
+    public void SetMapShowEntireArea(bool showEntireArea){
+      mapShowEntireArea=showEntireArea;
+      if(mapOpen){
+        ApplyMapExtentSelection();
+        mapCenter=new Vector2((mapExtentMinX+mapExtentMaxX)*.5f,(mapExtentMinZ+mapExtentMaxZ)*.5f);
+        mapZoom=1f;UpdateMapCamera();
+        if(Window is WorldBrowser browser)browser.SetStatusLabel(showEntireArea||!mapHasClusterExtent
+          ?"Map extent: entire area"
+          :"Map extent: main area (isolated outliers cropped)");
+      }
+      miniMapCaptureRequested=true;
     }
 
     private void UpdateMapCamera(){
@@ -2598,14 +4742,14 @@ namespace PugTools {
     }
 
     private void SetMapOpen(bool open){
-      if(mapOpen==open)return;
+      if(mapOpen==open){if(!open)CloseTaxiRouteMapState();return;}
       mapOpen=open;mapPointerDown=false;mapPointerDragged=false;
-      if(open)ResetMapCamera();
+      if(open)ResetMapCamera();else CloseTaxiRouteMapState();
       InvalidateTemporalHistory();
       if(Window is WorldBrowser browser){
         browser.SetFullMapActive(open);
         browser.SetStatusLabel(open
-          ? "Map: click = teleport, drag = pan, mouse wheel = zoom, M/Esc = close"
+          ? (IsTaxiRouteMapActive ? "Taxi map: click a highlighted route/destination, drag = pan, wheel = zoom, M/Esc = close" : "Map: click = teleport, drag = pan, wheel = zoom, move mouse = coordinates, M/Esc = close")
           : "Map closed. Camera speed: "+cameraSpeed.ToString("0.##")+" u/s");
       }
     }
@@ -2615,6 +4759,25 @@ namespace PugTools {
       float nx=p.X/width*2f-1f;
       float nz=p.Y/height*2f-1f; // screen down is world +Z in the top-down map
       return new Vector2(mapCenter.X+nx*mapVisibleWidth*.5f,mapCenter.Y+nz*mapVisibleHeight*.5f);
+    }
+
+    private AreaMapNote HitTestFullMapNote(Point point) {
+      if (area?.MapNotes == null || area.MapNotes.Count == 0 || ClientWidth <= 0 || ClientHeight <= 0) return null;
+      AreaMapNote best = null; float bestD2 = float.MaxValue;
+      float left = mapCenter.X - mapVisibleWidth * .5f, top = mapCenter.Y - mapVisibleHeight * .5f;
+      WorldRenderSettings s = SettingsSnapshot();
+      foreach (AreaMapNote note in area.MapNotes) {
+        if (!MapNoteCategoryEnabled(note, s)) continue;
+        string key = MapNoteIconKey(note.Icon); if (key == null) continue;
+        Size px = MapNoteIconPixelSize(key);
+        float x = (note.Position.X - left) / Math.Max(.0001f, mapVisibleWidth) * ClientWidth;
+        float y = (note.Position.Z - top) / Math.Max(.0001f, mapVisibleHeight) * ClientHeight;
+        float hx = Math.Max(8f, px.Width * .6f), hy = Math.Max(8f, px.Height * .6f);
+        if (Math.Abs(point.X - x) > hx || Math.Abs(point.Y - y) > hy) continue;
+        float dx = point.X - x, dy = point.Y - y, d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = note; }
+      }
+      return best;
     }
 
     private void ZoomMapAt(Point p,int delta){
@@ -2662,7 +4825,10 @@ namespace PugTools {
       if(!TrySampleMapHeight(world.X,world.Y,out y))y=Math.Max(boundsMin.Y+2f,Math.Min(boundsMax.Y+2f,camera.Position.Y));
       camera.Position=new Vector3(world.X,y+MapTeleportClearance,world.Y);
       currentCameraRoom=null;
-      if(Window is WorldBrowser browser)browser.SetStatusLabel(string.Format(System.Globalization.CultureInfo.InvariantCulture,"Teleported to {0:0.00}, {1:0.00}, {2:0.00}",camera.Position.X,camera.Position.Y,camera.Position.Z));
+      if(Window is WorldBrowser browser){
+        browser.SetStatusLabel(string.Format(System.Globalization.CultureInfo.InvariantCulture,"Teleported to {0:0}, {1:0}, {2:0}",world.X*10f,world.Y*10f,y*10f));
+        browser.SetFullMapActive(false);
+      }
       mapOpen=false;mapPointerDown=false;mapPointerDragged=false;InvalidateTemporalHistory();
     }
 
@@ -2670,11 +4836,22 @@ namespace PugTools {
 
     protected override void OnMouseDown(object sender,MouseEventArgs e){
       lastMousePos=e.Location;Control control=Window.Controls.Find(RenderPanelName,true).FirstOrDefault();if(control!=null)control.Capture=true;
-      if(mapOpen&&e.Button==MouseButtons.Left){mapPointerDown=true;mapPointerDragged=false;mapPointerStart=e.Location;mapPanStartCenter=mapCenter;}
+      if(mapOpen&&e.Button==MouseButtons.Left){mapPointerDown=true;mapPointerDragged=false;mapPointerStart=e.Location;mapPanStartCenter=mapCenter;return;}
+      if(!mapOpen&&orthographicActive&&e.Button==MouseButtons.Right){orthographicPanning=true;orthographicPanStart=e.Location;orthographicPanCameraStart=camera.Position;}
     }
     protected override void OnMouseUp(object sender,MouseEventArgs e){
       Control control=Window.Controls.Find(RenderPanelName,true).FirstOrDefault();if(control!=null)control.Capture=false;
-      if(mapOpen&&e.Button==MouseButtons.Left&&mapPointerDown){bool teleport=!mapPointerDragged;mapPointerDown=false;if(teleport)TeleportFromMap(e.Location);}
+      if(e.Button==MouseButtons.Right)orthographicPanning=false;
+      if(mapOpen&&e.Button==MouseButtons.Left&&mapPointerDown){
+        bool click=!mapPointerDragged;mapPointerDown=false;
+        if(click){
+          if(IsTaxiRouteMapActive){
+            if(TryPickTaxiRouteOnMap(e.Location,out WorldTaxiRouteInfo pickedRoute) && Window is WorldBrowser taxiBrowser){
+              CloseTaxiRouteMapState();mapOpen=false;mapPointerDragged=false;InvalidateTemporalHistory();taxiBrowser.SetFullMapActive(false);taxiBrowser.StartTaxiRouteFromMap(pickedRoute);
+            } else if(Window is WorldBrowser taxiMapBrowser) taxiMapBrowser.SetStatusLabel("Taxi map: click a highlighted route or destination marker; drag to pan, wheel to zoom, Esc/M to close.");
+          } else TeleportFromMap(e.Location);
+        }
+      }
     }
     protected override void OnMouseMove(object sender,MouseEventArgs e){
       if(mapOpen){
@@ -2682,18 +4859,64 @@ namespace PugTools {
           int dx=e.X-mapPointerStart.X,dy=e.Y-mapPointerStart.Y;
           if(!mapPointerDragged&&dx*dx+dy*dy>=16)mapPointerDragged=true;
           if(mapPointerDragged){
+            if(Window is WorldBrowser dragBrowser)dragBrowser.UpdateWorldMapNoteToolTip(null,Point.Empty);
             float wx=dx/(float)Math.Max(1,ClientWidth)*mapVisibleWidth;
             float wz=dy/(float)Math.Max(1,ClientHeight)*mapVisibleHeight;
             mapCenter=new Vector2(mapPanStartCenter.X-wx,mapPanStartCenter.Y-wz);UpdateMapCamera();
           }
         }
+        if(!mapPointerDragged&&Window is WorldBrowser mapBrowser){
+          AreaMapNote hoverNote = !IsTaxiRouteMapActive ? HitTestFullMapNote(e.Location) : null;
+          mapBrowser.UpdateWorldMapNoteToolTip(hoverNote, e.Location);
+          if(IsTaxiRouteMapActive && TryPickTaxiRouteOnMap(e.Location,out WorldTaxiRouteInfo hoverRoute))
+            mapBrowser.SetStatusLabel("Taxi destination: "+TaxiRouteMapDisplayName(hoverRoute)+"  •  click to ride");
+          else if(IsTaxiRouteMapActive)
+            mapBrowser.SetStatusLabel("Taxi map: click a highlighted route/destination; drag = pan, wheel = zoom, Esc/M = close");
+          else {
+            Vector2 world=MapWorldAtScreen(e.Location);
+            string heightText=TrySampleMapHeight(world.X,world.Y,out float mapY)
+              ? ", "+Math.Round(mapY*10f).ToString(System.Globalization.CultureInfo.InvariantCulture)
+              : String.Empty;
+            // Match Jedipedia's map readout: display X/Y are world X/Z ×10, followed by the sampled surface Z.
+            mapBrowser.SetStatusLabel("Map cursor: "+Math.Round(world.X*10f).ToString(System.Globalization.CultureInfo.InvariantCulture)+
+              ", "+Math.Round(world.Y*10f).ToString(System.Globalization.CultureInfo.InvariantCulture)+heightText+
+              (mapHasClusterExtent&&!mapShowEntireArea?"  •  cropped main area":""));
+          }
+        }
         lastMousePos=e.Location;return;
       }
-      if((e.Button&MouseButtons.Left)!=0||(e.Button&MouseButtons.Right)!=0){float dy=SlimDXNet.MathF.ToRadians(.4f*(e.Y-lastMousePos.Y));float dx=-SlimDXNet.MathF.ToRadians(.4f*(e.X-lastMousePos.X));camera.Pitch(-dy);camera.Yaw(dx);}
+      bool selectionGesture=(Control.ModifierKeys&Keys.Control)!=0;
+      const float pointerLookSensitivity=.0025f; // Jedipedia mouse/pointer sensitivity (radians per pixel).
+      if(orthographicActive){
+        if(orthographicPanning&&(e.Button&MouseButtons.Right)!=0){
+          int dx=e.X-orthographicPanStart.X,dy=e.Y-orthographicPanStart.Y;WorldRenderSettings s=SettingsSnapshot();
+          float worldPerPixel=2f*GetOrthographicHalfHeight(s)/Math.Max(1f,ClientHeight);
+          Vector3 right=HorizontalUnit(camera.Right,Vector3.UnitX);
+          float across=-dx*worldPerPixel;float along=dy*worldPerPixel/Math.Max((float)Math.Sin(orthographicPitch),.1f);
+          Vector3 pan=orthographicPanCameraStart+right*across+orthographicHeading*along;camera.Position=new Vector3(pan.X,camera.Position.Y,pan.Z);lastMousePos=e.Location;return;
+        }
+        if(!selectionGesture&&(e.Button&MouseButtons.Left)!=0){
+          float pitchDelta=pointerLookSensitivity*(e.Y-lastMousePos.Y);
+          float yawDelta=-pointerLookSensitivity*(e.X-lastMousePos.X);
+          orthographicPitch=Math.Max(OrthographicMinPitch,Math.Min(OrthographicMaxPitch,orthographicPitch+pitchDelta));
+          if(Math.Abs(yawDelta)>.000001f)orthographicHeading=HorizontalUnit(Vector3.TransformNormal(orthographicHeading,Matrix.RotationY(yawDelta)),Vector3.UnitZ);
+          ApplyOrthographicOrientation();
+        }
+        lastMousePos=e.Location;return;
+      }
+      bool rotate=((e.Button&MouseButtons.Right)!=0)||(!selectionGesture&&(e.Button&MouseButtons.Left)!=0);
+      if(rotate){float dy=pointerLookSensitivity*(e.Y-lastMousePos.Y);float dx=-pointerLookSensitivity*(e.X-lastMousePos.X);PitchPerspectiveCamera(-dy);camera.Yaw(dx);}
       lastMousePos=e.Location;
     }
     public void HandleMouseWheel(System.Drawing.Point location,int delta){
       if(mapOpen){ZoomMapAt(location,delta);return;}
+      if(HandleTaxiMouseWheel(delta))return;
+      if(orthographicActive){
+        orthographicZoomTarget=Math.Max(OrthographicZoomMin,Math.Min(OrthographicZoomMax,orthographicZoomTarget*(float)Math.Exp(-delta*OrthographicZoomSensitivity)));
+        orthographicFloorY=TrySampleViewerFloor(camera.Position.X,camera.Position.Z,camera.Position.Y+.05f,out float floorY)?floorY:float.NaN;
+        if(Window is WorldBrowser orthoBrowser)orthoBrowser.SetStatusLabel("Orthographic zoom: "+(100f/orthographicZoomTarget).ToString("0")+"%  •  wheel controls cut height");
+        return;
+      }
       cameraSpeed=(float)Math.Max(MinCameraSpeed,Math.Min(MaxCameraSpeed,cameraSpeed*Math.Exp(delta*0.001f)));
       if(Window is WorldBrowser browser){bool walking=SettingsSnapshot().WalkingMode;browser.SetStatusLabel((walking?"Walking speed: ":"Camera speed: ")+cameraSpeed.ToString("0.##")+" u/s (Shift "+(walking?"2x":"10x")+")");}
     }

@@ -82,6 +82,18 @@ namespace FileFormats {
     public string Id { get; set; }
     public string Fqn { get; set; }
     public string Label { get; set; }
+    // Resolved from the mpn.* template in the GOM after area.dat/mapnotes.not has been parsed.
+    // Keeping this on the lightweight area record lets both the D3D world map and the WinForms
+    // minimap use the same original SWTOR symbol without touching the DOM during rendering.
+    public string Icon { get; set; }
+    public string Condition { get; set; }
+    public Dictionary<string, string> LocalizedName { get; set; }
+    public long WonkaPackageId { get; set; }
+    public ulong WonkaDestinationId { get; set; }
+    public long AssetId { get; set; }
+    public ulong MapLinkAreaId { get; set; }
+    public long MapLinkMapNameSId { get; set; }
+    public long MapLinkSubmapNameSId { get; set; }
     public Vector3 Position { get; set; }
     public Vector3 Rotation { get; set; }
     public List<string> Tags { get; } = new List<string>();
@@ -501,49 +513,233 @@ namespace FileFormats {
     }
 
     private void ReadMapNotes() {
-      string[] candidates = { Path + "/mapnotes.not", "/resources/world/areas/" + Id + "/mapnotes.not", "/resources/world/livecontent/systemgenerated/" + Id + "/mapnotes.not" };
-      TorArchive.File file = candidates.Select(assets.FindFile).FirstOrDefault(x => x != null); if (file == null) return;
-      try {
-        using Stream s = file.OpenCopyInMemory(); using var ms = new MemoryStream(); s.CopyTo(ms); byte[] bytes = ms.ToArray();
-        string encoded = Encoding.UTF8.GetString(bytes);
-        // Jedipedia removes the fixed .not wrapper (30 bytes before the XML-ish stream and 18 after it).
-        string text = encoded.Length > 48 ? encoded.Substring(30, encoded.Length - 48) : encoded;
-        text = DecodeMapnoteText(text);
-        Regex entryRx = new Regex(@"<k\b[^>]*>(?<id>[\s\S]*?)</k>\s*<e\b[^>]*>\s*<node\b[^>]*>(?<node>[\s\S]*?)</node>\s*</e>", RegexOptions.IgnoreCase);
-        foreach (Match entry in entryRx.Matches(text)) {
-          var fields = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
-          foreach (Match f in Regex.Matches(entry.Groups["node"].Value, @"<f\b(?<attrs>[^>]*)>(?<value>[\s\S]*?)</f>", RegexOptions.IgnoreCase)) {
-            Match nm = Regex.Match(f.Groups["attrs"].Value, @"\bname\s*=\s*(?:""(?<dq>[^""]*)""|'(?<sq>[^']*)'|(?<bare>[^\s>]+))", RegexOptions.IgnoreCase);
-            string name = nm.Groups["dq"].Success ? nm.Groups["dq"].Value : nm.Groups["sq"].Success ? nm.Groups["sq"].Value : nm.Groups["bare"].Value;
-            if (!string.IsNullOrEmpty(name)) fields[name] = f.Groups["value"].Value;
+      // Mapnotes have existed in a few slightly different text wrappers over the lifetime of the client. The old
+      // GomLib loader successfully parsed the complete XML document, while Jedipedia's current browser strips the
+      // fixed archive wrapper and parses the regular <k>/<e><node> stream. Support both forms here instead of
+      // assuming one exact wrapper/encoding: otherwise a valid mapnotes.not can silently produce an empty list.
+      bool systemGenerated = Id == 36268000006UL || Id == 3758002374UL;
+      string normalPath = "/resources/world/areas/" + Id + "/mapnotes.not";
+      string generatedPath = "/resources/world/livecontent/systemgenerated/" + Id + "/mapnotes.not";
+      var candidates = new List<string>();
+      candidates.Add(systemGenerated ? generatedPath : normalPath);
+      if (!String.IsNullOrWhiteSpace(Path)) candidates.Add(Path.TrimEnd('/', '\\') + "/mapnotes.not");
+      candidates.Add(systemGenerated ? normalPath : generatedPath);
+
+      foreach (string candidate in candidates.Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase)) {
+        TorArchive.File file = assets.FindFile(candidate);
+        if (file == null) continue;
+        try {
+          byte[] bytes;
+          using (Stream s = file.OpenCopyInMemory()) {
+            using var ms = new MemoryStream();
+            s.CopyTo(ms);
+            bytes = ms.ToArray();
           }
-          string fqnFull = MapnoteTextContent(fields.TryGetValue("mpnTemplateFQN", out string fqnRaw) ? fqnRaw : null);
-          if (!TryParseMapnoteVector(fields.TryGetValue("mpnPosition", out string posRaw) ? posRaw : null, out Vector3 pos) || string.IsNullOrEmpty(fqnFull)) continue;
-          string fqn = fqnFull;
-          if (fqn.Length >= 12 && fqn.StartsWith("world.", StringComparison.OrdinalIgnoreCase)) fqn = fqn.Substring(8, fqn.Length - 12);
-          fqn = fqn.Replace('\\','.');
-          var note = new AreaMapNote {
-            Id = MapnoteTextContent(entry.Groups["id"].Value),
-            Fqn = fqn,
-            Label = fqn.Split('.').LastOrDefault()?.Replace('_',' ') ?? fqn,
-            Position = pos
-          };
-          if (TryParseMapnoteVector(fields.TryGetValue("mpnRotation", out string rotRaw) ? rotRaw : null, out Vector3 rot)) note.Rotation = rot;
-          if (fields.TryGetValue("mpnMapTags", out string tagsRaw)) foreach (Match tag in Regex.Matches(tagsRaw, @"<k\b[^>]*>(?<tag>[\s\S]*?)</k>", RegexOptions.IgnoreCase)) { string t = MapnoteTextContent(tag.Groups["tag"].Value); if (!string.IsNullOrEmpty(t)) note.Tags.Add(t); }
-          if (fields.TryGetValue("ParentMapTag", out string parentRaw)) foreach (string parent in MapnoteTextContent(parentRaw).Split(',')) { string t=parent.Trim(); if(t.Length>0) note.ParentTags.Add(t); }
-          MapNotes.Add(note);
+
+          string encoded = DecodeMapnoteFile(bytes);
+          var parsed = new List<AreaMapNote>();
+
+          // First try the full XML document. This is the format PugTools/GomLib historically consumed and is still
+          // present in some client builds. It also avoids depending on a fixed prefix/suffix length.
+          AddUniqueMapnotes(parsed, ParseMapnoteXml(encoded));
+
+          // Then mirror Jedipedia's current parser for the fixed wrapper used by live archives. Keep a full-stream
+          // regex fallback for malformed/legacy XML where XmlDocument is intentionally stricter than the client.
+          if (encoded.Length > 48) {
+            string wrapped = encoded.Substring(30, encoded.Length - 48);
+            AddUniqueMapnotes(parsed, ParseMapnoteText(DecodeMapnoteText(wrapped)));
+          }
+          AddUniqueMapnotes(parsed, ParseMapnoteText(DecodeMapnoteText(encoded)));
+
+          if (parsed.Count == 0) {
+            System.Diagnostics.Debug.WriteLine("No mapnotes parsed from: " + candidate);
+            continue;
+          }
+
+          MapNotes.AddRange(parsed);
+          System.Diagnostics.Debug.WriteLine("Loaded " + parsed.Count.ToString(CultureInfo.InvariantCulture) + " mapnotes from: " + candidate);
+          return;
+        } catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("Could not read mapnotes from " + candidate + ": " + ex.Message);
         }
-      } catch { }
+      }
+    }
+
+    private static string DecodeMapnoteFile(byte[] bytes) {
+      if (bytes == null || bytes.Length == 0) return String.Empty;
+
+      // StreamReader used by the original GomLib implementation auto-detected UTF BOMs. Preserve that behaviour,
+      // and also recognize BOM-less UTF-16 by its alternating zero bytes before falling back to UTF-8.
+      if (bytes.Length >= 2) {
+        if (bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2).TrimEnd('\0');
+        if (bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2).TrimEnd('\0');
+      }
+      if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3).TrimEnd('\0');
+
+      int probe = Math.Min(bytes.Length, 256), evenZero = 0, oddZero = 0;
+      for (int i = 0; i < probe; i++) if (bytes[i] == 0) { if ((i & 1) == 0) evenZero++; else oddZero++; }
+      if (oddZero > probe / 8 && oddZero > evenZero * 2) return Encoding.Unicode.GetString(bytes).TrimEnd('\0');
+      if (evenZero > probe / 8 && evenZero > oddZero * 2) return Encoding.BigEndianUnicode.GetString(bytes).TrimEnd('\0');
+      return Encoding.UTF8.GetString(bytes).TrimEnd('\0');
+    }
+
+    private static void AddUniqueMapnotes(List<AreaMapNote> target, IEnumerable<AreaMapNote> source) {
+      if (target == null || source == null) return;
+      var seen = new HashSet<string>(target.Select(MapnoteIdentity), StringComparer.OrdinalIgnoreCase);
+      foreach (AreaMapNote note in source) {
+        if (note == null) continue;
+        string key = MapnoteIdentity(note);
+        if (seen.Add(key)) target.Add(note);
+      }
+    }
+
+    private static string MapnoteIdentity(AreaMapNote note) {
+      if (note == null) return String.Empty;
+      if (!String.IsNullOrWhiteSpace(note.Id)) return "id:" + note.Id.Trim();
+      return String.Format(CultureInfo.InvariantCulture, "{0}|{1:0.#####}|{2:0.#####}|{3:0.#####}", note.Fqn ?? String.Empty, note.Position.X, note.Position.Y, note.Position.Z);
+    }
+
+    private static List<AreaMapNote> ParseMapnoteXml(string text) {
+      var result = new List<AreaMapNote>();
+      if (String.IsNullOrWhiteSpace(text)) return result;
+
+      foreach (string candidate in MapnoteXmlCandidates(text)) {
+        try {
+          var doc = new XmlDocument { PreserveWhitespace = false };
+          doc.LoadXml(candidate);
+          XmlNodeList valueNodes = doc.SelectNodes("//e[node]");
+          if (valueNodes == null) continue;
+
+          foreach (XmlNode valueNode in valueNodes) {
+            XmlNode keyNode = valueNode.PreviousSibling;
+            while (keyNode != null && keyNode.NodeType != XmlNodeType.Element) keyNode = keyNode.PreviousSibling;
+            if (keyNode == null || !String.Equals(keyNode.Name, "k", StringComparison.OrdinalIgnoreCase)) continue;
+            XmlNode node = valueNode.SelectSingleNode("./node");
+            if (node == null) continue;
+
+            var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (XmlNode field in node.SelectNodes("./f")) {
+              string name = field.Attributes?["name"]?.Value;
+              if (!String.IsNullOrEmpty(name)) fields[name] = field.InnerXml;
+            }
+            AreaMapNote note = BuildMapnote(keyNode.InnerText, fields);
+            if (note != null) result.Add(note);
+          }
+          if (result.Count > 0) return result;
+        } catch (XmlException) { }
+      }
+      return result;
+    }
+
+    private static IEnumerable<string> MapnoteXmlCandidates(string text) {
+      string raw = (text ?? String.Empty).Replace("\0", String.Empty).Trim('\uFEFF', ' ', '\r', '\n', '\t');
+      if (raw.Length == 0) yield break;
+      yield return raw;
+
+      // Some TOR revisions encode the inner XML one extra time. The historical GomLib loader explicitly handled
+      // both &lt; and &amp;lt;, so preserve that compatibility before falling back to the loose stream parser.
+      string decoded = DecodeMapnoteText(DecodeMapnoteText(raw));
+      if (!String.Equals(decoded, raw, StringComparison.Ordinal)) yield return decoded;
+
+      if (raw.Length > 48) {
+        string wrapped = DecodeMapnoteText(raw.Substring(30, raw.Length - 48)).Trim('\uFEFF', ' ', '\r', '\n', '\t');
+        if (wrapped.Length > 0) {
+          yield return wrapped;
+          // A stripped stream can contain several sibling <k>/<e> pairs without one root element.
+          yield return "<mapnotes>" + wrapped + "</mapnotes>";
+        }
+      }
+    }
+
+    private static List<AreaMapNote> ParseMapnoteText(string text) {
+      var result = new List<AreaMapNote>();
+      if (String.IsNullOrWhiteSpace(text)) return result;
+
+      Regex entryRx = new Regex(@"<k\b[^>]*>(?<id>[\s\S]*?)</k>\s*<e\b[^>]*>\s*<node\b[^>]*>(?<node>[\s\S]*?)</node>\s*</e>", RegexOptions.IgnoreCase);
+      foreach (Match entry in entryRx.Matches(text)) {
+        var fields = new Dictionary<string,string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match f in Regex.Matches(entry.Groups["node"].Value, @"<f\b(?<attrs>[^>]*)>(?<value>[\s\S]*?)</f>", RegexOptions.IgnoreCase)) {
+          Match nm = Regex.Match(f.Groups["attrs"].Value, @"\bname\s*=\s*(?:""(?<dq>[^""]*)""|'(?<sq>[^']*)'|(?<bare>[^\s>]+))", RegexOptions.IgnoreCase);
+          string name = nm.Groups["dq"].Success ? nm.Groups["dq"].Value : nm.Groups["sq"].Success ? nm.Groups["sq"].Value : nm.Groups["bare"].Value;
+          if (!String.IsNullOrEmpty(name)) fields[name] = f.Groups["value"].Value;
+        }
+        AreaMapNote note = BuildMapnote(entry.Groups["id"].Value, fields);
+        if (note != null) result.Add(note);
+      }
+      return result;
+    }
+
+    private static AreaMapNote BuildMapnote(string idRaw, Dictionary<string, string> fields) {
+      if (fields == null) return null;
+      string fqnFull = MapnoteTextContent(fields.TryGetValue("mpnTemplateFQN", out string fqnRaw) ? fqnRaw : null);
+      if (String.IsNullOrEmpty(fqnFull) || !TryParseMapnoteVector(fields.TryGetValue("mpnPosition", out string posRaw) ? posRaw : null, out Vector3 pos)) return null;
+
+      // Jedipedia's shipped FQN is normally "\\server\\mpn\\...mpn". Work from that representation directly,
+      // while retaining the old world.* trimming as a fallback for tool-generated fixtures.
+      string fqn = fqnFull.Trim();
+      if (fqn.StartsWith("\\server\\mpn\\", StringComparison.OrdinalIgnoreCase)) {
+        fqn = fqn.Substring("\\server\\mpn\\".Length);
+        if (fqn.EndsWith(".mpn", StringComparison.OrdinalIgnoreCase)) fqn = fqn.Substring(0, fqn.Length - 4);
+      } else if (fqn.Length >= 12 && fqn.StartsWith("world.", StringComparison.OrdinalIgnoreCase)) {
+        fqn = fqn.Substring(8, fqn.Length - 12);
+      }
+      fqn = fqn.Replace('\\', '.').Trim('.');
+
+      var note = new AreaMapNote {
+        Id = MapnoteTextContent(idRaw),
+        Fqn = fqn,
+        Label = fqn.Split('.').LastOrDefault()?.Replace('_', ' ') ?? fqn,
+        Position = pos
+      };
+      if (TryParseMapnoteVector(fields.TryGetValue("mpnRotation", out string rotRaw) ? rotRaw : null, out Vector3 rot)) note.Rotation = rot;
+      if (fields.TryGetValue("mpnMapTags", out string tagsRaw)) {
+        foreach (Match tag in Regex.Matches(tagsRaw, @"<k\b[^>]*>(?<tag>[\s\S]*?)</k>", RegexOptions.IgnoreCase)) {
+          string value = MapnoteTextContent(tag.Groups["tag"].Value);
+          if (!String.IsNullOrEmpty(value)) note.Tags.Add(value);
+        }
+      }
+      if (fields.TryGetValue("ParentMapTag", out string parentRaw)) {
+        foreach (string parent in MapnoteTextContent(parentRaw).Split(',')) {
+          string value = parent.Trim();
+          if (value.Length > 0) note.ParentTags.Add(value);
+        }
+      }
+      return note;
     }
 
     private static string DecodeMapnoteText(string value) => (value ?? string.Empty)
       .Replace("&quot;", "\"").Replace("&#39;", "'").Replace("&apos;", "'").Replace("&gt;", ">").Replace("&lt;", "<").Replace("&amp;", "&");
     private static string MapnoteTextContent(string value) => Regex.Replace(DecodeMapnoteText(value), "<[^>]*>", string.Empty).Trim();
     private static bool TryParseMapnoteVector(string value, out Vector3 result) {
-      result = Vector3.Zero; string text=MapnoteTextContent(value).Trim(); if(text.Length>=2 && ((text[0]=='('&&text[^1]==')')||(text[0]=='['&&text[^1]==']'))) text=text.Substring(1,text.Length-2);
-      string[] parts=text.Split(','); if(parts.Length!=3)return false;
-      if(!float.TryParse(parts[0],NumberStyles.Float,CultureInfo.InvariantCulture,out float x)||!float.TryParse(parts[1],NumberStyles.Float,CultureInfo.InvariantCulture,out float y)||!float.TryParse(parts[2],NumberStyles.Float,CultureInfo.InvariantCulture,out float z))return false;
-      result=new Vector3(x,y,z); return true;
+      result = Vector3.Zero;
+      string text = MapnoteTextContent(value).Trim();
+      if (String.IsNullOrEmpty(text)) return false;
+
+      bool TryVector(string candidate, out Vector3 vector) {
+        vector = Vector3.Zero;
+        string[] parts = candidate.Split(',');
+        if (parts.Length != 3) return false;
+        if (!float.TryParse(parts[0].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float x) ||
+            !float.TryParse(parts[1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float y) ||
+            !float.TryParse(parts[2].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float z)) return false;
+        vector = new Vector3(x, y, z);
+        return true;
+      }
+
+      if (TryVector(text, out result)) return true;
+      if (text.Length >= 2 && TryVector(text.Substring(1, text.Length - 2), out result)) return true;
+
+      // Be tolerant of uncommon wrappers such as Vector3(1,2,3) without accepting arbitrary numbers elsewhere.
+      Match m = Regex.Match(text, @"^[^,(]*\(?\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)\s*,\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)\s*,\s*([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+\-]?\d+)?)\s*\)?[^,]*$", RegexOptions.CultureInvariant);
+      if (m.Success && float.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out float rx) &&
+          float.TryParse(m.Groups[2].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out float ry) &&
+          float.TryParse(m.Groups[3].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out float rz)) {
+        result = new Vector3(rx, ry, rz);
+        return true;
+      }
+      result = Vector3.Zero;
+      return false;
     }
 
     private static float ParseF(string s) => float.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out float v) ? v : 0;

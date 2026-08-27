@@ -44,6 +44,21 @@ namespace SlimDXNet.Camera
             SetLens(newFov, Aspect, NearZ, FarZ);
         }
 
+        /// <summary>
+        /// Install an RH orthographic projection while retaining the reference FOV used by
+        /// viewer LOD/zoom calculations. The FPS camera still owns the view matrix/frustum.
+        /// </summary>
+        public void SetOrthographicLens(float referenceFovY, float aspect, float width, float height, float zn, float zf)
+        {
+            FovY = referenceFovY;
+            Aspect = aspect;
+            NearZ = zn;
+            FarZ = zf;
+            NearWindowHeight = height;
+            FarWindowHeight = height;
+            Proj = Matrix.OrthoRH(width, height, zn, zf);
+        }
+
         public override void UpdateViewMatrix()
         {
             var r = Right;

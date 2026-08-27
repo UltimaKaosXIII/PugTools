@@ -118,30 +118,41 @@ namespace TorArchive {
     }
 
     public Stream OpenCopyInMemory() {
-      using Stream fs = Open();
+      Stream fs = Open();
 
       if (FileInfo.UncompressedSize > Int32.MaxValue) {
+        fs.Dispose();
         throw new InvalidDataException(
           $"File {FileInfo.FileId:X16} is too large for an in-memory stream: {FileInfo.UncompressedSize} bytes."
         );
       }
 
-      Byte[] buffer = new Byte[(Int32)FileInfo.UncompressedSize];
-      Int32 totalRead = 0;
-
-      while (totalRead < buffer.Length) {
-        Int32 read = fs.Read(buffer, totalRead, buffer.Length - totalRead);
-        if (read <= 0) break;
-        totalRead += read;
+      // Zstd entries are already fully decompressed into a MemoryStream by OpenZstd(). The old implementation
+      // copied that complete stream into a second equally large byte[] here, briefly doubling RAM and memory
+      // bandwidth for every GR2/texture loaded from current 64-bit SWTOR archives. Transfer ownership of the
+      // already-independent MemoryStream directly to the caller instead.
+      if (fs is MemoryStream memory && memory.Position == 0 && memory.Length == (Int64)FileInfo.UncompressedSize) {
+        return memory;
       }
 
-      if (totalRead != buffer.Length) {
-        throw new EndOfStreamException(
-          $"TOR entry {FileInfo.FileId:X16} was truncated: read {totalRead} of {buffer.Length} bytes."
-        );
-      }
+      using (fs) {
+        Byte[] buffer = new Byte[(Int32)FileInfo.UncompressedSize];
+        Int32 totalRead = 0;
 
-      return new MemoryStream(buffer, writable: false) { Position = 0 };
+        while (totalRead < buffer.Length) {
+          Int32 read = fs.Read(buffer, totalRead, buffer.Length - totalRead);
+          if (read <= 0) break;
+          totalRead += read;
+        }
+
+        if (totalRead != buffer.Length) {
+          throw new EndOfStreamException(
+            $"TOR entry {FileInfo.FileId:X16} was truncated: read {totalRead} of {buffer.Length} bytes."
+          );
+        }
+
+        return new MemoryStream(buffer, writable: false) { Position = 0 };
+      }
     }
 
     public Byte[] PeakBytes(Int32 bytes) {

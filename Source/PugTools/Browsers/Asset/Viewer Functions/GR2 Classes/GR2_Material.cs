@@ -68,6 +68,7 @@ namespace FileFormats {
     // Volume texture used by SWTOR water materials. ShaderResourceView.FromStream also handles volume DDS files.
     public String waterSurfaceDDS;
     public ShaderResourceView waterSurfaceSRV;
+    private Int32 textureFirstMipLevel;
     // private Boolean useReflection;
     // private String visibility;
 
@@ -84,32 +85,82 @@ namespace FileFormats {
 
     private static void FileToShaderResource(ref Device device,
                                              File file,
-                                             ref ShaderResourceView srv) {
+                                             ref ShaderResourceView srv,
+                                             Int32 firstMipLevel = 0) {
 
       if (file != null && device != null) {
-        /*
         using Stream textureStream = file.OpenCopyInMemory();
-        using MemoryStream textureMS = new MemoryStream();
-        textureStream.CopyTo(textureMS);
-        srv = ShaderResourceView.FromMemory(device, textureMS.ToArray());
-        */
-
-        using Stream textureStream = file.OpenCopyInMemory();
-        srv = ShaderResourceView.FromStream(device, textureStream, (Int32)textureStream.Length);
-
+        Int32 mip = ClampDdsFirstMipLevel(textureStream, firstMipLevel);
+        if (mip > 0) {
+          ImageLoadInformation loadInfo = ImageLoadInformation.FromDefaults();
+          loadInfo.FirstMipLevel = mip;
+          srv = ShaderResourceView.FromStream(device, textureStream, (Int32)textureStream.Length, loadInfo);
+        } else {
+          srv = ShaderResourceView.FromStream(device, textureStream, (Int32)textureStream.Length);
+        }
       } else {
         return;
       }
     }
 
+    // D3DX maps FirstMipLevel to level 0 in the created resource. Clamp the requested skip to the
+    // mip count stored in the DDS header so tiny/single-level utility textures still load normally.
+    private static Int32 ClampDdsFirstMipLevel(Stream stream, Int32 requested) {
+      if (requested <= 0 || stream == null || !stream.CanSeek) return 0;
+      Int64 oldPosition = stream.Position;
+      try {
+        if (stream.Length < 32) return 0;
+        Byte[] header = new Byte[32];
+        stream.Position = 0;
+        Int32 read = stream.Read(header, 0, header.Length);
+        if (read < header.Length || BitConverter.ToUInt32(header, 0) != 0x20534444) return 0;
+        UInt32 mipCount = BitConverter.ToUInt32(header, 28);
+        if (mipCount == 0) mipCount = 1;
+        return Math.Min(requested, Math.Max(0, (Int32)mipCount - 1));
+      } catch {
+        return 0;
+      } finally {
+        try { stream.Position = oldPosition; } catch { }
+      }
+    }
+
     private static void FileToShaderResource(ref Device device,
                                              String resourcePath,
-                                             ref ShaderResourceView srv) {
+                                             ref ShaderResourceView srv,
+                                             Int32 firstMipLevel = 0) {
 
+      if (device == null || String.IsNullOrWhiteSpace(resourcePath)) return;
       Assets curAssets = AssetHandler.Instance.GetCurrentAssets();
+      if (curAssets == null) return;
       using File file = curAssets.FindFile(resourcePath);
 
-      FileToShaderResource(ref device, file, ref srv);
+      FileToShaderResource(ref device, file, ref srv, firstMipLevel);
+    }
+
+    private static void EnsureTextureResource(ref Device device, String resourcePath, ref ShaderResourceView srv, Int32 firstMipLevel) {
+      if (srv != null || device == null || String.IsNullOrWhiteSpace(resourcePath)) return;
+      FileToShaderResource(ref device, resourcePath, ref srv, firstMipLevel);
+    }
+
+    /// <summary>
+    /// Recreates texture SRVs from paths already parsed from the MAT. Several PugTools viewers parse MAT metadata
+    /// with a null D3D device; that correctly fills the material fields but intentionally cannot create GPU textures.
+    /// The world viewer is streamed/lazy now, so a simple "parsed" check must not treat those metadata-only materials
+    /// as GPU-ready. This method is intentionally idempotent and also repairs SRVs evicted by the world LRU.
+    /// </summary>
+    public void EnsureTextureResources(Device device, Int32 firstMipLevel = 0) {
+      if (device == null) return;
+      textureFirstMipLevel = Math.Max(0, firstMipLevel);
+      EnsureTextureResource(ref device, diffuseDDS, ref diffuseSRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, diffuse2DDS, ref diffuse2SRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, rotationDDS, ref rotationSRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, glossDDS, ref glossSRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, paletteDDS, ref paletteSRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, paletteMaskDDS, ref paletteMaskSRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, ageDDS, ref ageSRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, complexionDDS, ref complexionSRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, facepaintDDS, ref facepaintSRV, textureFirstMipLevel);
+      EnsureTextureResource(ref device, waterSurfaceDDS, ref waterSurfaceSRV, textureFirstMipLevel);
     }
 
     /// <summary>
@@ -171,7 +222,8 @@ namespace FileFormats {
       XmlNode inputNode,
       ref String ddsPath,
       ref ShaderResourceView srv,
-      Boolean useBlueFallback = false
+      Boolean useBlueFallback = false,
+      Int32 firstMipLevel = 0
     ) {
       String authoredValue = inputNode?["value"]?.InnerText;
       String variable = inputNode?["variable"]?.InnerText;
@@ -181,7 +233,7 @@ namespace FileFormats {
         using File file = assets?.FindFile(resolved);
         if (file != null) {
           ddsPath = resolved;
-          FileToShaderResource(ref device, file, ref srv);
+          FileToShaderResource(ref device, file, ref srv, firstMipLevel);
           return;
         }
       }
@@ -189,7 +241,7 @@ namespace FileFormats {
       ddsPath = resolved;
       if (useBlueFallback) {
         ddsPath = "/resources/art/defaultassets/blue.dds";
-        FileToShaderResource(ref device, ddsPath, ref srv);
+        FileToShaderResource(ref device, ddsPath, ref srv, firstMipLevel);
       }
     }
 
@@ -221,7 +273,8 @@ namespace FileFormats {
       return fallback;
     }
 
-    public void ParseMAT(Device device, List<GR2_Material> parentMaterials = null) {
+    public void ParseMAT(Device device, List<GR2_Material> parentMaterials = null, Int32 firstMipLevel = 0) {
+      textureFirstMipLevel = Math.Max(0, firstMipLevel);
       String materialFileName = "/resources/art/shaders/materials/" + (String.IsNullOrWhiteSpace(sourceMaterialName) ? materialName : sourceMaterialName) + ".mat";
       Assets currentAssets = AssetHandler.Instance.GetCurrentAssets();
 
@@ -326,27 +379,22 @@ namespace FileFormats {
 
           if (semantic.Equals("DiffuseMap", StringComparison.OrdinalIgnoreCase)) {
             LoadMaterialTexture(
-              ref device, currentAssets, node, ref diffuseDDS, ref diffuseSRV, true
-            );
-          } else if (semantic.Equals("TerrainMap0", StringComparison.OrdinalIgnoreCase) && diffuseSRV == null) {
-            // Grass/DynamicDetail MATs in some builds use TerrainMap0 as their authored sheet.
-            LoadMaterialTexture(
-              ref device, currentAssets, node, ref diffuseDDS, ref diffuseSRV, true
+              ref device, currentAssets, node, ref diffuseDDS, ref diffuseSRV, true, firstMipLevel
             );
           } else if (semantic.Equals("DiffuseMap2", StringComparison.OrdinalIgnoreCase)) {
             // TerrainAntiTile uses this as both selector noise and distant macro albedo.
             // Do not bind a fake fallback here: the shader deliberately takes a seam-free
             // single-sample path when the material has no real DiffuseMap2.
             LoadMaterialTexture(
-              ref device, currentAssets, node, ref diffuse2DDS, ref diffuse2SRV
+              ref device, currentAssets, node, ref diffuse2DDS, ref diffuse2SRV, false, firstMipLevel
             );
           } else if (semantic.Equals("RotationMap1", StringComparison.OrdinalIgnoreCase) || semantic.Equals("RotationMap", StringComparison.OrdinalIgnoreCase)) {
             LoadMaterialTexture(
-              ref device, currentAssets, node, ref rotationDDS, ref rotationSRV
+              ref device, currentAssets, node, ref rotationDDS, ref rotationSRV, false, firstMipLevel
             );
           } else if (semantic.Equals("GlossMap", StringComparison.OrdinalIgnoreCase)) {
             LoadMaterialTexture(
-              ref device, currentAssets, node, ref glossDDS, ref glossSRV
+              ref device, currentAssets, node, ref glossDDS, ref glossSRV, false, firstMipLevel
             );
           } else if (semantic.Equals("UsesEmissive", StringComparison.OrdinalIgnoreCase)) {
             Boolean.TryParse(inputValue, out useEmissive);
@@ -365,7 +413,7 @@ namespace FileFormats {
             try { vegetationParams2 = FileHelpers.StringToVec4(inputValue); } catch { vegetationParams2 = new Vector4(1f,1f,1f,0f); }
           } else if (semantic.Equals("WaterSurfaceMap", StringComparison.OrdinalIgnoreCase)) {
             LoadMaterialTexture(
-              ref device, currentAssets, node, ref waterSurfaceDDS, ref waterSurfaceSRV
+              ref device, currentAssets, node, ref waterSurfaceDDS, ref waterSurfaceSRV, false, firstMipLevel
             );
           }
 
@@ -374,11 +422,11 @@ namespace FileFormats {
 
             if (semantic == "PaletteMap") {
               LoadMaterialTexture(
-                ref device, currentAssets, node, ref paletteDDS, ref paletteSRV
+                ref device, currentAssets, node, ref paletteDDS, ref paletteSRV, false, firstMipLevel
               );
             } else if (semantic == "PaletteMaskMap") {
               LoadMaterialTexture(
-                ref device, currentAssets, node, ref paletteMaskDDS, ref paletteMaskSRV
+                ref device, currentAssets, node, ref paletteMaskDDS, ref paletteMaskSRV, false, firstMipLevel
               );
             } else if (semantic == "palette1") {
               if (palette1 == new Vector4())
@@ -400,15 +448,15 @@ namespace FileFormats {
           if (derived.Equals("SkinB", StringComparison.OrdinalIgnoreCase)) {
             if (semantic == "ComplexionMap") {
               LoadMaterialTexture(
-                ref device, currentAssets, node, ref complexionDDS, ref complexionSRV
+                ref device, currentAssets, node, ref complexionDDS, ref complexionSRV, false, firstMipLevel
               );
             } else if (semantic == "FacepaintMap") {
               LoadMaterialTexture(
-                ref device, currentAssets, node, ref facepaintDDS, ref facepaintSRV
+                ref device, currentAssets, node, ref facepaintDDS, ref facepaintSRV, false, firstMipLevel
               );
             } else if (semantic == "AgeMap") {
               LoadMaterialTexture(
-                ref device, currentAssets, node, ref ageDDS, ref ageSRV
+                ref device, currentAssets, node, ref ageDDS, ref ageSRV, false, firstMipLevel
               );
             } else if (semantic == "FlushTone") {
               if (flushTone == new Vector4())
@@ -444,7 +492,7 @@ namespace FileFormats {
         }
       } else {
         diffuseDDS = "/resources/art/defaultassets/blue.dds";
-        FileToShaderResource(ref device, diffuseDDS, ref diffuseSRV);
+        FileToShaderResource(ref device, diffuseDDS, ref diffuseSRV, firstMipLevel);
       }
 
       parsed = true;
@@ -452,7 +500,7 @@ namespace FileFormats {
 
     public void SetComplexionMap(Device device, String complexionPath) {
       complexionDDS = "/resources" + complexionPath;
-      FileToShaderResource(ref device, complexionDDS, ref complexionSRV);
+      FileToShaderResource(ref device, complexionDDS, ref complexionSRV, textureFirstMipLevel);
     }
 
     public void SetDynamicColor(GomObject dynObj, Int32 paletteNum = 0) {
@@ -498,7 +546,7 @@ namespace FileFormats {
 
     public void SetFacepaintMap(Device device, String facepaintPath) {
       facepaintDDS = "/resources" + facepaintPath;
-      FileToShaderResource(ref device, facepaintDDS, ref facepaintSRV);
+      FileToShaderResource(ref device, facepaintDDS, ref facepaintSRV, textureFirstMipLevel);
     }
   }
 }

@@ -40,6 +40,7 @@
 		<Content Include="Hash\hashes_filename.bin.gz" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Shaders\GR2.fx" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Shaders\World.fx" CopyToOutputDirectory="PreserveNewest" />
+		<Content Include="Resources\WorldMapIcons\*.png" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\packed_codebooks_aoTuV_603.bin" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\revorb.exe" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\ww2ogg.exe" CopyToOutputDirectory="PreserveNewest" />
@@ -117,6 +118,12 @@
 		<MakeDir Condition="!Exists('$(BinDir)Shaders')" Directories="$(BinDir)Shaders" />
 		<Copy SourceFiles="$(ProjectDir)Shaders\GR2.fx" DestinationFolder="$(BinDir)Shaders" />
 		<Copy SourceFiles="$(ProjectDir)Shaders\World.fx" DestinationFolder="$(BinDir)Shaders" />
+
+		<MakeDir Condition="!Exists('$(BinDir)Resources\WorldMapIcons')" Directories="$(BinDir)Resources\WorldMapIcons" />
+		<ItemGroup>
+			<WorldMapIcons Include="$(ProjectDir)Resources\WorldMapIcons\*.png" />
+		</ItemGroup>
+		<Copy SourceFiles="@(WorldMapIcons)" DestinationFolder="$(BinDir)Resources\WorldMapIcons" SkipUnchangedFiles="true" />
 
 		<Copy SourceFiles="$(ProjectDir)WorldAreaNames.xml" DestinationFolder="$(BinDir)" SkipUnchangedFiles="true" />
 

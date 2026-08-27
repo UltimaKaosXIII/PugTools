@@ -617,20 +617,18 @@ namespace PugTools {
       return obj;
     }
     public static Boolean PathContainsLiveAssets(String path) {
-      if (!Directory.Exists(path)) return false;
+      String assetsPath = TorArchive.Assets.GetAssetsDirectory(path);
+      if (!Directory.Exists(assetsPath)) return false;
 
-      String[] fileList = Directory.GetFiles(path, "swtor_main*.tor");
-
-      if (fileList.Length > 0) return true;
-      else return false;
+      String[] fileList = Directory.GetFiles(assetsPath, "swtor_main*.tor");
+      return fileList.Length > 0;
     }
     public static Boolean PathContainsPTSAssets(String path) {
-      if (!Directory.Exists(path)) return false;
+      String assetsPath = TorArchive.Assets.GetAssetsDirectory(path);
+      if (!Directory.Exists(assetsPath)) return false;
 
-      String[] fileList = Directory.GetFiles(path, "swtor_test*.tor");
-
-      if (fileList.Length > 0) return true;
-      else return false;
+      String[] fileList = Directory.GetFiles(assetsPath, "swtor_test*.tor");
+      return fileList.Length > 0;
     }
     public static String PrepExtractPath(String filename) {
       String subPath = "";

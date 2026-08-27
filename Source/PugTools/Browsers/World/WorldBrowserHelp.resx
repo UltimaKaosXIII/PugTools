@@ -118,23 +118,37 @@
     <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
   </resheader>
   <data name="txtHelp.Text" xml:space="preserve">
-    <value>FPS Camera
+    <value>World Browser controls
 
-F- Activate FPS Camera
-W - Move Forward
-A - Move Left
-S - Move Backward
-D - Move Right
-Minus Key - Set Slow Movement Speed
-Plus Key - Set Fast Movement SPeed
-Shift + Key - Extremely Slow Movement
-PgUp - Zoom In
-PgDown - Zoom Out
-R - Reset Camera
+Free-fly camera
+W / S - Move forward / backward
+Q / E - Strafe left / right
+A / D or J / L - Turn left / right
+I / K - Look up / down
+Space - Move up
+Shift - Sprint (10x)
+Alt + Shift - Sprint hugely (100x)
+Left or right drag - Rotate camera
+Mouse wheel - Change camera speed
+R - Reset camera
+Ctrl + E - Teleport to SWTOR/Jedipedia coordinates
 
-Misc Functions
+Orthographic projection
+W / S - Move forward / backward along the ground
+Q / E - Strafe left / right
+A / D or J / L - Turn left / right
+I / K - Tilt / look
+Right drag - Pan
+Mouse wheel - Zoom and control cutaway height
 
-C - Show Wireframe Mode
-PrtScreen - Take a Screen Shot</value>
+Map and interface
+M - Open / close full map
+Shift + M - Toggle minimap
+Ctrl + F - Find mapnote
+Ctrl + Click - Select world object
+Ctrl + Right-click - Clear selection
+Ctrl + Shift + F - Toggle FPS / occlusion statistics
+Alt + Z or Alt + Y - Hide / show viewer interface
+PrtScreen - Take a screenshot</value>
   </data>
 </root>

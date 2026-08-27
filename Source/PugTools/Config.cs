@@ -47,17 +47,25 @@ namespace PugTools {
       set => _prevAssetsUsePTS = value;
     }
 
-    private static readonly List<String> liveAssetsPaths = new List<String> {
-      "C:\\Program Files (x86)\\EA\\BioWare\\Star Wars - The Old Republic\\Assets\\",
-      "C:\\Program Files (x86)\\Electronic Arts\\BioWare\\Star Wars - The Old Republic\\Assets\\",
-      "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Star Wars - The Old Republic\\Assets\\"
+    private static readonly List<String> liveGamePaths = new List<String> {
+      "C:\\Program Files (x86)\\EA\\BioWare\\Star Wars - The Old Republic\\",
+      "C:\\Program Files (x86)\\Electronic Arts\\BioWare\\Star Wars - The Old Republic\\",
+      "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Star Wars - The Old Republic\\"
     };
 
-    private static readonly List<String> ptsAssetsPaths = new List<String> {
-      "C:\\Program Files (x86)\\EA\\BioWare\\Star Wars - The Old Republic\\Assets\\",
-      "C:\\Program Files (x86)\\Electronic Arts\\BioWare\\Star Wars - The Old Republic\\Assets\\",
-      "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Star Wars - The Old Republic - PTS\\Assets\\"
+    private static readonly List<String> ptsGamePaths = new List<String> {
+      "C:\\Program Files (x86)\\EA\\BioWare\\Star Wars - The Old Republic\\",
+      "C:\\Program Files (x86)\\Electronic Arts\\BioWare\\Star Wars - The Old Republic\\",
+      "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Star Wars - The Old Republic - PTS\\"
     };
+
+    private static String NormalizeGamePath(String path) {
+      if (String.IsNullOrWhiteSpace(path)) return String.Empty;
+
+      String normalized = TorArchive.Assets.NormalizeGamePath(path);
+      if (String.IsNullOrEmpty(normalized)) return String.Empty;
+      return normalized.EndsWith("\\") ? normalized : normalized + "\\";
+    }
 
     public static void Load() {
       // Path to the asset files
@@ -65,11 +73,11 @@ namespace PugTools {
 
       if (str != null)
         // Load from config, if directory exists
-        if (Directory.Exists(str)) AssetsPath = str;
+        if (Directory.Exists(str)) AssetsPath = NormalizeGamePath(str);
         // Otherwise check some default directories
-        else if (Directory.Exists(liveAssetsPaths[0])) AssetsPath = liveAssetsPaths[0];
-        else if (Directory.Exists(liveAssetsPaths[1])) AssetsPath = liveAssetsPaths[1];
-        else if (Directory.Exists(liveAssetsPaths[2])) AssetsPath = liveAssetsPaths[2];
+        else if (Directory.Exists(liveGamePaths[0])) AssetsPath = NormalizeGamePath(liveGamePaths[0]);
+        else if (Directory.Exists(liveGamePaths[1])) AssetsPath = NormalizeGamePath(liveGamePaths[1]);
+        else if (Directory.Exists(liveGamePaths[2])) AssetsPath = NormalizeGamePath(liveGamePaths[2]);
         else AssetsPath = String.Empty;
 
       // Load PTS assets if checked
@@ -81,12 +89,12 @@ namespace PugTools {
 
       if (str != null)
         // Load from config, if directory exists
-        if (Directory.Exists(str)) PrevAssetsPath = str;
+        if (Directory.Exists(str)) PrevAssetsPath = NormalizeGamePath(str);
         //otherwise check some default directories
-        else if (Directory.Exists(ptsAssetsPaths[0])) PrevAssetsPath = ptsAssetsPaths[0];
-        else if (Directory.Exists(ptsAssetsPaths[1])) PrevAssetsPath = ptsAssetsPaths[1];
-        else if (Directory.Exists(ptsAssetsPaths[2])) PrevAssetsPath = ptsAssetsPaths[2];
-        else PrevAssetsPath = str;
+        else if (Directory.Exists(ptsGamePaths[0])) PrevAssetsPath = NormalizeGamePath(ptsGamePaths[0]);
+        else if (Directory.Exists(ptsGamePaths[1])) PrevAssetsPath = NormalizeGamePath(ptsGamePaths[1]);
+        else if (Directory.Exists(ptsGamePaths[2])) PrevAssetsPath = NormalizeGamePath(ptsGamePaths[2]);
+        else PrevAssetsPath = NormalizeGamePath(str);
 
       // Load PTS assets if checked
       str = ConfigFile.AppSettings.Settings["PrevAssetsUsePTS"].Value;

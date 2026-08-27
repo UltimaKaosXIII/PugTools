@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -17,8 +17,8 @@ namespace GomLib.Models {
     public long HuntingRadius { get; set; }
     public long BonusHuntingRadius { get; set; }
     public MapLink MapLink { get; set; }
-    //public long WonkaPackageId { get; set; }
-    //public long WonkaDestinationId { get; set; }
+    public long WonkaPackageId { get; set; }
+    public ulong WonkaDestinationId { get; set; }
     public long AssetID { get; internal set; }
     public DetailedFaction Faction { get; internal set; }
 
@@ -27,15 +27,15 @@ namespace GomLib.Models {
     // public Placeable Placeable { get; set; }
 
     public override int GetHashCode() {
-      int result = Name.GetHashCode();
-      result ^= Icon.GetHashCode();
+      int result = Name?.GetHashCode() ?? 0;
+      result ^= Icon?.GetHashCode() ?? 0;
       result ^= Condition.GetHashCode();
       result ^= HuntingRadius.GetHashCode();
       result ^= BonusHuntingRadius.GetHashCode();
       if (MapLink != null)
         result ^= MapLink.GetHashCode();
-      //result ^= WonkaPackageId.GetHashCode();
-      //result ^= WonkaDestinationId.GetHashCode();
+      result ^= WonkaPackageId.GetHashCode();
+      result ^= WonkaDestinationId.GetHashCode();
       if (Faction != null)
         result ^= Faction.GetHashCode();
       return result;
@@ -72,6 +72,10 @@ namespace GomLib.Models {
       if (HuntingRadius != itm.HuntingRadius)
         return false;
       if (BonusHuntingRadius != itm.BonusHuntingRadius)
+        return false;
+      if (WonkaPackageId != itm.WonkaPackageId)
+        return false;
+      if (WonkaDestinationId != itm.WonkaDestinationId)
         return false;
       if (AssetID != itm.AssetID)
         return false;

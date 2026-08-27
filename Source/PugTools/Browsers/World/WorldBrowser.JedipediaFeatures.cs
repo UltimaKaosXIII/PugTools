@@ -115,11 +115,12 @@ namespace PugTools {
 
       var appearanceCache = new Dictionary<string, List<GR2>>(StringComparer.OrdinalIgnoreCase);
       var npcCache = new Dictionary<string, Npc>(StringComparer.OrdinalIgnoreCase);
-      var spawnerCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+      var spawnerCache = new Dictionary<string, SpawnerPreviewInfo>(StringComparer.OrdinalIgnoreCase);
       var spnModelCache = new Dictionary<string, List<GR2>>(StringComparer.OrdinalIgnoreCase);
       var spnAnimationCache = new Dictionary<string, WorldNpcAnimationClip>(StringComparer.OrdinalIgnoreCase);
+      var spnDynCache = new Dictionary<string, SpnDynPreviewTemplate>(StringComparer.OrdinalIgnoreCase);
       var animationCache = new Dictionary<string, WorldNpcAnimationClip>(StringComparer.OrdinalIgnoreCase);
-      var firstSpawnPointByParent = BuildFirstSpawnPointIndex();
+      var spawnPointsByParent = BuildSpawnPointIndex();
       var speciesScales = LoadNpcSpeciesScales();
       int failures = 0;
 
@@ -136,26 +137,62 @@ namespace PugTools {
             if (!ext.StartsWith("spn_", StringComparison.OrdinalIgnoreCase)) continue;
             string spnFqn = ResolveSpawnerFqn(asset, instance);
             if (String.IsNullOrWhiteSpace(spnFqn)) continue;
-            if (!spawnerCache.TryGetValue(spnFqn, out string entityFqn)) {
-              entityFqn = ResolveSpawnerEntityFqn(spnFqn);
-              spawnerCache[spnFqn] = entityFqn ?? String.Empty;
+            if (!spawnerCache.TryGetValue(spnFqn, out SpawnerPreviewInfo spawnerInfo)) {
+              spawnerInfo = ResolveSpawnerPreviewInfo(spnFqn);
+              spawnerCache[spnFqn] = spawnerInfo ?? new SpawnerPreviewInfo();
             }
-            if (String.IsNullOrWhiteSpace(entityFqn)) continue;
-            Room renderRoom = room;
-            AssetInstance renderInstance = instance;
-            if (firstSpawnPointByParent.TryGetValue(instance.ID, out var spawnPoint)) { renderRoom = spawnPoint.Room; renderInstance = spawnPoint.Instance; }
-
-            if (entityFqn.StartsWith("npc.", StringComparison.OrdinalIgnoreCase)) {
-              if (!npcCache.TryGetValue(entityFqn, out Npc npc)) {
-                npc = currentDom.NpcLoader.Load(entityFqn);
-                npcCache[entityFqn] = npc;
+            List<string> entityFqns = spawnerInfo?.EntityFqns;
+            if (entityFqns == null || entityFqns.Count == 0) continue;
+            string idleAnimation = SpawnerIdleAnimationName(instance);
+            // Build first, then compress the variant slots. Jedipedia skips an alternative that fails to resolve;
+            // keeping its original index would otherwise create a blank two-second slot in our preview.
+            var builtVariants = new List<object>();
+            foreach (string entityFqn in entityFqns) {
+              if (String.IsNullOrWhiteSpace(entityFqn)) continue;
+              try {
+                if (entityFqn.StartsWith("npc.", StringComparison.OrdinalIgnoreCase)) {
+                  if (!npcCache.TryGetValue(entityFqn, out Npc npc)) {
+                    npc = currentDom.NpcLoader.Load(entityFqn);
+                    npcCache[entityFqn] = npc;
+                  }
+                  WorldNpcPlacement spnPlacement = BuildNpcPlacement(room, instance, entityFqn, npc, appearanceCache, speciesScales, idleAnimation, animationCache);
+                  if (spnPlacement != null) {
+                    // Jedipedia only resolves pth.* ride routes for placeables. Applying the spawner's path to an NPC
+                    // turns platform/elevator metadata into character locomotion and can make a creature race back and
+                    // forth at absurd speed. NPC dispensers still use authored spn_pt spawn points, but never pth.*.
+                    if (spawnPointsByParent.TryGetValue(instance.ID, out var npcSpawnPoints))
+                      foreach (var point in npcSpawnPoints) spnPlacement.SpawnPoints.Add(BuildSpawnPointPose(point.Room, point.Instance));
+                    builtVariants.Add(spnPlacement);
+                  }
+                } else if (entityFqn.StartsWith("plc.", StringComparison.OrdinalIgnoreCase)) {
+                  WorldSpnPlacement spnObject = BuildSpnPlaceablePlacement(room, instance, entityFqn, spnModelCache, spnAnimationCache, spnDynCache);
+                  if (spnObject != null) {
+                    spnObject.PathFqn = spawnerInfo?.PathFqn;
+                    spnObject.TraversalStyle = spawnerInfo?.TraversalStyle ?? 1;
+                    spnObject.Route = ResolveSpnAreaPath(spnObject.PathFqn, room, instance);
+                    if (spnObject.Route == null && spawnPointsByParent.TryGetValue(instance.ID, out var objectSpawnPoints))
+                      foreach (var point in objectSpawnPoints) spnObject.SpawnPoints.Add(BuildSpawnPointPose(point.Room, point.Instance));
+                    builtVariants.Add(spnObject);
+                  }
+                }
+              } catch (Exception variantError) {
+                // An invalid alternative does not invalidate the dispenser. Jedipedia skips that slot and keeps the
+                // alternatives that did resolve, so do the same here before compressing VariantIndex/VariantCount.
+                System.Diagnostics.Debug.WriteLine("Spawner alternative failed (" + entityFqn + "): " + variantError.Message);
               }
-              string idleAnimation = SpawnerIdleAnimationName(instance);
-              WorldNpcPlacement spnPlacement = BuildNpcPlacement(renderRoom, renderInstance, entityFqn, npc, appearanceCache, speciesScales, idleAnimation, animationCache);
-              if (spnPlacement != null) worldNpcPlacements.Add(spnPlacement);
-            } else if (entityFqn.StartsWith("plc.", StringComparison.OrdinalIgnoreCase)) {
-              WorldSpnPlacement spnObject = BuildSpnPlaceablePlacement(renderRoom, renderInstance, entityFqn, spnModelCache, spnAnimationCache);
-              if (spnObject != null) worldSpnPlacements.Add(spnObject);
+            }
+
+            int variantCount = builtVariants.Count;
+            for (int variantIndex = 0; variantIndex < builtVariants.Count; variantIndex++) {
+              if (builtVariants[variantIndex] is WorldNpcPlacement npcVariant) {
+                npcVariant.VariantIndex = variantIndex;
+                npcVariant.VariantCount = Math.Max(1, variantCount);
+                worldNpcPlacements.Add(npcVariant);
+              } else if (builtVariants[variantIndex] is WorldSpnPlacement spnVariant) {
+                spnVariant.VariantIndex = variantIndex;
+                spnVariant.VariantCount = Math.Max(1, variantCount);
+                worldSpnPlacements.Add(spnVariant);
+              }
             }
           } catch (Exception ex) {
             failures++;
@@ -166,19 +203,38 @@ namespace PugTools {
       System.Diagnostics.Debug.WriteLine("World spawn preview: " + worldNpcPlacements.Count + " NPCs, " + worldSpnPlacements.Count + " placeables, " + failures + " failures");
     }
 
-    private Dictionary<ulong, (Room Room, AssetInstance Instance)> BuildFirstSpawnPointIndex() {
-      var result = new Dictionary<ulong, (Room Room, AssetInstance Instance)>();
+    private Dictionary<ulong, List<(Room Room, AssetInstance Instance)>> BuildSpawnPointIndex() {
+      var result = new Dictionary<ulong, List<(Room Room, AssetInstance Instance)>>();
       if (area == null) return result;
       foreach (Room room in area.RoomList) {
         foreach (AssetInstance instance in room.InstancesById.Values) {
           if (instance == null || instance.parentInstance == 0 || !area.AssetIdMap.TryGetValue(instance.assetID, out AreaAsset asset) || asset == null) continue;
           if (!String.Equals((asset.Extension ?? String.Empty).Trim(), "spn_pt", StringComparison.OrdinalIgnoreCase)) continue;
-          if (!result.ContainsKey(instance.parentInstance)) result[instance.parentInstance] = (room, instance);
+          if (!result.TryGetValue(instance.parentInstance, out var list)) result[instance.parentInstance] = list = new List<(Room Room, AssetInstance Instance)>();
+          list.Add((room, instance));
         }
       }
+      // Room dictionaries are normally insertion ordered, but IDs give the dispenser a stable authored ordering on
+      // runtimes where dictionary enumeration differs.
+      foreach (var list in result.Values) list.Sort((a, b) => a.Instance.ID.CompareTo(b.Instance.ID));
       return result;
     }
 
+
+    private static WorldSpawnPointPose BuildSpawnPointPose(Room room, AssetInstance point) {
+      if (point == null) return new WorldSpawnPointPose();
+      Matrix absolute = point.GetAbsoluteTransform(room);
+      float rx = point.rotation.X * (float)Math.PI / 180f;
+      float ry = point.rotation.Y * (float)Math.PI / 180f;
+      float rz = point.rotation.Z * (float)Math.PI / 180f;
+      // Row-vector equivalent of Jedipedia's gl-matrix Ry -> Rx -> Rz composition. Point scale is deliberately
+      // excluded: .spn_pt is an editor gizmo normally authored at 0.5 and must never shrink the spawned entity.
+      Matrix rotation = Matrix.RotationZ(rz) * Matrix.RotationX(rx) * Matrix.RotationY(ry);
+      return new WorldSpawnPointPose {
+        Position = new Vector3(absolute.M41, absolute.M42, absolute.M43),
+        Rotation = rotation
+      };
+    }
 
     private Dictionary<ulong, float> LoadNpcSpeciesScales() {
       var result = new Dictionary<ulong, float>();
@@ -218,23 +274,112 @@ namespace PugTools {
       return standalone.StartsWith("spn.", StringComparison.OrdinalIgnoreCase) ? standalone : null;
     }
 
-    private string ResolveSpawnerEntityFqn(string spnFqn) {
+    private sealed class SpawnerPreviewInfo {
+      public readonly List<string> EntityFqns = new List<string>();
+      public string EntityFqn => EntityFqns.Count > 0 ? EntityFqns[0] : null;
+      public string PathFqn;
+      public int TraversalStyle = 1;
+    }
+
+    private SpawnerPreviewInfo ResolveSpawnerPreviewInfo(string spnFqn) {
+      var result = new SpawnerPreviewInfo();
       GomObject spawner = currentDom.GetObject(spnFqn);
-      if (spawner == null) return null;
+      if (spawner == null) return result;
+
       var list = spawner.Data.ValueOrDefault<List<object>>("spnEntityList", null);
-      if (list == null) return null;
+      if (list == null) return result;
+      bool firstResolvedRow = true;
+      var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
       foreach (object entry in list) {
         if (entry is not GomObjectData row) continue;
         object entityReference = row.ValueOrDefault<object>("spnEntityFqn", null) ?? row.ValueOrDefault<object>("spnEntityId", null);
-        if (entityReference == null) continue;
-        if (entityReference is string text && !String.IsNullOrWhiteSpace(text)) return text.Trim();
-        try {
-          if (!TryUnsignedGomId(entityReference, out ulong id)) continue;
-          GomObject entity = currentDom.GetObject(id);
-          if (entity != null) return entity.Name;
-        } catch { }
+        string resolved = ResolveGomReferenceName(entityReference);
+        if (String.IsNullOrWhiteSpace(resolved)) continue;
+        if (seen.Add(resolved)) result.EntityFqns.Add(resolved);
+
+        // spnEntityList is alternatives rather than a group. Jedipedia uses the FIRST readable row for the route,
+        // even while it cycles every distinct entity in the list. Weighted duplicate rows are deduplicated above.
+        if (firstResolvedRow) {
+          firstResolvedRow = false;
+          var paths = row.ValueOrDefault<List<object>>("spnPathList", null);
+          if (paths != null) foreach (object pathReference in paths) {
+            string path = ResolveGomReferenceName(pathReference);
+            if (String.IsNullOrWhiteSpace(path) || path.StartsWith("pth.generic.", StringComparison.OrdinalIgnoreCase)) continue;
+            result.PathFqn = path;
+            result.TraversalStyle = ResolveSpnTraversalStyle(path);
+            break;
+          }
+        }
       }
-      return null;
+      return result;
+    }
+
+    private string ResolveGomReferenceName(object rawValue) {
+      if (rawValue == null) return null;
+      if (rawValue is string text) {
+        string trimmed = text.Trim();
+        if (trimmed.Length == 0) return null;
+        if (!UInt64.TryParse(trimmed, out ulong numericText)) return trimmed;
+        try { return currentDom.GetObject(numericText)?.Name ?? trimmed; } catch { return trimmed; }
+      }
+      try {
+        if (!TryUnsignedGomId(rawValue, out ulong id)) return rawValue.ToString()?.Trim();
+        return currentDom.GetObject(id)?.Name;
+      } catch { return null; }
+    }
+
+    private int ResolveSpnTraversalStyle(string pathFqn) {
+      if (String.IsNullOrWhiteSpace(pathFqn)) return 1;
+      try {
+        GomObject pathNode = currentDom.GetObject(pathFqn);
+        // GomLib stores script-enum payloads as ScriptEnum and deliberately zero-bases ScriptEnum.Value while
+        // decoding them (see DomEnum.ValueString/ScriptEnum). SWTOR's pthTraversalStyle itself is 1-based:
+        // 1 Forward, 2 Reverse, 3 Patrol, 4 Circuit, 5 Random. Treating ScriptEnum as an ordinary integer made
+        // Patrol unreadable and silently fell back to Forward, which is the characteristic "ride one way, snap
+        // back to the start" behaviour seen on elevators.
+        object raw = pathNode?.Data.ValueOrDefault<object>("pthTraversalStyle", null)
+          ?? pathNode?.Data.ValueOrDefault<object>("4611686030387597023", null);
+        if (raw == null) return 1;
+
+        if (raw is ScriptEnum scriptEnum) {
+          int scriptStyle = scriptEnum.Value + 1;
+          if (scriptStyle >= 1 && scriptStyle <= 5) return scriptStyle;
+        }
+
+        try {
+          int numeric = Convert.ToInt32(raw, System.Globalization.CultureInfo.InvariantCulture);
+          if (numeric >= 1 && numeric <= 5) return numeric;
+        } catch { }
+
+        string text = raw.ToString()?.Trim() ?? String.Empty;
+        if (text.IndexOf("backward", StringComparison.OrdinalIgnoreCase) >= 0 || text.IndexOf("reverse", StringComparison.OrdinalIgnoreCase) >= 0) return 2;
+        if (text.IndexOf("patrol", StringComparison.OrdinalIgnoreCase) >= 0) return 3;
+        if (text.IndexOf("circuit", StringComparison.OrdinalIgnoreCase) >= 0) return 4;
+        if (text.IndexOf("random", StringComparison.OrdinalIgnoreCase) >= 0) return 5;
+        if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+            Int32.TryParse(text.Substring(2), System.Globalization.NumberStyles.HexNumber,
+              System.Globalization.CultureInfo.InvariantCulture, out int zeroBasedEnum) && zeroBasedEnum >= 0 && zeroBasedEnum <= 4)
+          return zeroBasedEnum + 1;
+      } catch { }
+      return 1;
+    }
+
+    private AreaPath ResolveSpnAreaPath(string pathFqn, Room room, AssetInstance spawner) {
+      if (String.IsNullOrWhiteSpace(pathFqn) || area?.Paths == null) return null;
+      List<AreaPath> candidates = area.Paths.Where(path => path != null && path.Points != null && path.Points.Count >= 2 &&
+        String.Equals(path.Fqn, pathFqn, StringComparison.OrdinalIgnoreCase)).ToList();
+      if (candidates.Count == 0) return null;
+      if (candidates.Count == 1 || spawner == null || room == null) return candidates[0];
+
+      Matrix spawnerWorld = spawner.GetAbsoluteTransform(room);
+      Vector3 origin = new Vector3(spawnerWorld.M41, spawnerWorld.M42, spawnerWorld.M43);
+      AreaPath best = candidates[0];
+      float bestDistance = (best.Points[0].Position - origin).LengthSquared();
+      for (int i = 1; i < candidates.Count; i++) {
+        float distance = (candidates[i].Points[0].Position - origin).LengthSquared();
+        if (distance < bestDistance) { best = candidates[i]; bestDistance = distance; }
+      }
+      return best;
     }
 
     private static bool TryUnsignedGomId(object rawValue, out ulong id) {
@@ -249,6 +394,13 @@ namespace PugTools {
       if (UInt64.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out id)) return true;
       if (Int64.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out long signed)) { id = unchecked((ulong)signed); return true; }
       return false;
+    }
+
+    private static bool WorldNpcLooksLikeTaxiTerminal(string sourceFqn, string name, string title) {
+      string hint = ((sourceFqn ?? String.Empty) + " " + (name ?? String.Empty) + " " + (title ?? String.Empty)).ToLowerInvariant();
+      return hint.Contains("taxi") || hint.Contains("taxidroid") || hint.Contains("taxi_droid") || hint.Contains("taxi droid") ||
+        hint.Contains("transport_droid") || hint.Contains("transport droid") || hint.Contains("travel_droid") || hint.Contains("travel droid") ||
+        hint.Contains("speeder_droid") || hint.Contains("speeder droid");
     }
 
     private WorldNpcPlacement ResolveClientOnlyNpc(Room room, AssetInstance instance, AreaAsset asset, Dictionary<string, List<GR2>> appearanceCache, Dictionary<string, WorldNpcAnimationClip> animationCache) {
@@ -274,6 +426,7 @@ namespace PugTools {
       }
       var placement = new WorldNpcPlacement {
         Room = room, Instance = instance, SourceFqn = fqn, Name = fqn, Scale = scale, ShowNameplate = false,
+        IsTaxiTerminal = WorldNpcLooksLikeTaxiTerminal(fqn, fqn, null),
         BodyType = bodyType, Animation = ResolveNpcAnimationClip(null, bodyType, animationCache),
         AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, fqn)
       };
@@ -304,7 +457,8 @@ namespace PugTools {
       WorldNpcAnimationClip animation = ResolveNpcAnimationClip(idleAnimationName, bodyType, animationCache);
       var placement = new WorldNpcPlacement {
         Room = room, Instance = instance, SourceFqn = sourceFqn, Name = displayName,
-        Title = title, Scale = scale, Items = ResolveVisualItemNames(visual), ShowNameplate = true,
+        Title = title, IsTaxiTerminal = WorldNpcLooksLikeTaxiTerminal(sourceFqn, displayName, title),
+        Scale = scale, Items = ResolveVisualItemNames(visual), ShowNameplate = true,
         RepublicReaction = npc.DetFaction?.RepublicReaction, ImperialReaction = npc.DetFaction?.ImperialReaction, HasFactionPackage = npc.DetFaction != null,
         IdleAnimationName = idleAnimationName, AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn), BodyType = bodyType, Animation = animation
       };
@@ -359,6 +513,96 @@ namespace PugTools {
       }
       if (cache != null) cache[key] = result;
       return result;
+    }
+
+    private void ResolveNpcLocomotionClips(string bodyType, Dictionary<string, WorldNpcAnimationClip> cache,
+        out WorldNpcAnimationClip walk, out WorldNpcAnimationClip run) {
+      walk = null; run = null;
+      if (String.IsNullOrWhiteSpace(bodyType) || currentAssets == null) return;
+      string bt = bodyType.Trim().ToLowerInvariant();
+      string walkKey = "<locomotion-walk>|" + bt;
+      string runKey = "<locomotion-run>|" + bt;
+      bool walkCached = cache != null && cache.TryGetValue(walkKey, out walk);
+      bool runCached = cache != null && cache.TryGetValue(runKey, out run);
+      if (walkCached && runCached) return;
+
+      try {
+        List<NpcAnimationSpec> specs = ResolveNpcAnimationSpecs(bodyType);
+        foreach (NpcAnimationSpec spec in specs) {
+          if (walk != null && run != null) break;
+          string family = String.Equals(spec.Category, "creature", StringComparison.OrdinalIgnoreCase) || String.Equals(spec.Category, "pet", StringComparison.OrdinalIgnoreCase)
+            ? "creature" : "humanoid";
+          string[] networks = { family + "_loco", "anim_library", family + "_loco_idle", "droid_loco", "npc_loco" };
+
+          // Cheap direct probes cover the common shipped spellings without parsing the multi-megabyte anim_library.
+          if (walk == null) {
+            foreach (string candidate in new[] { "ex_stand_walk_forward", "ex_stand_walk_fwd", "ex_walk_forward", "ex_walk_fwd", "ex_stand_walk", "ex_walk" }) {
+              foreach (string network in networks) {
+                walk = TryLoadNpcAnimationClip(spec, candidate, network, "Walk");
+                if (walk != null) break;
+              }
+              if (walk != null) break;
+            }
+          }
+          if (run == null) {
+            foreach (string candidate in new[] { "ex_stand_run_forward", "ex_stand_run_fwd", "ex_run_forward", "ex_run_fwd", "ex_stand_run", "ex_run", "ex_sprint" }) {
+              foreach (string network in networks) {
+                run = TryLoadNpcAnimationClip(spec, candidate, network, "Run");
+                if (run != null) break;
+              }
+              if (run != null) break;
+            }
+          }
+
+          // Body types use many non-obvious clip names. Let the actual Morpheme animation list tell us what the
+          // network ships, then rank forward locomotion leaves by name. This is still cached once per body type.
+          if (walk == null || run == null) {
+            foreach (string network in networks.Distinct(StringComparer.OrdinalIgnoreCase)) {
+              string mphPath = "/resources/anim/" + spec.Category + "/" + spec.Folder + "/" + network + ".mph";
+              using File mphFile = currentAssets.FindFile(mphPath);
+              if (mphFile == null) continue;
+              List<string> names;
+              try {
+                using Stream mphStream = mphFile.OpenCopyInMemory();
+                using var mphReader = new BinaryReader(mphStream);
+                names = MPHAnimationReader.FindIdleClipNames(mphReader);
+              } catch { continue; }
+              if (names == null || names.Count == 0) continue;
+
+              if (walk == null) {
+                string bestWalk = names.Select(n => new { Name = n, Score = ScoreNpcLocomotionClip(n, false) })
+                  .Where(x => x.Score > 0).OrderByDescending(x => x.Score).Select(x => x.Name).FirstOrDefault();
+                if (!String.IsNullOrWhiteSpace(bestWalk)) walk = TryLoadNpcAnimationClip(spec, bestWalk, network, "Walk");
+              }
+              if (run == null) {
+                string bestRun = names.Select(n => new { Name = n, Score = ScoreNpcLocomotionClip(n, true) })
+                  .Where(x => x.Score > 0).OrderByDescending(x => x.Score).Select(x => x.Name).FirstOrDefault();
+                if (!String.IsNullOrWhiteSpace(bestRun)) run = TryLoadNpcAnimationClip(spec, bestRun, network, "Run");
+              }
+              if (walk != null && run != null) break;
+            }
+          }
+        }
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("NPC locomotion resolution failed " + bodyType + ": " + ex.Message);
+      }
+      if (cache != null) { cache[walkKey] = walk; cache[runKey] = run; }
+    }
+
+    private static int ScoreNpcLocomotionClip(string name, bool run) {
+      if (String.IsNullOrWhiteSpace(name)) return Int32.MinValue;
+      string n = name.ToLowerInvariant();
+      bool hasRun = n.Contains("run") || n.Contains("sprint");
+      bool hasWalk = n.Contains("walk");
+      if (run ? !hasRun : !hasWalk) return Int32.MinValue;
+      int score = 1000;
+      if (n.Contains("forward") || n.Contains("_fwd") || n.EndsWith("fwd", StringComparison.Ordinal)) score += 500;
+      if (n.Contains("stand")) score += 120;
+      if (n.Contains("loop")) score += 80;
+      if (run && n.Contains("sprint")) score += 100;
+      foreach (string bad in new[] { "back", "strafe", "turn", "left", "right", "jump", "fall", "swim", "mount", "combat", "weapon", "idle" })
+        if (n.Contains(bad)) score -= 700;
+      return score;
     }
 
     private void ResolveNpcAnimationInfo(string displayName, out string action, out string network) {
@@ -595,23 +839,404 @@ namespace PugTools {
       return System.Globalization.CultureInfo.CurrentCulture.TextInfo.ToTitleCase(leaf.ToLowerInvariant());
     }
 
-    private WorldSpnPlacement BuildSpnPlaceablePlacement(Room room, AssetInstance instance, string sourceFqn, Dictionary<string, List<GR2>> modelCache, Dictionary<string, WorldNpcAnimationClip> animationCache) {
+    private sealed class SpnDynPreviewTemplate {
+      public string StartState;
+      public readonly List<GR2> Models = new List<GR2>();
+      public readonly List<WorldSpnDynState> States = new List<WorldSpnDynState>();
+      public readonly List<WorldSpnDynLight> Lights = new List<WorldSpnDynLight>();
+    }
+
+    private WorldSpnPlacement BuildSpnPlaceablePlacement(Room room, AssetInstance instance, string sourceFqn,
+        Dictionary<string, List<GR2>> modelCache, Dictionary<string, WorldNpcAnimationClip> animationCache,
+        Dictionary<string, SpnDynPreviewTemplate> dynCache) {
       Placeable placeable = null;
       GomObject node = null;
       try { placeable = currentDom.PlaceableLoader.Load(sourceFqn); } catch { }
       try { node = currentDom.GetObject(sourceFqn); } catch { }
-      List<GR2> loaded = GetSpnPlaceableModels(sourceFqn, placeable, node, modelCache, animationCache, out WorldNpcAnimationClip animation);
-      if (loaded == null || loaded.Count == 0) return null;
+
+      SpnDynPreviewTemplate dynTemplate = null;
+      if (dynCache != null && dynCache.TryGetValue(sourceFqn, out SpnDynPreviewTemplate cachedDyn)) dynTemplate = cachedDyn;
+      else {
+        dynTemplate = BuildSpnDynPreviewTemplate(placeable, node);
+        if (dynCache != null) dynCache[sourceFqn] = dynTemplate;
+      }
+
+      WorldNpcAnimationClip animation = null;
+      List<GR2> loaded;
+      if (dynTemplate != null) loaded = dynTemplate.Models;
+      else loaded = GetSpnPlaceableModels(sourceFqn, placeable, node, modelCache, animationCache, out animation);
+      // A dyn assembly may intentionally contain only a light row. Jedipedia keeps that placement even without
+      // geometry, because the light is a world-space contribution rather than a drawable model.
+      if ((loaded == null || loaded.Count == 0) && (dynTemplate == null || dynTemplate.Lights.Count == 0)) return null;
+
       string name = placeable?.Name;
       if (placeable?.LocalizedName != null && placeable.LocalizedName.TryGetValue(GomLib.StringTable.SelectedLocalization, out string localized) && IsRealLocalizedName(localized, sourceFqn)) name = localized;
       if (!IsRealLocalizedName(name, sourceFqn)) name = PrettySpawnName(sourceFqn);
       var placement = new WorldSpnPlacement {
         Room = room, Instance = instance, SourceFqn = sourceFqn, Name = name, Scale = 1f, Animation = animation,
-        AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn)
+        AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn),
+        DynStartState = dynTemplate?.StartState,
+        BlueGlow = SpnPlaceableHasBlueGlow(placeable, node)
       };
-      foreach (GR2 model in loaded) placement.Models.Add(model);
+      if (loaded != null) foreach (GR2 model in loaded) if (model != null && !placement.Models.Contains(model)) placement.Models.Add(model);
+      if (dynTemplate != null) {
+        foreach (WorldSpnDynState state in dynTemplate.States) placement.DynStates.Add(state);
+        foreach (WorldSpnDynLight light in dynTemplate.Lights) placement.DynLights.Add(light);
+      }
       return placement;
     }
+
+    private SpnDynPreviewTemplate BuildSpnDynPreviewTemplate(Placeable placeable, GomObject plcNode) {
+      if (plcNode == null) return null;
+      string modelReference = plcNode.Data.ValueOrDefault<string>("plcModel", null);
+      if (String.IsNullOrWhiteSpace(modelReference)) modelReference = placeable?.Model;
+      if (String.IsNullOrWhiteSpace(modelReference) || modelReference.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase) ||
+          modelReference.EndsWith(".mag", StringComparison.OrdinalIgnoreCase)) return null;
+
+      string dynFqn = modelReference.Trim().Replace('/', '.').Replace('\\', '.').Trim('.');
+      GomObject dynNode = null;
+      try { dynNode = currentDom.GetObject(dynFqn); } catch { }
+      if (dynNode == null) return null;
+      var rows = dynNode.Data.ValueOrDefault<List<object>>("dynObjectDataList", null)
+        ?? dynNode.Data.ValueOrDefault<List<object>>("dynVisualList", null);
+      if (rows == null || rows.Count == 0) return null;
+
+      string startState = CleanGomString(plcNode.Data.ValueOrDefault<object>("plcdynStartState", null));
+      var template = new SpnDynPreviewTemplate { StartState = startState };
+      List<string> stateNames = SpnDynStateNames(dynNode, rows, startState);
+      if (stateNames.Count == 0) stateNames.Add(null);
+
+      var modelByVisual = new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
+      var animationByVisual = new Dictionary<string, WorldNpcAnimationClip>(StringComparer.OrdinalIgnoreCase);
+
+      foreach (string stateName in stateNames) {
+        var state = new WorldSpnDynState { Name = stateName };
+        for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++) {
+          if (rows[rowIndex] is not GomObjectData row) continue;
+          string visual = CleanGomString(row.ValueOrDefault<object>("dynVisualFqn", null));
+          if (String.IsNullOrWhiteSpace(visual) || SpnDynVisualHidden(row, visual) || SpnDynRowIsLight(row, visual)) continue;
+          bool isMag = visual.EndsWith(".mag", StringComparison.OrdinalIgnoreCase);
+          if (!isMag && !visual.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
+
+          Dictionary<string, GomObjectData> rowStates = SpnDynRowStates(dynNode, row, rowIndex);
+          if (!SpnDynRowVisible(rowStates, stateName)) continue;
+          GomObjectData selectedState = !String.IsNullOrWhiteSpace(stateName) && rowStates != null && rowStates.TryGetValue(stateName, out GomObjectData stateRow)
+            ? stateRow : null;
+          string action = selectedState == null ? null : CleanGomString(selectedState.ValueOrDefault<object>("dynMagName", null));
+
+          if (isMag && SpnMagActionHidden(visual, action)) {
+            // Jedipedia treats a hidden animated part as the object itself being hidden for this dyn state.
+            state.Hidden = true;
+            state.Parts.Clear();
+            break;
+          }
+
+          if (!modelByVisual.TryGetValue(visual, out GR2 model)) {
+            WorldNpcAnimationClip partAnimation = null;
+            model = isMag ? LoadSpnMag(visual, out partAnimation) : LoadSpnModel(visual);
+            modelByVisual[visual] = model;
+            if (partAnimation != null) animationByVisual[visual] = partAnimation;
+            if (model != null && !template.Models.Contains(model)) template.Models.Add(model);
+          }
+          if (model == null) continue;
+          animationByVisual.TryGetValue(visual, out WorldNpcAnimationClip animation);
+          state.Parts.Add(new WorldSpnDynPart {
+            Model = model,
+            LocalMatrix = SpnDynLocalMatrix(row),
+            Animation = animation,
+            BlueGlow = SpnDynRowBlueGlow(rowStates, stateName)
+          });
+        }
+        template.States.Add(state);
+      }
+
+      foreach (WorldSpnDynLight light in BuildSpnDynLights(dynNode, rows, stateNames)) template.Lights.Add(light);
+      return template.Models.Count == 0 && template.Lights.Count == 0 ? null : template;
+    }
+
+    private static string CleanGomString(object value) {
+      if (value == null) return null;
+      string text = value.ToString()?.Replace("\0", String.Empty).Trim();
+      return String.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private static List<string> SpnDynStateNames(GomObject dynNode, List<object> rows, string startState) {
+      var result = new List<string>();
+      if (!String.IsNullOrWhiteSpace(startState)) result.Add(startState);
+      if (String.IsNullOrWhiteSpace(startState) || rows == null) return result;
+      for (int i = 0; i < rows.Count; i++) {
+        if (rows[i] is not GomObjectData row) continue;
+        Dictionary<string, GomObjectData> states = SpnDynRowStates(dynNode, row, i);
+        if (states == null) continue;
+        foreach (string name in states.Keys)
+          if (!String.IsNullOrWhiteSpace(name) && !result.Contains(name, StringComparer.OrdinalIgnoreCase)) result.Add(name);
+      }
+      return result;
+    }
+
+    private static Dictionary<string, GomObjectData> SpnDynRowStates(GomObject dynNode, GomObjectData row, int rowIndex) {
+      var result = new Dictionary<string, GomObjectData>(StringComparer.OrdinalIgnoreCase);
+      Dictionary<object, object> current = row?.ValueOrDefault<Dictionary<object, object>>("dynStateToDynObjectState", null);
+      if (current != null) {
+        foreach (var pair in current) if (pair.Value is GomObjectData state) {
+          string name = CleanGomString(pair.Key);
+          if (!String.IsNullOrWhiteSpace(name)) result[name] = state;
+        }
+        if (result.Count > 0) return result;
+      }
+
+      Dictionary<object, object> legacy = dynNode?.Data.ValueOrDefault<Dictionary<object, object>>("dynStateNameToListOfVisualStates", null);
+      if (legacy == null) return result.Count == 0 ? null : result;
+      foreach (var pair in legacy) {
+        string name = CleanGomString(pair.Key);
+        if (String.IsNullOrWhiteSpace(name) || pair.Value is not List<object> stateRows || rowIndex < 0 || rowIndex >= stateRows.Count) continue;
+        if (stateRows[rowIndex] is GomObjectData state) result[name] = state;
+      }
+      return result.Count == 0 ? null : result;
+    }
+
+    private static bool SpnPlaceableHasBlueGlow(Placeable placeable, GomObject node) {
+      if (placeable != null && (placeable.AbilitySpecOnUseId != 0 || placeable.CodexId != 0 || placeable.LootPackageId != 0)) return true;
+      if (node?.Data == null) return false;
+      return SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcAbilitySpecOnUse", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcAbilitySpecOnLoot", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcCodexSpec", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcdynLootPackage", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcTreasureChestLootLevel", null));
+    }
+
+    private static bool SpnGlowValueSet(object value) {
+      if (value == null) return false;
+      if (value is string text) return !String.IsNullOrWhiteSpace(text) && text.Trim() != "0";
+      if (value is ScriptEnum scriptEnum) return scriptEnum.Value >= 0;
+      try { return Convert.ToDecimal(value, System.Globalization.CultureInfo.InvariantCulture) != 0m; } catch { return true; }
+    }
+
+    private static bool SpnDynRowBlueGlow(Dictionary<string, GomObjectData> states, string stateName) {
+      if (String.IsNullOrWhiteSpace(stateName) || states == null || !states.TryGetValue(stateName, out GomObjectData state) || state == null) return false;
+      if (!state.Dictionary.TryGetValue("dynState", out object raw) || raw == null) return false;
+      return (SpnDynInteger(raw, 0) & 4L) != 0;
+    }
+
+    private static bool SpnDynRowVisible(Dictionary<string, GomObjectData> states, string stateName) {
+      if (String.IsNullOrWhiteSpace(stateName) || states == null || states.Count == 0) return true;
+      bool authored = false;
+      bool visible = false;
+      foreach (var pair in states) {
+        if (pair.Value == null || !pair.Value.Dictionary.TryGetValue("dynState", out object raw) || raw == null) continue;
+        authored = true;
+        long flags = SpnDynInteger(raw, 0);
+        if (String.Equals(pair.Key, stateName, StringComparison.OrdinalIgnoreCase) && (flags & 1L) != 0) visible = true;
+      }
+      return authored ? visible : true;
+    }
+
+    private static long SpnDynInteger(object value, long fallback) {
+      if (value == null) return fallback;
+      if (value is ScriptEnum scriptEnum) return scriptEnum.Value + 1L;
+      try { return Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture); } catch { }
+      string text = CleanGomString(value);
+      if (String.IsNullOrWhiteSpace(text)) return fallback;
+      if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+          Int64.TryParse(text.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out long hex)) return hex;
+      return Int64.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out long parsed) ? parsed : fallback;
+    }
+
+    private static float SpnDynNumber(object value, float fallback) {
+      if (value == null) return fallback;
+      if (value is ScriptEnum scriptEnum) return scriptEnum.Value + 1f;
+      try {
+        float number = Convert.ToSingle(value, System.Globalization.CultureInfo.InvariantCulture);
+        return Single.IsNaN(number) || Single.IsInfinity(number) ? fallback : number;
+      } catch { return fallback; }
+    }
+
+    private static Vector3 SpnDynVector3(object value, Vector3 fallback) {
+      if (value is List<float> floats && floats.Count >= 3) return new Vector3(floats[0], floats[1], floats[2]);
+      if (value is List<object> objects && objects.Count >= 3)
+        return new Vector3(SpnDynNumber(objects[0], fallback.X), SpnDynNumber(objects[1], fallback.Y), SpnDynNumber(objects[2], fallback.Z));
+      if (value is System.Collections.IList list && list.Count >= 3)
+        return new Vector3(SpnDynNumber(list[0], fallback.X), SpnDynNumber(list[1], fallback.Y), SpnDynNumber(list[2], fallback.Z));
+      return fallback;
+    }
+
+    private static Matrix SpnDynLocalMatrix(GomObjectData row) {
+      Vector3 position = SpnDynVector3(row?.ValueOrDefault<object>("dynPosition", null), Vector3.Zero);
+      Vector3 rotation = SpnDynVector3(row?.ValueOrDefault<object>("dynRotation", null), Vector3.Zero);
+      Vector3 scale = SpnDynVector3(row?.ValueOrDefault<object>("dynScale", null), new Vector3(1f, 1f, 1f));
+      float rx = rotation.X * (float)Math.PI / 180f, ry = rotation.Y * (float)Math.PI / 180f, rz = rotation.Z * (float)Math.PI / 180f;
+      // Row-vector equivalent of Jedipedia's T · Ry · Rx · Rz · S.
+      return Matrix.Scaling(scale) * Matrix.RotationZ(rz) * Matrix.RotationX(rx) * Matrix.RotationY(ry) * Matrix.Translation(position);
+    }
+
+    private static bool SpnDynVisualHidden(GomObjectData row, string visual) {
+      string path = (visual ?? String.Empty).Replace('\\', '/').ToLowerInvariant();
+      string objectName = CleanGomString(row?.ValueOrDefault<object>("dynObjectName", null)) ?? String.Empty;
+      if (objectName.StartsWith("dbo_", StringComparison.OrdinalIgnoreCase)) return true;
+      string[] pieces = path.Split(new[] { '/', '_', '.' }, StringSplitOptions.RemoveEmptyEntries);
+      return pieces.Any(piece => String.Equals(piece, "collision", StringComparison.OrdinalIgnoreCase)) ||
+        path.IndexOf("designblockout", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool SpnDynRowIsLight(GomObjectData row, string visual) {
+      if (!String.IsNullOrWhiteSpace(visual) && visual.EndsWith(".lit", StringComparison.OrdinalIgnoreCase)) return true;
+      object rawType = row?.ValueOrDefault<object>("dynObjectType", null);
+      return SpnDynInteger(rawType, -1) == 5;
+    }
+
+    private bool SpnMagActionHidden(string magReference, string action) {
+      if (String.IsNullOrWhiteSpace(magReference) || String.IsNullOrWhiteSpace(action) || currentAssets == null) return false;
+      try {
+        string magPath = NormalizeResourceAssetPath(magReference, null);
+        using File file = currentAssets.FindFile(magPath);
+        if (file == null) return false;
+        Dictionary<string, string> values;
+        using (Stream stream = file.OpenCopyInMemory()) using (var reader = new StreamReader(stream)) values = ParseNpcSpec(reader.ReadToEnd());
+        if (!values.TryGetValue("AnimMetadataFqn", out string metadata) || String.IsNullOrWhiteSpace(metadata)) return false;
+        string metadataPath = NormalizeResourceAssetPath(metadata, null);
+        using File metadataFile = currentAssets.FindFile(metadataPath);
+        if (metadataFile == null) return false;
+        string text;
+        using (Stream stream = metadataFile.OpenCopyInMemory()) using (var reader = new StreamReader(stream)) text = reader.ReadToEnd();
+        string escaped = System.Text.RegularExpressions.Regex.Escape(action.Trim());
+        var match = System.Text.RegularExpressions.Regex.Match(text,
+          "<action\\s+name=\"" + escaped + "\"[^>]*>([\\s\\S]*?)</action>",
+          System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return match.Success && System.Text.RegularExpressions.Regex.IsMatch(match.Groups[1].Value,
+          "<sa\\s+path=\"mv_hide\"", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+      } catch { return false; }
+    }
+
+    private static readonly Dictionary<ulong, string> SpnDynLightPropertyNames = new Dictionary<ulong, string> {
+      { 17837464995121910744UL, "Color" },
+      { 6349573576868323461UL, "Falloff" },
+      { 4748468179436753632UL, "IlluminationMap" },
+      { 2600316532131449482UL, "Intensity" },
+      { 6521451727119918103UL, "LightType" },
+      { 4517970592427740037UL, "RampMap" },
+      { 2758068308593703698UL, "Range" },
+      { 14067375507992444331UL, "SourceOffset" },
+      { 9041169397708211167UL, "RestrictToRoom" },
+      { 16232016272567338703UL, "DoGranny" },
+      { 8982315057199028444UL, "DoHeightmaps" },
+      { 4864343265957239075UL, "DoSpeedTree" },
+      { 1118051188720359896UL, "DoCharacters" },
+      { 10066959401320433411UL, "DoWater" }
+    };
+
+    private List<WorldSpnDynLight> BuildSpnDynLights(GomObject dynNode, List<object> rows, List<string> stateNames) {
+      var result = new List<WorldSpnDynLight>();
+      if (dynNode == null || rows == null) return result;
+      for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++) {
+        if (rows[rowIndex] is not GomObjectData row) continue;
+        string visual = CleanGomString(row.ValueOrDefault<object>("dynVisualFqn", null));
+        if (!SpnDynRowIsLight(row, visual)) continue;
+
+        Dictionary<string, GomObjectData> rowStates = SpnDynRowStates(dynNode, row, rowIndex);
+        if (stateNames != null && stateNames.Count == 1 && !SpnDynRowVisible(rowStates, stateNames[0])) continue;
+
+        Dictionary<string, object> properties = SpnDynLightProperties(dynNode, row);
+        var light = new WorldSpnDynLight { LocalMatrix = SpnDynLocalMatrix(row) };
+        if (properties.TryGetValue("LightType", out object lightType)) light.LightType = SpnDynLightTypeName(lightType);
+        if (properties.TryGetValue("SourceOffset", out object sourceOffset)) light.SourceOffset = SpnDynNumber(sourceOffset, 0f);
+        if (properties.TryGetValue("Range", out object range)) light.Range = Math.Max(.0001f, SpnDynNumber(range, 1f));
+        if (properties.TryGetValue("Intensity", out object intensity)) light.Intensity = SpnDynNumber(intensity, 1f);
+        if (properties.TryGetValue("Color", out object color) && TrySpnDynColor(color, out Vector4 parsedColor)) light.Color = parsedColor;
+        if (properties.TryGetValue("IlluminationMap", out object illumination)) light.IlluminationMap = CleanGomString(illumination);
+        if (properties.TryGetValue("RampMap", out object ramp)) light.RampMap = CleanGomString(ramp);
+        if (properties.TryGetValue("Falloff", out object falloff)) light.Falloff = CleanGomString(falloff);
+        if (properties.TryGetValue("RestrictToRoom", out object restrict)) light.RestrictToRoom = SpnDynBool(restrict, false);
+        if (properties.TryGetValue("DoHeightmaps", out object doHeightmaps)) light.DoHeightmaps = SpnDynBool(doHeightmaps, true);
+        if (properties.TryGetValue("DoGranny", out object doGranny)) light.DoGranny = SpnDynBool(doGranny, true);
+        if (properties.TryGetValue("DoCharacters", out object doCharacters)) light.DoCharacters = SpnDynBool(doCharacters, true);
+        if (properties.TryGetValue("DoWater", out object doWater)) light.DoWater = SpnDynBool(doWater, true);
+
+        if (stateNames != null && stateNames.Count > 1)
+          foreach (string stateName in stateNames) if (!String.IsNullOrWhiteSpace(stateName))
+            light.StateVisibility[stateName] = SpnDynRowVisible(rowStates, stateName);
+        result.Add(light);
+      }
+      return result;
+    }
+
+    private static Dictionary<string, object> SpnDynLightProperties(GomObject dynNode, GomObjectData row) {
+      var result = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+      string objectName = CleanGomString(row?.ValueOrDefault<object>("dynObjectName", null));
+      Dictionary<object, object> legacyByName = dynNode?.Data.ValueOrDefault<Dictionary<object, object>>("dynLightNameToProperty", null);
+      if (legacyByName != null && !String.IsNullOrWhiteSpace(objectName)) {
+        foreach (var pair in legacyByName) {
+          if (!String.Equals(CleanGomString(pair.Key), objectName, StringComparison.OrdinalIgnoreCase) || pair.Value is not GomObjectData legacy) continue;
+          AddLegacySpnDynLightProperty(result, legacy, "dynLightType", "LightType");
+          AddLegacySpnDynLightProperty(result, legacy, "dynLightColor", "Color");
+          AddLegacySpnDynLightProperty(result, legacy, "dynLightRampMap", "RampMap");
+          AddLegacySpnDynLightProperty(result, legacy, "dynLightIlluminationMap", "IlluminationMap");
+          AddLegacySpnDynLightProperty(result, legacy, "dynLightFalloff", "Falloff");
+          AddLegacySpnDynLightProperty(result, legacy, "dynLightIntensity", "Intensity");
+          AddLegacySpnDynLightProperty(result, legacy, "dynLightRange", "Range");
+          break;
+        }
+      }
+
+      foreach (string field in new[] {
+        "dynObjectDataStringProperties", "dynObjectDataFloatProperties", "dynObjectDataBooleanProperties",
+        "dynObjectDataIntegerProperties", "dynObjectDataVector3Properties"
+      }) {
+        Dictionary<object, object> map = row?.ValueOrDefault<Dictionary<object, object>>(field, null);
+        if (map == null) continue;
+        foreach (var pair in map) {
+          if (!TryUnsignedGomId(pair.Key, out ulong hash) || !SpnDynLightPropertyNames.TryGetValue(hash, out string name)) continue;
+          result[name] = pair.Value;
+        }
+      }
+      return result;
+    }
+
+    private static void AddLegacySpnDynLightProperty(Dictionary<string, object> target, GomObjectData source, string field, string name) {
+      if (source != null && source.Dictionary.TryGetValue(field, out object value) && value != null) target[name] = value;
+    }
+
+    private static bool SpnDynBool(object value, bool fallback) {
+      if (value == null) return fallback;
+      if (value is bool boolean) return boolean;
+      if (value is ScriptEnum scriptEnum) return scriptEnum.Value + 1 != 0;
+      string text = CleanGomString(value);
+      if (String.Equals(text, "true", StringComparison.OrdinalIgnoreCase) || text == "1") return true;
+      if (String.Equals(text, "false", StringComparison.OrdinalIgnoreCase) || text == "0") return false;
+      try { return Convert.ToBoolean(value, System.Globalization.CultureInfo.InvariantCulture); } catch { return fallback; }
+    }
+
+    private static string SpnDynLightTypeName(object value) {
+      long numeric = SpnDynInteger(value, Int64.MinValue);
+      if (numeric == 1) return "DIRECTIONAL";
+      if (numeric == 2) return "OMNI";
+      if (numeric == 3) return "SPOT";
+      string text = CleanGomString(value) ?? "OMNI";
+      if (text.IndexOf("direction", StringComparison.OrdinalIgnoreCase) >= 0) return "DIRECTIONAL";
+      if (text.IndexOf("spot", StringComparison.OrdinalIgnoreCase) >= 0) return "SPOT";
+      return "OMNI";
+    }
+
+    private static bool TrySpnDynColor(object value, out Vector4 color) {
+      color = new Vector4(1f, 1f, 1f, 1f);
+      Vector3 vector = SpnDynVector3(value, new Vector3(Single.NaN, Single.NaN, Single.NaN));
+      if (!Single.IsNaN(vector.X) && !Single.IsNaN(vector.Y) && !Single.IsNaN(vector.Z)) {
+        color = new Vector4(vector, 1f);
+        return true;
+      }
+      string text = CleanGomString(value);
+      if (String.IsNullOrWhiteSpace(text)) return false;
+      if (text.StartsWith("#", StringComparison.Ordinal)) text = text.Substring(1);
+      string[] parts = text.Split(',');
+      if (parts.Length < 3) return false;
+      if (!Single.TryParse(parts[0].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float r) ||
+          !Single.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float g) ||
+          !Single.TryParse(parts[2].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float b)) return false;
+      float a = 1f;
+      if (parts.Length > 3) Single.TryParse(parts[3].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out a);
+      color = new Vector4(r, g, b, a);
+      return true;
+    }
+
 
     private List<GR2> GetSpnPlaceableModels(string sourceFqn, Placeable placeable, GomObject node, Dictionary<string, List<GR2>> cache, Dictionary<string, WorldNpcAnimationClip> animationCache, out WorldNpcAnimationClip animation) {
       animation = null;
@@ -657,7 +1282,8 @@ namespace PugTools {
         string direct = dyn.Data.ValueOrDefault<string>(field, null);
         if (!String.IsNullOrWhiteSpace(direct)) CollectSpnModels(direct, output, visited, ref animation);
       }
-      var visuals = dyn.Data.ValueOrDefault<List<object>>("dynVisualList", null);
+      var visuals = dyn.Data.ValueOrDefault<List<object>>("dynObjectDataList", null)
+        ?? dyn.Data.ValueOrDefault<List<object>>("dynVisualList", null);
       if (visuals != null) foreach (object item in visuals) if (item is GomObjectData row) {
         string visual = row.ValueOrDefault<string>("dynVisualFqn", null) ?? row.ValueOrDefault<string>("dynVisualModel", null);
         if (!String.IsNullOrWhiteSpace(visual)) CollectSpnModels(visual, output, visited, ref animation);
@@ -806,7 +1432,17 @@ namespace PugTools {
         if (pair.Key.IndexOf("FaceHair", StringComparison.OrdinalIgnoreCase) >= 0 && String.IsNullOrWhiteSpace(modelPath)) modelPath = "/art/defaultassets/blank.gr2";
         if (String.IsNullOrWhiteSpace(modelPath) || !modelPath.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
         GR2 model = LoadNpcPartModel(modelPath, slot, appearance, pair.Key, bodyType);
-        if (model != null) result.Add(model);
+        if (model != null) {
+          result.Add(model);
+          // Attached appearance GR2s (hair, facial pieces, armour accessories, etc.) are real skinned NPP parts.
+          // Drawing them recursively through DrawModel() leaves them in bind pose while the parent body animates,
+          // which is the detached/floating-parts artifact seen on some NPCs. Flatten them into the placement so every
+          // attachment goes through the same JBA skinning path as the owning appearance part.
+          if (model.attachedModels != null && model.attachedModels.Count > 0) {
+            foreach (GR2 attached in model.attachedModels.Where(x => x != null).ToArray()) result.Add(attached);
+            model.attachedModels.Clear();
+          }
+        }
       }
       return result;
     }

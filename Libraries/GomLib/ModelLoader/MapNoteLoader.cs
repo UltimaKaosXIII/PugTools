@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using GomLib.Models;
 // using System.Diagnostics;
@@ -74,16 +74,24 @@ namespace GomLib.ModelLoader {
         }
       }
 
-      mpn.AssetID = obj.Data.Get<long>("mpnAssetID");
+      mpn.AssetID = obj.Data.ValueOrDefault<long>("mpnAssetID", 0);
       //mpn.Id = (ulong)(mpnAssetID >> 32);
 
-      var textLookup = obj.Data.Get<Dictionary<object, object>>("locTextRetrieverMap");
-      var nameLookupData = (GomObjectData)textLookup[NameLookupKey];
-      mpn.Name = _dom.StringTable.TryGetString(mpn.Fqn, nameLookupData);
-      mpn.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(mpn.Fqn, nameLookupData);
+      // Not every authored mapnote has a display-name retriever (utility/debug/link-only notes are common).
+      // The old hard index threw before mpnIconAsset / Wonkavator / map-link metadata could be read, which made
+      // otherwise valid symbols disappear from the map and left their tooltips empty. Resolve the optional name
+      // defensively and continue loading the structural metadata even when no localized label exists.
+      var textLookup = obj.Data.ValueOrDefault<Dictionary<object, object>>("locTextRetrieverMap", null);
+      GomObjectData nameLookupData = null;
+      if (textLookup != null && textLookup.TryGetValue(NameLookupKey, out object rawNameLookup))
+        nameLookupData = rawNameLookup as GomObjectData;
+      if (nameLookupData != null) {
+        mpn.Name = _dom.StringTable.TryGetString(mpn.Fqn, nameLookupData);
+        mpn.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(mpn.Fqn, nameLookupData);
+      }
 
       //mpn.Icon = MapNoteIconExtensions.ToMapNoteIcon(obj.Data.Get<string>("mpnIconAsset"));
-      mpn.Icon = obj.Data.Get<string>("mpnIconAsset");
+      mpn.Icon = obj.Data.ValueOrDefault<string>("mpnIconAsset", null);
       if (obj.Data.ContainsKey("mpnConditionEType")) { mpn.Condition = MapNoteConditionExtensions.ToMapNoteCondition(obj.Data.Get<object>("mpnConditionEType").ToString()); }
       if (obj.Data.ContainsKey("mpnHuntingRadius")) { mpn.HuntingRadius = _dom.Data.huntingRadius.GetRadius(obj.Data.Get<long>("mpnHuntingRadius")); }
       if (obj.Data.ContainsKey("mpnHuntingRadiusBonus")) { mpn.BonusHuntingRadius = _dom.Data.huntingRadius.GetRadius(obj.Data.Get<long>("mpnHuntingRadiusBonus")); }
@@ -99,8 +107,8 @@ namespace GomLib.ModelLoader {
       }
 
       // if (obj.Data.ContainsKey("mpnMetadataFullFQN") && mpn.Icon != MapNoteIcon.Taxi && mpn.Icon != MapNoteIcon.Wonkavator) { Debug.WriteLine(mpn.Fqn); }
-      //if (obj.Data.ContainsKey("mpnMetadataInt")) { mpn.WonkaPackageId = obj.Data.Get<long>("mpnMetadataInt"); }
-      //if (obj.Data.ContainsKey("mpnMetadataID")) { mpn.WonkaDestinationId = (long)obj.Data.Get<ulong>("mpnMetadataID"); }
+      if (obj.Data.ContainsKey("mpnMetadataInt")) { mpn.WonkaPackageId = obj.Data.Get<long>("mpnMetadataInt"); }
+      if (obj.Data.ContainsKey("mpnMetadataID")) { mpn.WonkaDestinationId = obj.Data.Get<ulong>("mpnMetadataID"); }
       //0x2F63800000000
 
       switch (mpn.Icon) {
@@ -111,8 +119,10 @@ namespace GomLib.ModelLoader {
             if (taxiNode != null) {
               long taxNameId = taxiNode.Data.ValueOrDefault<long>("taxNameId", -1);
               long taxFaction = taxiNode.Data.ValueOrDefault<long>("taxFaction", 0);
-              mpn.Name = taxiTerminals.GetText(0x7D60500000000 + taxNameId, mpn.Fqn);
-              mpn.LocalizedName = taxiTerminals.GetLocalizedText(0x7D60500000000 + taxNameId, mpn.Fqn);
+              if (taxiTerminals != null) {
+                mpn.Name = taxiTerminals.GetText(0x7D60500000000 + taxNameId, mpn.Fqn);
+                mpn.LocalizedName = taxiTerminals.GetLocalizedText(0x7D60500000000 + taxNameId, mpn.Fqn);
+              }
               mpn.Faction = _dom.FactionData.ToFaction(taxFaction);
             }
           }

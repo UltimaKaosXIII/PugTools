@@ -19,6 +19,17 @@ namespace FileFormats {
     OccluderOnly = 4
   }
 
+  // Jedipedia's rgnVolumeData: an arbitrary local-space triangle footprint whose vertices each carry
+  // an independent extrusion height. SWTOR uses these prisms for map/audio/respawn/PvP/quest regions;
+  // treating every .rgn as the default 64x64 box makes room selection and utility overlays wildly inaccurate.
+  public sealed class RegionVolumeData {
+    public Vector3[] Positions { get; internal set; } = Array.Empty<Vector3>();
+    public float[] Heights { get; internal set; } = Array.Empty<float>();
+    public ushort[] Indices { get; internal set; } = Array.Empty<ushort>();
+    public Vector3 Min { get; internal set; }
+    public Vector3 Max { get; internal set; }
+  }
+
   public class AssetInstance1 {
     public ulong Id; public ulong AssetId; public ulong ParentInstanceId; public Room Room;
     public Vector3 Position; public Vector3 Scale = new Vector3(1,1,1); public Vector3 Rotation; public Matrix Transform; public bool Hidden;
@@ -36,7 +47,15 @@ namespace FileFormats {
     public HeightMap HeightMap { get; private set; }
     private byte[] vertexData;
     private byte[] waterDepthData;
+    private byte[] regionVolumeData;
     public byte[] WaterDepthData => waterDepthData;
+    public RegionVolumeData RegionVolume { get; private set; }
+    public string RegionClassType { get; private set; } = "GENERIC";
+    public string RegionCharacteristics { get; private set; }
+    public string RegionRespawnMedCenter { get; private set; }
+    // /engine/portal.p target room. Jedipedia feeds this into its dPVS portal graph; keeping the parsed
+    // target here lets the offline renderer build a conservative portal-aware visibility graph as well.
+    public string PortalTarget { get; private set; }
     public int numFaces;
     public float depth = 64, height = 64, width = 64;
     public bool HasWidthProperty { get; private set; }
@@ -54,6 +73,7 @@ namespace FileFormats {
     // TriggerParam names INSTANCE_REGION phases (for example stronghold_dromund_kaas).
     public string TriggerClassType { get; private set; }
     public string TriggerParam { get; private set; }
+    public string TriggerTag { get; private set; }
     public bool TriggerEllipsoid { get; private set; }
     public bool PathFollowerPending { get; set; }
     public bool PathFollowerAnimated { get; set; }
@@ -76,7 +96,7 @@ namespace FileFormats {
     public bool IsLocalLight { get; private set; }
     public string LocalLightType { get; private set; } = "OMNI";
     public float LocalLightSourceOffset { get; private set; }
-    public float LocalLightRange { get; private set; } = 10f;
+    public float LocalLightRange { get; private set; } = 1f;
     public float LocalLightIntensity { get; private set; } = 1f;
     public Vector4 LocalLightColor { get; private set; } = new Vector4(1,1,1,1);
     public string LocalLightIlluminationMap { get; private set; }
@@ -168,6 +188,41 @@ namespace FileFormats {
         return;
       }
 
+      // Region metadata. Unlike trigger.trg's simple Width/Height/Depth primitive, region.rgn owns an
+      // arbitrary triangulated footprint in rgnVolumeData. The blob uses the same misleading string/binary
+      // storage as terrain/water payloads, so decode hex-string wrappers before decompression.
+      if (name == 0xFDA2965D && (type == 8 || type == 9)) { // rgnVolumeData
+        uint len = br.ReadUInt32(); byte[] raw = br.ReadBytes(checked((int)len));
+        regionVolumeData = type == 8 ? DecodePayloadBytes(raw) : raw;
+        ParsedProperties[name] = regionVolumeData;
+        return;
+      }
+      if (name == 0xAFF3B819 && (type == 1 || type == 3)) { // rgnClassType (1-based)
+        int rawRegionClass = br.ReadInt32();
+        string[] regionClasses = { "GENERIC", "MAP", "AUDIO", "RESPAWN", "PVP", "DEATH", "EXHAUSTION",
+          "WORLD_QUEST", "SHARED_WORLD_QUEST", "META_WORLD_QUEST", "PLANETARY_WORLD_QUEST" };
+        RegionClassType = rawRegionClass >= 1 && rawRegionClass <= regionClasses.Length ? regionClasses[rawRegionClass - 1] : "GENERIC";
+        ParsedProperties[name] = rawRegionClass;
+        return;
+      }
+      if ((name == 0x27EEE87F || name == 0x1BD46F12) && (type == 8 || type == 9)) { // characteristics / respawn med center
+        object regionTextValue = ReadGenericProperty(ref br, type);
+        string regionText = regionTextValue is byte[] regionBytes ? DecodeText(regionBytes) : regionTextValue?.ToString();
+        if (name == 0x27EEE87F) RegionCharacteristics = regionText; else RegionRespawnMedCenter = regionText;
+        ParsedProperties[name] = regionTextValue;
+        return;
+      }
+
+      // /engine/portal.p target. The shipped value is text in both type-8 and type-9 room properties and may
+      // optionally start with a numeric portal id ("123 room/name.dat"). Jedipedia strips that id later when
+      // resolving the graph; preserve the raw text here.
+      if (name == 0xB04139FD && (type == 8 || type == 9)) { // PortalTarget
+        object portalValue = ReadGenericProperty(ref br, type);
+        PortalTarget = portalValue is byte[] portalBytes ? DecodeText(portalBytes) : portalValue?.ToString();
+        ParsedProperties[name] = portalValue;
+        return;
+      }
+
       // Phase trigger properties. Jedipedia reads these from /engine/trigger.trg placements and chooses the
       // smallest INSTANCE_REGION containing the camera as the current phase.
       if (name == 0x80AF3C1A && (type == 1 || type == 3)) { // TriggerClassType
@@ -187,6 +242,12 @@ namespace FileFormats {
         object triggerParamValue = ReadGenericProperty(ref br, type);
         TriggerParam = triggerParamValue is byte[] triggerBytes ? DecodeText(triggerBytes) : triggerParamValue?.ToString();
         ParsedProperties[name] = triggerParamValue;
+        return;
+      }
+      if (name == 0x39801EBA && (type == 8 || type == 9)) { // Tag (MAP trigger page / generic trigger label)
+        object triggerTagValue = ReadGenericProperty(ref br, type);
+        TriggerTag = triggerTagValue is byte[] triggerBytes ? DecodeText(triggerBytes) : triggerTagValue?.ToString();
+        ParsedProperties[name] = triggerTagValue;
         return;
       }
       if (name == 0x5BFA9DA3 && type == 0) { // Ellipsoid
@@ -297,27 +358,73 @@ namespace FileFormats {
 
     private static int ToInt(object o) { try { return Convert.ToInt32(o); } catch { return 0; } }
     private static float ToFloat(object o, float fallback = 0) { try { return Convert.ToSingle(o); } catch { if (float.TryParse(o?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float f)) return f; return fallback; } }
-    private static bool ToBool(object o, bool fallback = false) { if (o is bool b) return b; return bool.TryParse(o?.ToString(), out b) ? b : fallback; }
+    private static bool ToBool(object o, bool fallback = false) {
+      if (o is bool b) return b;
+      string text = LocalLightText(o);
+      if (String.Equals(text, "1", StringComparison.OrdinalIgnoreCase)) return true;
+      if (String.Equals(text, "0", StringComparison.OrdinalIgnoreCase)) return false;
+      return bool.TryParse(text, out b) ? b : fallback;
+    }
+
+    // Room property type 9 is a text field in Jedipedia's local-light schema, while the generic reader deliberately
+    // preserves type-9 bytes because other room properties use that type for binary payloads. Decode it only while
+    // interpreting local-light values so those other payloads remain untouched.
+    private static string LocalLightText(object value) {
+      if (value is byte[] bytes) return DecodeText(bytes).Trim().Trim('"');
+      return value?.ToString()?.Trim().Trim('"') ?? String.Empty;
+    }
+
+    private static float LocalLightNumber(object value, float fallback) {
+      string text = LocalLightText(value);
+      return float.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float parsed)
+        && Single.IsFinite(parsed) ? parsed : fallback;
+    }
+
+    private static string LocalLightTypeName(object value) {
+      string text = LocalLightText(value);
+      if (String.Equals(text, "DIRECTIONAL", StringComparison.OrdinalIgnoreCase)) return "DIRECTIONAL";
+      if (String.Equals(text, "OMNI", StringComparison.OrdinalIgnoreCase)) return "OMNI";
+      if (String.Equals(text, "SPOT", StringComparison.OrdinalIgnoreCase)) return "SPOT";
+      if (String.Equals(text, "BOX", StringComparison.OrdinalIgnoreCase)) return "BOX";
+
+      // Jedipedia's room reader treats enum property type 3 as one-based:
+      // 1=DIRECTIONAL, 2=OMNI, 3=SPOT.
+      if (Int32.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int raw))
+        return raw == 1 ? "DIRECTIONAL" : raw == 3 ? "SPOT" : "OMNI";
+      return "OMNI";
+    }
+
+    private static bool TryLocalLightColor(object value, out Vector4 color) {
+      if (value is Vector4 direct) { color = direct; return true; }
+      string text = LocalLightText(value);
+      if (String.IsNullOrWhiteSpace(text) || text.StartsWith("[", StringComparison.Ordinal)) { color = default; return false; }
+      string[] parts = text.TrimStart('#').Split(',');
+      if (parts.Length < 3) { color = default; return false; }
+      float[] c = new float[4] { 1, 1, 1, 1 };
+      for (int i = 0; i < Math.Min(parts.Length, 4); i++) {
+        if (!float.TryParse(parts[i].Trim(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out c[i])
+            || !Single.IsFinite(c[i])) { color = default; return false; }
+      }
+      color = new Vector4(c[0], c[1], c[2], c[3]);
+      return true;
+    }
 
     private void ApplyLocalLightProperty(uint name, object value) {
       switch (name) {
-        case 0x36A29A30:
-          IsLocalLight = true;
-          // The room enum is zero-based: 0=DIRECTIONAL, 1=OMNI, 2=SPOT.
-          int type = ToInt(value); LocalLightType = type == 0 ? "DIRECTIONAL" : type == 2 ? "SPOT" : "OMNI"; break;
-        case 0x6CB280CE: IsLocalLight = true; LocalLightSourceOffset = ToFloat(value); break;
-        case 0x16E929FD: IsLocalLight = true; LocalLightRange = Math.Max(.01f, ToFloat(value, 10)); break;
-        case 0x6C84A1CD: IsLocalLight = true; LocalLightIlluminationMap = value?.ToString(); break;
-        case 0xBC68CFF3: IsLocalLight = true; LocalLightIntensity = ToFloat(value, 1); break;
-        case 0x429C878A: IsLocalLight = true; LocalLightRampMap = value?.ToString(); break;
+        case 0x36A29A30: IsLocalLight = true; LocalLightType = LocalLightTypeName(value); break;
+        case 0x6CB280CE: IsLocalLight = true; LocalLightSourceOffset = LocalLightNumber(value, 0); break;
+        case 0x16E929FD: IsLocalLight = true; LocalLightRange = Math.Max(.0001f, LocalLightNumber(value, 1)); break;
+        case 0x6C84A1CD: IsLocalLight = true; LocalLightIlluminationMap = LocalLightText(value); break;
+        case 0xBC68CFF3: IsLocalLight = true; LocalLightIntensity = LocalLightNumber(value, 1); break;
+        case 0x429C878A: IsLocalLight = true; LocalLightRampMap = LocalLightText(value); break;
         case 0x279A7732: IsLocalLight = true; LocalLightRestrictToRoom = ToBool(value); break;
-        case 0xA67AE663: IsLocalLight = true; if (value is Vector4 c) LocalLightColor = c; break;
+        case 0xA67AE663: IsLocalLight = true; if (TryLocalLightColor(value, out Vector4 c)) LocalLightColor = c; break;
         case 0xC5B29609: IsLocalLight = true; LocalLightDoHeightmaps = ToBool(value, true); break;
         case 0x925224AE: IsLocalLight = true; LocalLightDoGranny = ToBool(value, true); break;
         case 0x3902C81A: IsLocalLight = true; LocalLightDoSpeedTree = ToBool(value, true); break;
         case 0xB37CB64C: IsLocalLight = true; LocalLightDoWater = ToBool(value, true); break;
         case 0x0D59B255: IsLocalLight = true; LocalLightDoCharacters = ToBool(value, true); break;
-        case 0x3B92D7B4: IsLocalLight = true; LocalLightFalloff = value?.ToString(); break;
+        case 0x3B92D7B4: IsLocalLight = true; LocalLightFalloff = LocalLightText(value); break;
       }
     }
 
@@ -365,17 +472,46 @@ namespace FileFormats {
     }
 
     public void ReadEmbeddedGeometry() {
-      if (vertexData == null || vertexData.Length < 2) return;
-      string ext = area != null && area.AssetIdMap.TryGetValue(assetID, out AreaAsset asset) ? asset.Extension?.ToLowerInvariant() : null;
-      byte[] data = Decompress(vertexData);
+      string ext = area != null && area.AssetIdMap.TryGetValue(assetID, out AreaAsset asset)
+        ? (asset.Extension ?? String.Empty).Trim().TrimStart('.').ToLowerInvariant() : null;
+      byte[] payload = ext == "rgn" ? regionVolumeData : vertexData;
+      if (payload == null || payload.Length < 2) return;
+      byte[] data = Decompress(payload);
       if (data == null || data.Length < 2) return;
       try {
         using var br = new BinaryReader(new MemoryStream(data, false));
-        if (ext == "wtr") ReadWater(br);
+        if (ext == "rgn") ReadRegionVolume(br);
+        else if (ext == "wtr") ReadWater(br);
         else if (ext == "hms" || ext == null || ext == string.Empty) ReadHeightMap(br);
       } catch (Exception ex) {
         System.Diagnostics.Debug.WriteLine("Could not parse embedded geometry " + ID + ": " + ex.Message);
       }
+    }
+
+    private void ReadRegionVolume(BinaryReader br) {
+      if (br.BaseStream.Length - br.BaseStream.Position < 3) throw new InvalidDataException("Truncated RGN volume");
+      _ = br.ReadByte(); // version; the shipped layouts currently share the same payload structure
+      ushort vertexCount = br.ReadUInt16();
+      if (vertexCount < 3 || vertexCount > 65530 || br.BaseStream.Length - br.BaseStream.Position < (long)vertexCount * 16 + 2)
+        throw new InvalidDataException("Invalid RGN vertex count");
+      Vector3[] positions = new Vector3[vertexCount];
+      float[] heights = new float[vertexCount];
+      Vector3 min = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+      Vector3 max = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+      for (int i = 0; i < vertexCount; i++) {
+        Vector3 position = ReadVec3(br); float extrusion = br.ReadSingle();
+        if (!Single.IsFinite(position.X) || !Single.IsFinite(position.Y) || !Single.IsFinite(position.Z) || !Single.IsFinite(extrusion))
+          throw new InvalidDataException("Non-finite RGN vertex");
+        positions[i] = position; heights[i] = extrusion;
+        min.X = Math.Min(min.X, position.X); min.Y = Math.Min(min.Y, Math.Min(position.Y, position.Y + extrusion)); min.Z = Math.Min(min.Z, position.Z);
+        max.X = Math.Max(max.X, position.X); max.Y = Math.Max(max.Y, Math.Max(position.Y, position.Y + extrusion)); max.Z = Math.Max(max.Z, position.Z);
+      }
+      ushort indexCount = br.ReadUInt16();
+      if (indexCount < 3 || indexCount % 3 != 0 || br.BaseStream.Length - br.BaseStream.Position < (long)indexCount * 2)
+        throw new InvalidDataException("Invalid RGN index count");
+      ushort[] indices = new ushort[indexCount];
+      for (int i = 0; i < indexCount; i++) { ushort index = br.ReadUInt16(); if (index >= vertexCount) throw new InvalidDataException("RGN index out of range"); indices[i] = index; }
+      RegionVolume = new RegionVolumeData { Positions = positions, Heights = heights, Indices = indices, Min = min, Max = max };
     }
 
     // Kept for older call sites.

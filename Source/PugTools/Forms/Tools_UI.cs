@@ -44,7 +44,7 @@ namespace PugTools {
       if (AssetBrowser == null || AssetBrowser.IsDisposed) {
         if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
           MessageBox.Show(
-            "Please select a Previous Assets Path before opening the browser in compare mode.",
+            "Please select a Previous Game Path before opening the browser in compare mode.",
             "Compare Builds",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning
@@ -69,16 +69,14 @@ namespace PugTools {
     }
     private void BtnAssetsPath_Click(Object sender, EventArgs e) {
       FolderBrowserDialog fbd = new FolderBrowserDialog {
-        SelectedPath = txtAssetsPath.Text
+        SelectedPath = txtAssetsPath.Text,
+        Description = "Select the SWTOR game folder (not the Assets subfolder)."
       };
 
-      _ = fbd.ShowDialog();
+      if (fbd.ShowDialog() != DialogResult.OK) return;
 
-      if (fbd.SelectedPath.EndsWith("\\")) {
-        txtAssetsPath.Text = fbd.SelectedPath;
-      } else {
-        txtAssetsPath.Text = fbd.SelectedPath + "\\";
-      }
+      String selectedPath = TorArchive.Assets.NormalizeGamePath(fbd.SelectedPath);
+      txtAssetsPath.Text = selectedPath.EndsWith("\\") ? selectedPath : selectedPath + "\\";
     }
     private void BtnCreateSql_Click(Object sender, EventArgs e) {
       SqlCreate();
@@ -341,7 +339,7 @@ namespace PugTools {
       if (ModelBrowser == null || ModelBrowser.IsDisposed) {
         if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
           MessageBox.Show(
-            "Please select a Previous Assets Path before opening the browser in compare mode.",
+            "Please select a Previous Game Path before opening the browser in compare mode.",
             "Compare Builds",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning
@@ -369,7 +367,7 @@ namespace PugTools {
       if (NodeBrowser == null || NodeBrowser.IsDisposed) {
         if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
           MessageBox.Show(
-            "Please select a Previous Assets Path before opening the browser in compare mode.",
+            "Please select a Previous Game Path before opening the browser in compare mode.",
             "Compare Builds",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning
@@ -395,16 +393,14 @@ namespace PugTools {
     }
     private void BtnPrevAssetsPath_Click(Object sender, EventArgs e) {
       FolderBrowserDialog fbd = new FolderBrowserDialog {
-        SelectedPath = txtPrevAssetsPath.Text
+        SelectedPath = txtPrevAssetsPath.Text,
+        Description = "Select the SWTOR game folder for the previous/compare build."
       };
 
-      _ = fbd.ShowDialog();
+      if (fbd.ShowDialog() != DialogResult.OK) return;
 
-      if (fbd.SelectedPath.EndsWith("\\")) {
-        txtPrevAssetsPath.Text = fbd.SelectedPath;
-      } else {
-        txtPrevAssetsPath.Text = fbd.SelectedPath + "\\";
-      }
+      String selectedPath = TorArchive.Assets.NormalizeGamePath(fbd.SelectedPath);
+      txtPrevAssetsPath.Text = selectedPath.EndsWith("\\") ? selectedPath : selectedPath + "\\";
     }
     private void BtnSearch_Click(Object sender, EventArgs e) {
       DisableButtons();

@@ -51,6 +51,7 @@
     float TimeSeconds;
     int HasColorLut;
     float MapArtOpacity;
+    float ViewerBlueGlow;
     float4x4 TaaReprojection;
     // xy = inverse render-target size, zw = current sub-pixel jitter in pixel/texture coordinates.
     float4 TaaParams0;
@@ -77,6 +78,18 @@
     int HasWaterSurface;
     int HasWaterEnvironment;
     float3 WaterPadding0;
+    // Jedipedia-style NPC nameplate visibility pass. Each entry stores scene-depth UV in xy and
+    // the projected window depth in z; the GPU writes one visibility texel per label.
+    float4 NameplateSamples[192];
+    // xy = main viewport dimensions, zw = inverse main viewport dimensions.
+    float4 NameplateVisibilityParams;
+    float NameplateDepthBias;
+    float3 NameplatePadding0;
+    // Conservative per-object visibility probes. xy = scene-depth UV, z = the nearest depth of the receiver's
+    // world bounding sphere, w = projected radius in pixels. The result is consumed on the following frame.
+    float4 ObjectVisibilitySamples[512];
+    // x = output width, y/z = main viewport width/height, w = depth bias.
+    float4 ObjectVisibilityParams;
 };
 
 cbuffer WorldPerObject {
@@ -86,6 +99,12 @@ cbuffer WorldPerObject {
     float4x4 ShadowMatrix1;
     float4x4 ShadowMatrix2;
     float4x4 ShadowMatrix3;
+};
+
+// Population meshes use the same 256-bone palette path as PugTools' dedicated GR2 viewer. Keeping skinning on
+// the GPU avoids remapping/uploading every NPC vertex every frame while preserving the exact JBA pose matrices.
+cbuffer WorldSkinning {
+    float4x4 SkinPalette[256];
 };
 
 Texture2D DiffuseMap;
@@ -134,6 +153,10 @@ SamplerState PointClamp { Filter = MIN_MAG_MIP_POINT; AddressU = Clamp; AddressV
 SamplerComparisonState ShadowSampler { Filter = COMPARISON_MIN_MAG_LINEAR_MIP_POINT; AddressU = Border; AddressV = Border; ComparisonFunc = Less_Equal; BorderColor = float4(1,1,1,1); };
 
 RasterizerState SolidRS { FillMode = Solid; CullMode = None; DepthClipEnable = TRUE; };
+// Jedipedia feeds authored LOD -3 / OCCLUDER_ONLY geometry into dPVS rather than drawing it. PugTools' D3D11
+// fallback uses the same geometry as a depth-only prepass. A small positive bias pushes the simplified occluder
+// behind coincident visible walls, avoiding holes while still rejecting geometry clearly hidden behind them.
+RasterizerState OccluderRS { FillMode = Solid; CullMode = None; DepthClipEnable = TRUE; DepthBias = 4; SlopeScaledDepthBias = 0.5; };
 // WTR surfaces are authored one-sided. Jedipedia/WebGL culls back faces; rendering the underside in
 // PugTools turns a swamp plane into the huge grey/white horizontal slab seen while flying below it.
 RasterizerState WaterRS { FillMode = Solid; CullMode = Back; FrontCounterClockwise = TRUE; DepthClipEnable = TRUE; };
@@ -142,6 +165,7 @@ DepthStencilState DepthWriteDSS { DepthEnable = TRUE; DepthWriteMask = ALL; Dept
 DepthStencilState DepthReadDSS { DepthEnable = TRUE; DepthWriteMask = ZERO; DepthFunc = LESS_EQUAL; };
 DepthStencilState NoDepthDSS { DepthEnable = FALSE; DepthWriteMask = ZERO; };
 BlendState OpaqueBS { BlendEnable[0] = FALSE; RenderTargetWriteMask[0] = 0x0F; };
+BlendState DepthOnlyBS { BlendEnable[0] = FALSE; RenderTargetWriteMask[0] = 0x00; };
 BlendState AlphaBS {
     BlendEnable[0] = TRUE;
     SrcBlend[0] = SRC_ALPHA;
@@ -174,6 +198,10 @@ BlendState MultiplyBS {
 };
 
 struct VSIn { float3 Pos:POSITION; float3 Normal:NORMAL; float2 Tex:TEXCOORD; float3 Tan:TANGENT; };
+struct SkinnedVSIn {
+    float3 Pos:POSITION; float3 Normal:NORMAL; float2 Tex:TEXCOORD; float3 Tan:TANGENT;
+    float4 Weights:BLENDWEIGHT; uint4 Indices:BLENDINDICES;
+};
 struct VSOut {
     float4 Pos:SV_POSITION;
     float3 WorldPos:TEXCOORD0;
@@ -192,6 +220,38 @@ VSOut WorldVS(VSIn v) {
     o.Tangent = normalize(mul(float4(v.Tan,0), World).xyz);
     o.Tex = v.Tex;
     o.ViewDistance = distance(CameraPosition.xyz, wp.xyz);
+    return o;
+}
+
+VSOut SkinnedWorldVS(SkinnedVSIn v) {
+    VSOut o;
+    float4 localPos=float4(v.Pos,1);
+    float3 localNormal=v.Normal;
+    float3 localTangent=v.Tan;
+    float weightSum=dot(v.Weights,float4(1.0f,1.0f,1.0f,1.0f));
+    if(weightSum>0.00001f) {
+        float4 w=v.Weights/weightSum;
+        localPos=
+            mul(float4(v.Pos,1),SkinPalette[v.Indices.x])*w.x +
+            mul(float4(v.Pos,1),SkinPalette[v.Indices.y])*w.y +
+            mul(float4(v.Pos,1),SkinPalette[v.Indices.z])*w.z +
+            mul(float4(v.Pos,1),SkinPalette[v.Indices.w])*w.w;
+        localNormal=
+            mul(v.Normal,(float3x3)SkinPalette[v.Indices.x])*w.x +
+            mul(v.Normal,(float3x3)SkinPalette[v.Indices.y])*w.y +
+            mul(v.Normal,(float3x3)SkinPalette[v.Indices.z])*w.z +
+            mul(v.Normal,(float3x3)SkinPalette[v.Indices.w])*w.w;
+        localTangent=
+            mul(v.Tan,(float3x3)SkinPalette[v.Indices.x])*w.x +
+            mul(v.Tan,(float3x3)SkinPalette[v.Indices.y])*w.y +
+            mul(v.Tan,(float3x3)SkinPalette[v.Indices.z])*w.z +
+            mul(v.Tan,(float3x3)SkinPalette[v.Indices.w])*w.w;
+    }
+    float4 wp=mul(localPos,World);
+    o.WorldPos=wp.xyz; o.Pos=mul(wp,ViewProj);
+    o.Normal=normalize(mul(float4(normalize(localNormal),0),WorldInvTranspose).xyz);
+    o.Tangent=normalize(mul(float4(normalize(localTangent),0),World).xyz);
+    o.Tex=v.Tex; o.ViewDistance=distance(CameraPosition.xyz,wp.xyz);
     return o;
 }
 
@@ -393,26 +453,24 @@ float3 SampleLocalRamp(int n, float2 uv) {
 
 float3 ProjectedLocalLightMask(int n, float3 worldPos) {
     float4 flags=LocalLightProjectorParams[n];
-    if(flags.y<0.5 && flags.z<0.5) return float3(1,1,1);
 
-    // Jedipedia builds a model matrix whose three axes are scaled by the light Range and then
-    // projects world space through its inverse.  In the native shader those coordinates are
-    // stored as LightInvX/Y/Z/W rows; doing the complete inverse multiplication is equivalent
-    // and avoids row/column convention ambiguity in SlimDX.
+    // Jedipedia always applies the authored projector volume, even when the illumination/falloff
+    // textures themselves are missing (its missing textures resolve to white). Previously PugTools
+    // skipped these bounds entirely and replaced them with a synthetic spherical fade, which made
+    // many indoor .lit volumes either disappear or affect the wrong surfaces.
     float4 local=mul(float4(worldPos,1),LocalLightProjectorInv[n]);
     if(local.w<=0.0) return float3(0,0,0);
     float3 projected=local.xyz/max(local.w,0.0001)*0.5+0.5;
-    float3 mask=float3(1,1,1);
+    if(any(projected.xy<float2(0,0)) || any(projected.xy>float2(1,1))) return float3(0,0,0);
 
-    if(flags.y>=0.5) {
-        if(any(projected.xy<float2(0,0)) || any(projected.xy>float2(1,1))) return float3(0,0,0);
-        mask*=SampleLocalIllumination(n,projected.xy);
-    }
+    float rearProjectionRange=max(1.0-flags.x,0.0001);
+    float compressedRear=(0.5*rearProjectionRange-0.5+projected.z)/rearProjectionRange;
+    float offsetZ=projected.z>0.5?projected.z:compressedRear;
+    if(offsetZ<0.0 || offsetZ>1.0) return float3(0,0,0);
+
+    float3 mask=float3(1,1,1);
+    if(flags.y>=0.5) mask*=SampleLocalIllumination(n,projected.xy);
     if(flags.z>=0.5) {
-        float rearProjectionRange=max(1.0-flags.x,0.0001);
-        float compressedRear=(0.5*rearProjectionRange-0.5+projected.z)/rearProjectionRange;
-        float offsetZ=projected.z>0.5?projected.z:compressedRear;
-        if(offsetZ<0.0 || offsetZ>1.0) return float3(0,0,0);
         // The shipped local Uber/Grass passes pin the second falloff coordinate to the centre row.
         mask*=SampleLocalFalloff(n,float2(offsetZ,0.5));
     }
@@ -431,9 +489,12 @@ float3 LocalLighting(VSOut i, float3 N, float3 V, float3 baseColor) {
         } else {
             float3 delta = LocalLightPosRange[n].xyz - i.WorldPos;
             float dist = length(delta); L = delta / max(dist,0.0001);
-            float range = max(LocalLightPosRange[n].w,0.001);
-            attenuation = saturate(1 - dist/range); attenuation *= attenuation;
+            // SWTOR/Jedipedia shapes ordinary OMNI/BOX lights with the projector and authored falloff
+            // texture. The old extra quadratic radial fade attenuated the same light a second time and
+            // was the main reason interiors remained almost black even when a .lit volume was selected.
             if (type >= 1.5) {
+                float range = max(LocalLightPosRange[n].w,0.001);
+                attenuation = saturate(1 - dist/range); attenuation *= attenuation;
                 float3 spotDir = normalize(LocalLightDirType[n].xyz);
                 float cone = saturate((dot(-L,spotDir)-0.55)/0.35);
                 attenuation *= cone*cone;
@@ -445,11 +506,13 @@ float3 LocalLighting(VSOut i, float3 N, float3 V, float3 baseColor) {
 
         // Local lights have their own authored ramp in SWTOR.  The game samples it with the same
         // 0.484375 incidence mapping as the environment ramp and the fully-lit V row.
-        float3 authoredLighting=float3(ndl,ndl,ndl);
-        if(LocalLightProjectorParams[n].w>=0.5) {
-            float3 ramp=SampleLocalRamp(n,float2(saturate(ndl*0.484375+0.5),0.75));
-            authoredLighting=ramp*1.05*(0.15*ndl+0.925);
-        }
+        // Jedipedia always has a ramp here: a missing authored RampMap is a 1x1 white fallback, not
+        // Lambert lighting. That distinction is large indoors because the game's local-light pass is nearly
+        // full-energy even at grazing incidence; the ramp carries the authored shape.
+        float3 ramp=float3(1,1,1);
+        if(LocalLightProjectorParams[n].w>=0.5)
+            ramp=SampleLocalRamp(n,float2(saturate(ndl*0.484375+0.5),0.75));
+        float3 authoredLighting=ramp*1.05*(0.15*ndl+0.925);
         float3 H = normalize(L+V);
         float spec = pow(saturate(dot(N,H)),24);
         float3 lightEnergy=LocalLightColorIntensity[n].rgb*LocalLightColorIntensity[n].a*attenuation*projectorMask;
@@ -477,9 +540,13 @@ float4 ApplyFog(float4 color, VSOut i) {
 
 float4 DynamicDetailPS(DydOut i):SV_Target {
     if(i.DistanceFade<0.001)discard;
-    float4 diffuse=HasDiffuse!=0?DiffuseMap.Sample(LinearWrap,i.Tex):float4(.2,.55,.18,1);
-    float cut=AlphaTestValue>0?AlphaTestValue:0.5;
-    if(diffuse.a<cut)discard;
+    // Match SWTOR/Jedipedia's DynamicDetailGrass cutout path: a billboard without its authored diffuse texture must
+    // not fall back to a solid coloured card, and surviving texels are opaque depth-writing coverage after AlphaRef.
+    // This is the important distinction between real grass silhouettes and the large green rectangles seen when a
+    // streamed/failed material was rendered without its texture.
+    if(HasDiffuse==0)discard;
+    float4 diffuse=DiffuseMap.Sample(LinearWrap,i.Tex);
+    if(diffuse.a<(AlphaTestValue>0?AlphaTestValue:0.5))discard;
     VSOut baseInput;
     baseInput.Pos=float4(0,0,0,1);baseInput.WorldPos=i.WorldPos;baseInput.Normal=i.Normal;baseInput.Tangent=float3(1,0,0);baseInput.Tex=i.Tex;baseInput.ViewDistance=i.ViewDistance;
     float shade=CascadeShadow(baseInput)*ScrollingCloudShade(i.WorldPos);
@@ -491,10 +558,11 @@ float4 DynamicDetailPS(DydOut i):SV_Target {
         rgb+=LocalLighting(baseInput,normalize(i.Normal),V,diffuse.rgb*i.Tint);
         float toneExp=max(1.08-0.13*(shade*i.Ndl+dot(backlight,float3(.299,.587,.114))),0.0001);rgb=pow(max(rgb,float3(0,0,0)),float3(toneExp,toneExp,toneExp));
     }
-    return ApplyFog(float4(rgb,1),baseInput);
+    return ApplyFog(float4(rgb,1.0),baseInput);
 }
 float4 DynamicDetailShadowPS(DydOut i):SV_Target {
-    float4 diffuse=HasDiffuse!=0?DiffuseMap.Sample(LinearWrap,i.Tex):float4(1,1,1,1);
+    if(HasDiffuse==0)discard;
+    float4 diffuse=DiffuseMap.Sample(LinearWrap,i.Tex);
     if(i.DistanceFade<0.001||diffuse.a<(AlphaTestValue>0?AlphaTestValue:0.5))discard;
     return 0;
 }
@@ -528,6 +596,15 @@ void EvaluateMaterial(VSOut i, out float4 c, out float3 N, out float4 glossSampl
     if (AlphaMode == 1 && c.a < AlphaTestValue) discard;
 }
 
+float3 ApplyViewerBlueGlow(float3 rgb, float alphaValue) {
+    if(ViewerBlueGlow<=0.5) return rgb;
+    // Match Jedipedia's injected interaction tint for the corresponding SWTOR blend families.
+    if(AlphaMode<=1) return float3(0.0,0.28,0.9)+rgb*0.55;
+    if(AlphaMode==2) return rgb+float3(0.0,0.28,0.9);
+    if(AlphaMode==3) return lerp(rgb,float3(0.18,0.45,1.0),0.55);
+    return float3(0.0,0.28,0.9)*alphaValue+rgb*0.55;
+}
+
 float4 LitPS(VSOut i):SV_Target {
     float4 c; float3 N; float4 glossSample; EvaluateMaterial(i,c,N,glossSample);
     float3 V=normalize(CameraPosition.xyz-i.WorldPos);
@@ -550,7 +627,17 @@ float4 LitPS(VSOut i):SV_Target {
         outColor*=1.0-emissiveLum;
         outColor+=c.rgb*emissiveLum;
     }
+    outColor=ApplyViewerBlueGlow(outColor,c.a);
     return ApplyFog(float4(outColor,c.a),i);
+}
+
+// Jedipedia/SWTOR local lights are additive material re-draws after the ordinary environment pass. The
+// first PugTools pass still evaluates four lights in-place for efficiency; this shader is used only for receiver
+// lights beyond those four, so it must output local-light energy alone (no fog/environment/emissive duplication).
+float4 LocalLightAddPS(VSOut i):SV_Target {
+    float4 c; float3 N; float4 glossSample; EvaluateMaterial(i,c,N,glossSample);
+    float3 V=normalize(CameraPosition.xyz-i.WorldPos);
+    return float4(LocalLighting(i,N,V,c.rgb),0);
 }
 
 float4 HookOverlayPS(VSOut i):SV_Target {
@@ -575,7 +662,7 @@ float4 HookAdditivePS(VSOut i):SV_Target {
     return float4(rgb*HookOpacity,intensity);
 }
 
-float4 UnlitPS(VSOut i):SV_Target { float4 c; float3 n; float4 g; EvaluateMaterial(i,c,n,g); return ApplyFog(c,i); }
+float4 UnlitPS(VSOut i):SV_Target { float4 c; float3 n; float4 g; EvaluateMaterial(i,c,n,g); c.rgb=ApplyViewerBlueGlow(c.rgb,c.a); return ApplyFog(c,i); }
 float4 SkyPS(VSOut i):SV_Target {
     // Jedipedia/SWTOR Skydome.fx is intentionally much simpler than the ordinary material path:
     // sample DiffuseMap with the authored primary UVs, output RGB, force opaque alpha. Applying tint/alpha/fog
@@ -654,6 +741,12 @@ float4 TerrainLitPS(VSOut i):SV_Target {
     fogged.rgb*=layerWeight;
     return float4(fogged.rgb,1);
 }
+float4 TerrainLocalLightAddPS(VSOut i):SV_Target {
+    float3 diffuseColor,N;float4 glossSample;float layerWeight;EvaluateTerrain(i,diffuseColor,N,glossSample,layerWeight);
+    float3 V=normalize(CameraPosition.xyz-i.WorldPos);
+    return float4(LocalLighting(i,N,V,diffuseColor)*layerWeight,0);
+}
+
 float4 TerrainUnlitPS(VSOut i):SV_Target {
     float3 diffuseColor,N;float4 glossSample;float layerWeight;EvaluateTerrain(i,diffuseColor,N,glossSample,layerWeight);
     float4 fogged=ApplyFog(float4(diffuseColor,1),i);fogged.rgb*=layerWeight;return float4(fogged.rgb,1);
@@ -792,6 +885,74 @@ PostOut PostVS(uint id:SV_VertexID){
     float2 p=id==0?float2(-1,-1):(id==1?float2(-1,3):float2(3,-1));
     o.Pos=float4(p,0,1); o.Tex=float2(p.x*.5+.5, .5-p.y*.5); return o;
 }
+struct NameplateVisibilityOut {
+    float4 Pos : SV_POSITION;
+    float3 Sample : TEXCOORD0;
+};
+
+NameplateVisibilityOut NameplateVisibilityVS(uint vertexId : SV_VertexID) {
+    NameplateVisibilityOut o;
+    float2 viewport=max(NameplateVisibilityParams.xy,float2(1,1));
+    // The visibility render target is only 192x1, but the normal scene viewport is deliberately
+    // retained. Place vertex N at main-viewport pixel (N,0), which maps directly to target texel N
+    // without needing a second SlimDX Viewport object.
+    float2 pixel=float2((float)vertexId+0.5,0.5);
+    float2 ndc=float2(pixel.x/viewport.x*2.0-1.0,1.0-pixel.y/viewport.y*2.0);
+    o.Pos=float4(ndc,0,1);
+    o.Sample=NameplateSamples[vertexId].xyz;
+    return o;
+}
+
+float4 NameplateVisibilityPS(NameplateVisibilityOut i) : SV_Target {
+    // Same five-tap cross as Jedipedia: a one-pixel cable/railing crossing the anchor should not
+    // make the complete label flicker. Any unobstructed sample counts as visible.
+    const float2 taps[5]={
+        float2(0,0),float2(3,0),float2(-3,0),float2(0,3),float2(0,-3)
+    };
+    float visible=0;
+    [unroll] for(int n=0;n<5;n++) {
+        float2 uv=saturate(i.Sample.xy+taps[n]*NameplateVisibilityParams.zw);
+        float sceneZ=SceneDepthMap.SampleLevel(PointClamp,uv,0).r;
+        if(i.Sample.z<=sceneZ+NameplateDepthBias) visible=1;
+    }
+    return float4(visible,0,0,1);
+}
+
+struct ObjectVisibilityOut {
+    float4 Pos : SV_POSITION;
+    float4 Sample : TEXCOORD0;
+};
+
+ObjectVisibilityOut ObjectVisibilityVS(uint vertexId : SV_VertexID) {
+    ObjectVisibilityOut o;
+    float outputWidth=max(ObjectVisibilityParams.x,1.0);
+    float x=((float(vertexId)+0.5)/outputWidth)*2.0-1.0;
+    o.Pos=float4(x,0,0,1);
+    o.Sample=ObjectVisibilitySamples[vertexId];
+    return o;
+}
+
+float4 ObjectVisibilityPS(ObjectVisibilityOut i) : SV_Target {
+    // This is deliberately more conservative than a screen-space bounding-box query. A receiver is considered
+    // hidden only when the nearest point of its bounding sphere is behind scene depth at thirteen samples spread
+    // across the projected disk. Samples outside the real mesh see background and therefore fail open.
+    const float2 taps[13]={
+        float2(0,0),
+        float2(.78,0),float2(-.78,0),float2(0,.78),float2(0,-.78),
+        float2(.55,.55),float2(-.55,.55),float2(.55,-.55),float2(-.55,-.55),
+        float2(.32,0),float2(-.32,0),float2(0,.32),float2(0,-.32)
+    };
+    float2 invViewport=1.0/max(ObjectVisibilityParams.yz,float2(1,1));
+    float2 radiusUv=i.Sample.w*invViewport;
+    [unroll] for(int n=0;n<13;n++) {
+        float2 uv=i.Sample.xy+taps[n]*radiusUv;
+        if(any(uv<0.0)||any(uv>1.0)) return float4(1,0,0,1);
+        float sceneZ=SceneDepthMap.SampleLevel(PointClamp,uv,0).r;
+        if(i.Sample.z<=sceneZ+ObjectVisibilityParams.w) return float4(1,0,0,1);
+    }
+    return float4(0,0,0,1);
+}
+
 float3 PostRgbToYCoCg(float3 c) {
     return float3(0.25*c.r + 0.5*c.g + 0.25*c.b, 0.5*c.r - 0.5*c.b, -0.25*c.r + 0.5*c.g - 0.25*c.b);
 }
@@ -884,6 +1045,15 @@ float4 PostPS(PostOut i):SV_Target{
 }
 
 technique11 Lit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
+technique11 SkinnedLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,SkinnedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
+technique11 SkinnedLocalLightAdd { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,SkinnedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LocalLightAddPS())); } }
+technique11 SkinnedAlphaTestLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,SkinnedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
+technique11 SkinnedAlphaLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,SkinnedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
+technique11 SkinnedAddLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,SkinnedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
+technique11 SkinnedMultiplyLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(MultiplyBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,SkinnedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
+technique11 SkinnedUnlit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,SkinnedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,UnlitPS())); } }
+technique11 SkinnedWire { pass P0 { SetRasterizerState(WireRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,SkinnedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,UnlitPS())); } }
+technique11 LocalLightAdd { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LocalLightAddPS())); } }
 technique11 AlphaTestLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
 technique11 AlphaLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
 technique11 AddLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
@@ -895,16 +1065,20 @@ technique11 Sky { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(De
 technique11 TerrainCoverage { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,TerrainCoveragePS())); } }
 technique11 TerrainLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,TerrainLitPS())); } }
 technique11 TerrainAddLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,TerrainLitPS())); } }
+technique11 TerrainLocalLightAdd { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,TerrainLocalLightAddPS())); } }
 technique11 TerrainUnlit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,TerrainUnlitPS())); } }
 technique11 TerrainAddUnlit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,TerrainUnlitPS())); } }
 technique11 Height { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,HeightPS())); } }
 technique11 Wire { pass P0 { SetRasterizerState(WireRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,UnlitPS())); } }
 technique11 Water { pass P0 { SetRasterizerState(WaterRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,WaterPS())); } }
 technique11 Overlay { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,OverlayPS())); } }
+technique11 MapMarker { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,OverlayPS())); } }
 technique11 MapArt { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,MapArtPS())); } }
 technique11 Shadow { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,ShadowVS())); SetGeometryShader(NULL); SetPixelShader(NULL); } }
+technique11 OccluderDepth { pass P0 { SetRasterizerState(OccluderRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(DepthOnlyBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,ShadowVS())); SetGeometryShader(NULL); SetPixelShader(NULL); } }
 technique11 AlphaShadow { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,InstancedAlphaShadowPS())); } }
 technique11 InstancedLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,InstancedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
+technique11 InstancedLocalLightAdd { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,InstancedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LocalLightAddPS())); } }
 technique11 InstancedAlphaTestLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,InstancedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
 technique11 InstancedAlphaLit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,InstancedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,LitPS())); } }
 technique11 InstancedUnlit { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,InstancedWorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,UnlitPS())); } }
@@ -915,3 +1089,5 @@ technique11 DynamicDetailShadow { pass P0 { SetRasterizerState(SolidRS); SetDept
 technique11 TemporalAA { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,PostVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,TemporalAAPS())); } }
 technique11 FXAA { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,PostVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxaaPS())); } }
 technique11 PostProcess { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,PostVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,PostPS())); } }
+technique11 NameplateVisibility { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,NameplateVisibilityVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,NameplateVisibilityPS())); } }
+technique11 ObjectVisibility { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,ObjectVisibilityVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,ObjectVisibilityPS())); } }

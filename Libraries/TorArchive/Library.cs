@@ -42,17 +42,32 @@ namespace TorArchive {
       Name = name;
     }
 
+    // Direct archive (for swtor/publictest retailclient TOR files). These archives do not use
+    // the swtor_<library>_<n>.tor naming convention, so keep the exact path and query the
+    // Archive hash table directly instead of duplicating it in a Library metadata index.
+    public Library(String name, String[] archiveFilePaths) : this() {
+      if (archiveFilePaths == null || archiveFilePaths.Length == 0)
+        throw new ArgumentException("No archive paths were provided", nameof(archiveFilePaths));
+
+      Environment = CLIENT;
+      Location = Path.GetDirectoryName(archiveFilePaths[0]) ?? String.Empty;
+      Name = name;
+      m_explicitArchivePaths = archiveFilePaths;
+    }
+
     #endregion Constructor
 
     #region Fields
     private readonly Dictionary<UInt64, String> m_duplicateDict;
     private readonly Object m_lockObject;
     private readonly Dictionary<UInt64, MetadataEntry> m_metadataLookup;
+    private readonly String[] m_explicitArchivePaths;
 
     private const Byte LIVE = 0;
     private const Byte PTS  = 1;
-    private const Byte RED  = 2;
-    private const Byte BETA = 3;
+    private const Byte RED    = 2;
+    private const Byte BETA   = 3;
+    private const Byte CLIENT = 4;
 
     #endregion Fields
 
@@ -101,12 +116,24 @@ namespace TorArchive {
 
       FileId fileId = FileId.FromFilePath(path);
 
+      if (m_explicitArchivePaths != null) {
+        foreach (Archive archive in Archives.Values) {
+          File directResult = archive.FindFile(fileId);
+          if (directResult == null) continue;
+
+          directResult.FilePath = path;
+          return directResult;
+        }
+
+        return null;
+      }
+
       if (!m_metadataLookup.TryGetValue(fileId.AsUInt64(), out MetadataEntry metadata)) {
         return null;
       }
 
-      Archive archive = Archives[metadata.Archive];
-      File result = archive.FindFile(fileId);
+      Archive archiveWithMetadata = Archives[metadata.Archive];
+      File result = archiveWithMetadata.FindFile(fileId);
 
       if (result != null) {
         result.FilePath = path;
@@ -123,6 +150,20 @@ namespace TorArchive {
       lock (m_lockObject) {
         if (Loaded) {
           //Check again just in case.
+          return;
+        }
+
+        if (m_explicitArchivePaths != null) {
+          Int32 archiveIndex = 1;
+          foreach (String archivePath in m_explicitArchivePaths) {
+            if (!System.IO.File.Exists(archivePath)) continue;
+            Archives[archiveIndex++] = new Archive(archivePath, this);
+          }
+
+          if (Archives.Count == 0)
+            throw new InvalidOperationException($"Cannot find archive files for library named {Name} in {Location}");
+
+          Loaded = true;
           return;
         }
 
