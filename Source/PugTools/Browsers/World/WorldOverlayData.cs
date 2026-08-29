@@ -104,6 +104,9 @@ namespace PugTools {
     public int VariantIndex { get; set; }
     public int VariantCount { get; set; } = 1;
     public string DynStartState { get; set; }
+    // Cached from the plc.* prototype. Plain-click interaction can therefore consider only real elevator controls
+    // instead of letting an unrelated spawned prop's broad bounds swallow the click in front of a Wonkavator panel.
+    public long WonkaPackageId { get; set; }
     public bool BlueGlow { get; set; }
     public readonly List<WorldSpawnPointPose> SpawnPoints = new List<WorldSpawnPointPose>();
     // Models remains the union of all visual models so the renderer can build GPU buffers once. DynStates contains

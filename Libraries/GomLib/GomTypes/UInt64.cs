@@ -6,7 +6,7 @@ namespace GomLib.GomTypes {
     public override System.Boolean ConfirmType(GomBinaryReader reader)
       => reader.ReadByte() == (Byte)TypeId;
     public override Object ReadData(DataObjectModel dom, GomBinaryReader reader)
-      => reader.ReadNumber();
+      => reader.ReadIdNumber();
 
     public override System.String ToString() => "UInt64";
   }

@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using FileFormats;
 using GomLib;
 using GomLib.Models;
@@ -281,35 +282,189 @@ namespace PugTools {
       public int TraversalStyle = 1;
     }
 
+    private sealed class LegacySpawnerDefinition {
+      public readonly List<string> EntityFqns = new List<string>();
+      public string PathFqn;
+    }
+
+    private static readonly object LegacySpawnerBundleLock = new object();
+    private static Dictionary<string, LegacySpawnerDefinition> legacySpawnerDefinitions;
+    private static bool legacySpawnerBundleAttempted;
+
     private SpawnerPreviewInfo ResolveSpawnerPreviewInfo(string spnFqn) {
       var result = new SpawnerPreviewInfo();
-      GomObject spawner = currentDom.GetObject(spnFqn);
-      if (spawner == null) return result;
 
-      var list = spawner.Data.ValueOrDefault<List<object>>("spnEntityList", null);
-      if (list == null) return result;
-      bool firstResolvedRow = true;
-      var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-      foreach (object entry in list) {
-        if (entry is not GomObjectData row) continue;
-        object entityReference = row.ValueOrDefault<object>("spnEntityFqn", null) ?? row.ValueOrDefault<object>("spnEntityId", null);
-        string resolved = ResolveGomReferenceName(entityReference);
-        if (String.IsNullOrWhiteSpace(resolved)) continue;
-        if (seen.Add(resolved)) result.EntityFqns.Add(resolved);
+      // Current releases provide spnDispenserTemplate nodes directly. Releases before 1.4 do not:
+      // Jedipedia deliberately stops its compatibility snapshot at the spawner boundary so npc/plc/dyn/npp
+      // still resolve from the actually selected beta archives. Do the same here.
+      GomObject spawner = null;
+      try { spawner = currentDom.GetObject(spnFqn); } catch { }
 
-        // spnEntityList is alternatives rather than a group. Jedipedia uses the FIRST readable row for the route,
-        // even while it cycles every distinct entity in the list. Weighted duplicate rows are deduplicated above.
-        if (firstResolvedRow) {
-          firstResolvedRow = false;
-          var paths = row.ValueOrDefault<List<object>>("spnPathList", null);
-          if (paths != null) foreach (object pathReference in paths) {
-            string path = ResolveGomReferenceName(pathReference);
-            if (String.IsNullOrWhiteSpace(path) || path.StartsWith("pth.generic.", StringComparison.OrdinalIgnoreCase)) continue;
-            result.PathFqn = path;
-            result.TraversalStyle = ResolveSpnTraversalStyle(path);
-            break;
+      if (spawner != null) {
+        var list = spawner.Data.ValueOrDefault<List<object>>("spnEntityList", null);
+        if (list != null) {
+          bool firstResolvedRow = true;
+          var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+          foreach (object entry in list) {
+            if (entry is not GomObjectData row) continue;
+            object entityReference = row.ValueOrDefault<object>("spnEntityFqn", null) ?? row.ValueOrDefault<object>("spnEntityId", null);
+            string resolved = ResolveGomReferenceName(entityReference);
+            if (String.IsNullOrWhiteSpace(resolved)) continue;
+            if (seen.Add(resolved)) result.EntityFqns.Add(resolved);
+
+            // spnEntityList is alternatives rather than a group. Jedipedia uses the FIRST readable row for the route.
+            if (firstResolvedRow) {
+              firstResolvedRow = false;
+              var paths = row.ValueOrDefault<List<object>>("spnPathList", null);
+              if (paths != null) foreach (object pathReference in paths) {
+                string path = ResolveGomReferenceName(pathReference);
+                if (String.IsNullOrWhiteSpace(path) || path.StartsWith("pth.generic.", StringComparison.OrdinalIgnoreCase)) continue;
+                result.PathFqn = path;
+                result.TraversalStyle = ResolveSpnTraversalStyle(path);
+                break;
+              }
+            }
           }
         }
+      }
+
+      if (result.EntityFqns.Count == 0) {
+        LegacySpawnerDefinition legacy = FindLegacySpawnerDefinition(spnFqn);
+        if (legacy != null) {
+          result.EntityFqns.AddRange(legacy.EntityFqns);
+          result.PathFqn = legacy.PathFqn;
+          result.TraversalStyle = ResolveSpnTraversalStyle(legacy.PathFqn);
+        }
+      }
+      return result;
+    }
+
+    private static LegacySpawnerDefinition FindLegacySpawnerDefinition(string spnFqn) {
+      if (String.IsNullOrWhiteSpace(spnFqn)) return null;
+      EnsureLegacySpawnerBundle();
+      if (legacySpawnerDefinitions == null) return null;
+      legacySpawnerDefinitions.TryGetValue(spnFqn.Trim(), out LegacySpawnerDefinition result);
+      return result;
+    }
+
+    private static void EnsureLegacySpawnerBundle() {
+      if (legacySpawnerBundleAttempted) return;
+      lock (LegacySpawnerBundleLock) {
+        if (legacySpawnerBundleAttempted) return;
+        legacySpawnerBundleAttempted = true;
+        try {
+          string path = Path.Combine(AppContext.BaseDirectory, "Tools", "spn-legacy-v1.bin");
+          if (!System.IO.File.Exists(path)) return;
+
+          byte[] container = System.IO.File.ReadAllBytes(path);
+          if (container.Length < 16) throw new InvalidDataException("Legacy SPN bundle has a truncated container header.");
+
+          byte[] data;
+          using (var header = new BinaryReader(new MemoryStream(container, false))) {
+            const uint containerMagic = 0x5A50534A; // JSPZ
+            if (header.ReadUInt32() != containerMagic) throw new InvalidDataException("Legacy SPN bundle has an invalid container magic.");
+            uint version = header.ReadUInt32();
+            uint outputBytes = header.ReadUInt32();
+            uint compressedBytes = header.ReadUInt32();
+            if (version != 1 || outputBytes < 32 || outputBytes > 0x1000000 ||
+                compressedBytes == 0 || (ulong)compressedBytes != (ulong)(container.Length - 16))
+              throw new InvalidDataException("Legacy SPN bundle has invalid container lengths.");
+
+            int compressedLength = checked((int)compressedBytes);
+            if (compressedLength != container.Length - 16)
+              throw new InvalidDataException("Legacy SPN bundle compressed length does not match the file.");
+            byte[] compressed = new byte[compressedLength];
+            Buffer.BlockCopy(container, 16, compressed, 0, compressed.Length);
+            using var decompressor = new ZstdSharp.Decompressor();
+            data = decompressor.Unwrap(compressed, checked((int)outputBytes)).ToArray();
+            if (data.Length != outputBytes) throw new InvalidDataException("Legacy SPN bundle decompressed to the wrong length.");
+          }
+
+          legacySpawnerDefinitions = ParseLegacySpawnerData(data);
+        } catch (Exception ex) {
+          legacySpawnerDefinitions = null;
+          System.Diagnostics.Debug.WriteLine("Legacy SPN bundle could not be loaded: " + ex.Message);
+        }
+      }
+    }
+
+    private static Dictionary<string, LegacySpawnerDefinition> ParseLegacySpawnerData(byte[] data) {
+      const uint dataMagic = 0x4E50534A; // JSPN
+      const uint noString = 0xFFFFFFFF;
+      const int headerBytes = 32;
+      const int recordBytes = 16;
+
+      if (data == null || data.Length < headerBytes) throw new InvalidDataException("Legacy SPN data is truncated.");
+      using var br = new BinaryReader(new MemoryStream(data, false));
+      if (br.ReadUInt32() != dataMagic) throw new InvalidDataException("Legacy SPN data has an invalid magic.");
+      if (br.ReadUInt32() != 1) throw new InvalidDataException("Legacy SPN data has an unsupported version.");
+
+      uint recordCount = br.ReadUInt32();
+      uint refCount = br.ReadUInt32();
+      uint stringCount = br.ReadUInt32();
+      uint recordsOffset = br.ReadUInt32();
+      uint refsOffset = br.ReadUInt32();
+      uint stringOffsetsOffset = br.ReadUInt32();
+
+      ulong expectedRefs = (ulong)recordsOffset + (ulong)recordCount * recordBytes;
+      ulong expectedStringOffsets = (ulong)refsOffset + (ulong)refCount * 4UL;
+      if (recordsOffset != headerBytes || expectedRefs != refsOffset || expectedStringOffsets != stringOffsetsOffset)
+        throw new InvalidDataException("Legacy SPN data has invalid section offsets.");
+
+      ulong stringsOffset64 = (ulong)stringOffsetsOffset + ((ulong)stringCount + 1UL) * 4UL;
+      if (stringsOffset64 > (ulong)data.Length) throw new InvalidDataException("Legacy SPN string table is truncated.");
+      int stringsOffset = checked((int)stringsOffset64);
+
+      br.BaseStream.Position = stringOffsetsOffset;
+      uint[] stringOffsets = new uint[checked((int)stringCount + 1)];
+      uint previous = 0;
+      for (int i = 0; i < stringOffsets.Length; i++) {
+        uint current = br.ReadUInt32();
+        if ((i == 0 && current != 0) || current < previous || stringsOffset64 + current > (ulong)data.Length)
+          throw new InvalidDataException("Legacy SPN data has invalid string offsets.");
+        stringOffsets[i] = current;
+        previous = current;
+      }
+      if (stringsOffset64 + previous != (ulong)data.Length)
+        throw new InvalidDataException("Legacy SPN data has an invalid string sentinel.");
+
+      string GetString(uint index) {
+        if (index >= stringCount) return String.Empty;
+        int from = checked(stringsOffset + (int)stringOffsets[index]);
+        int to = checked(stringsOffset + (int)stringOffsets[index + 1]);
+        return Encoding.ASCII.GetString(data, from, to - from);
+      }
+
+      br.BaseStream.Position = refsOffset;
+      uint[] refs = new uint[checked((int)refCount)];
+      for (int i = 0; i < refs.Length; i++) {
+        refs[i] = br.ReadUInt32();
+        if (refs[i] >= stringCount) throw new InvalidDataException("Legacy SPN data has an invalid entity reference.");
+      }
+
+      var result = new Dictionary<string, LegacySpawnerDefinition>(StringComparer.OrdinalIgnoreCase);
+      br.BaseStream.Position = recordsOffset;
+      for (uint i = 0; i < recordCount; i++) {
+        uint fqnString = br.ReadUInt32();
+        uint refStart = br.ReadUInt32();
+        ushort rowRefCount = br.ReadUInt16();
+        ushort reserved = br.ReadUInt16();
+        uint pathString = br.ReadUInt32();
+        if (fqnString >= stringCount || reserved != 0 || (ulong)refStart + rowRefCount > refCount ||
+            (pathString != noString && pathString >= stringCount))
+          throw new InvalidDataException("Legacy SPN data has an invalid spawner record.");
+
+        string fqn = GetString(fqnString);
+        if (String.IsNullOrWhiteSpace(fqn)) continue;
+        var definition = new LegacySpawnerDefinition();
+        for (uint r = 0; r < rowRefCount; r++) {
+          string entity = GetString(refs[checked((int)(refStart + r))]);
+          if (!String.IsNullOrWhiteSpace(entity) &&
+              !definition.EntityFqns.Contains(entity, StringComparer.OrdinalIgnoreCase))
+            definition.EntityFqns.Add(entity);
+        }
+        if (pathString != noString) definition.PathFqn = GetString(pathString);
+        result[fqn] = definition;
       }
       return result;
     }
@@ -419,7 +574,8 @@ namespace PugTools {
       float scale = visual.ValueOrDefault<float>("cosTemplateVisualDataScale", 1f);
       if (!(scale > 0)) scale = visual.ValueOrDefault<float>("npcTemplateVisualDataScaleAdjustment", 1f);
       if (!(scale > 0)) scale = 1f;
-      string bodyType = appearance.BodyType;
+      string bodyType = visual.ValueOrDefault<string>("npcTemplateVisualDataCharSpec", null);
+      if (String.IsNullOrWhiteSpace(bodyType)) bodyType = appearance.BodyType;
       if (String.IsNullOrWhiteSpace(bodyType) && appearance.AppearanceSlotMap != null) {
         AppSlot bodySlot = appearance.AppearanceSlotMap.Values.Where(x => x != null).SelectMany(x => x).FirstOrDefault(x => x != null && !String.IsNullOrWhiteSpace(x.BodyType));
         bodyType = bodySlot?.BodyType;
@@ -430,7 +586,7 @@ namespace PugTools {
         BodyType = bodyType, Animation = ResolveNpcAnimationClip(null, bodyType, animationCache),
         AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, fqn)
       };
-      foreach (GR2 model in GetNpcAppearanceModels(appearance, appearanceCache)) placement.Models.Add(model);
+      foreach (GR2 model in GetNpcAppearanceModels(appearance, appearanceCache, bodyType)) placement.Models.Add(model);
       placement.Items = ResolveVisualItemNames(visual);
       return placement.Models.Count > 0 ? placement : null;
     }
@@ -449,7 +605,9 @@ namespace PugTools {
       string title = npc.Title;
       if (npc.LocalizedTitle != null && npc.LocalizedTitle.TryGetValue(GomLib.StringTable.SelectedLocalization, out string localizedTitle) && !String.IsNullOrWhiteSpace(localizedTitle)) title = localizedTitle;
       string displayName = LocalizedNpcName(npc, sourceFqn);
-      string bodyType = appearance.BodyType;
+      // The wearer character spec, not the NPP's authored body type, owns [bt]/[gen].
+      // Jedipedia found thousands of appearance/wearer pairs where those differ.
+      string bodyType = !String.IsNullOrWhiteSpace(visual.CharSpec) ? visual.CharSpec : appearance.BodyType;
       if (String.IsNullOrWhiteSpace(bodyType) && appearance.AppearanceSlotMap != null) {
         AppSlot bodySlot = appearance.AppearanceSlotMap.Values.Where(x => x != null).SelectMany(x => x).FirstOrDefault(x => x != null && !String.IsNullOrWhiteSpace(x.BodyType));
         bodyType = bodySlot?.BodyType;
@@ -462,7 +620,7 @@ namespace PugTools {
         RepublicReaction = npc.DetFaction?.RepublicReaction, ImperialReaction = npc.DetFaction?.ImperialReaction, HasFactionPackage = npc.DetFaction != null,
         IdleAnimationName = idleAnimationName, AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn), BodyType = bodyType, Animation = animation
       };
-      foreach (GR2 model in GetNpcAppearanceModels(appearance, appearanceCache)) placement.Models.Add(model);
+      foreach (GR2 model in GetNpcAppearanceModels(appearance, appearanceCache, bodyType)) placement.Models.Add(model);
       return placement.Models.Count > 0 ? placement : null;
     }
 
@@ -872,11 +1030,22 @@ namespace PugTools {
       string name = placeable?.Name;
       if (placeable?.LocalizedName != null && placeable.LocalizedName.TryGetValue(GomLib.StringTable.SelectedLocalization, out string localized) && IsRealLocalizedName(localized, sourceFqn)) name = localized;
       if (!IsRealLocalizedName(name, sourceFqn)) name = PrettySpawnName(sourceFqn);
+      long wonkaPackageId = placeable?.WonkaPackageId ?? 0;
+      if (wonkaPackageId == 0) wonkaPackageId = WonkInt64(node?.Data.ValueOrDefault<object>("wnkPackageID", null));
+      bool blueGlow = SpnPlaceableHasBlueGlow(placeable, node);
+      // A dyn row's Usable bit says WHICH part of an already-interactive plc receives the click; it does not make a
+      // shared dyn assembly interactive on its own. Jedipedia applies the same parent gate. Without it, reused dyn
+      // models can light stray "buttons" on ordinary props and make the Wonkavator controls look visually corrupted.
+      if (!blueGlow && dynTemplate != null) {
+        foreach (WorldSpnDynState state in dynTemplate.States)
+          foreach (WorldSpnDynPart part in state.Parts) if (part != null) part.BlueGlow = false;
+      }
       var placement = new WorldSpnPlacement {
         Room = room, Instance = instance, SourceFqn = sourceFqn, Name = name, Scale = 1f, Animation = animation,
         AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn),
         DynStartState = dynTemplate?.StartState,
-        BlueGlow = SpnPlaceableHasBlueGlow(placeable, node)
+        WonkaPackageId = wonkaPackageId,
+        BlueGlow = blueGlow
       };
       if (loaded != null) foreach (GR2 model in loaded) if (model != null && !placement.Models.Contains(model)) placement.Models.Add(model);
       if (dynTemplate != null) {
@@ -996,13 +1165,36 @@ namespace PugTools {
     }
 
     private static bool SpnPlaceableHasBlueGlow(Placeable placeable, GomObject node) {
-      if (placeable != null && (placeable.AbilitySpecOnUseId != 0 || placeable.CodexId != 0 || placeable.LootPackageId != 0)) return true;
+      // Keep this aligned with Jedipedia's placeableGlow classification. The dyn Usable flag is only a geometry
+      // selector; the plc itself must advertise an interaction. That matters especially for reused elevator/button
+      // assemblies, where treating the dyn bit as sufficient makes unrelated copies glow.
+      if (placeable?.TemplateNoGlow == true) return false;
+      if (placeable != null) {
+        if ((placeable.PropState & 4L) != 0) return true;
+        if (placeable.AbilitySpecOnUseId != 0 || placeable.CodexId != 0 ||
+            placeable.WonkaPackageId != 0 || !String.IsNullOrWhiteSpace(placeable.ConversationFqn)) return true;
+      }
       if (node?.Data == null) return false;
+      if (node.Data.ValueOrDefault("plcTemplateNoGlow", false)) return false;
+      long propState = 0;
+      try { propState = Convert.ToInt64(node.Data.ValueOrDefault<object>("plcPropState", null), System.Globalization.CultureInfo.InvariantCulture); } catch { }
+      if ((propState & 4L) != 0) return true;
       return SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcAbilitySpecOnUse", null)) ||
         SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcAbilitySpecOnLoot", null)) ||
         SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcCodexSpec", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcdynLootPackage", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcTreasureChestLootLevel", null));
+        // These two field names changed in our old GOM name table while the stable IDs stayed the same. Accept both
+        // spellings so Live and RED/Beta DOMs reach the same decision as the current Jedipedia reader.
+        (SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcRequiredLevelForUse", null)) ||
+         SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcTreasureChestLootLevel", null))) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcMissionBoardPkg", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcConvo", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcdynLootState", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcPartialLootTimer", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcDespawnOnUse", null)) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcDisableOnUse", null)) ||
+        (SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcUseDistance", null)) ||
+         SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcTemplateUseDistance", null))) ||
+        SpnGlowValueSet(node.Data.ValueOrDefault<object>("wnkPackageID", null));
     }
 
     private static bool SpnGlowValueSet(object value) {
@@ -1413,9 +1605,11 @@ namespace PugTools {
       } catch { }
     }
 
-    private List<GR2> GetNpcAppearanceModels(NpcAppearance appearance, Dictionary<string, List<GR2>> cache) {
+    private List<GR2> GetNpcAppearanceModels(NpcAppearance appearance, Dictionary<string, List<GR2>> cache, string bodyTypeOverride = null) {
       if (appearance == null) return new List<GR2>();
-      string cacheKey = !String.IsNullOrWhiteSpace(appearance.Fqn) ? appearance.Fqn : appearance.Id.ToString();
+      string resolvedBodyType = !String.IsNullOrWhiteSpace(bodyTypeOverride) ? bodyTypeOverride : appearance.BodyType;
+      string cacheKey = (!String.IsNullOrWhiteSpace(appearance.Fqn) ? appearance.Fqn : appearance.Id.ToString())
+        + "|" + (resolvedBodyType ?? String.Empty).ToLowerInvariant();
       if (cache.TryGetValue(cacheKey, out List<GR2> cached)) return cached;
       var result = new List<GR2>();
       cache[cacheKey] = result;
@@ -1427,8 +1621,9 @@ namespace PugTools {
         // because an NPP offers multiple weighted alternatives (hair/face parts commonly do).
         AppSlot slot = pair.Value.FirstOrDefault(x => x != null);
         if (slot == null) continue;
-        string bodyType = String.IsNullOrWhiteSpace(slot.BodyType) ? appearance.BodyType : slot.BodyType;
-        string modelPath = (slot.Model ?? String.Empty).Replace("[bt]", bodyType ?? String.Empty).Replace("[BT]", bodyType ?? String.Empty);
+        string bodyType = !String.IsNullOrWhiteSpace(resolvedBodyType) ? resolvedBodyType
+          : (String.IsNullOrWhiteSpace(slot.BodyType) ? appearance.BodyType : slot.BodyType);
+        string modelPath = currentDom.AppearanceLoader.ApplyPartsMacros(slot.Model, bodyType);
         if (pair.Key.IndexOf("FaceHair", StringComparison.OrdinalIgnoreCase) >= 0 && String.IsNullOrWhiteSpace(modelPath)) modelPath = "/art/defaultassets/blank.gr2";
         if (String.IsNullOrWhiteSpace(modelPath) || !modelPath.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
         GR2 model = LoadNpcPartModel(modelPath, slot, appearance, pair.Key, bodyType);
@@ -1455,12 +1650,12 @@ namespace PugTools {
         using var br = new BinaryReader(stream);
         GR2 model = new GR2(br, modelPath.Split('/', '\\').Last());
 
-        string material0 = (slot.Material0 ?? String.Empty).Replace("[bt]", bodyType ?? String.Empty).Replace("[BT]", bodyType ?? String.Empty);
-        string materialMirror = (slot.MaterialMirror ?? String.Empty).Replace("[bt]", bodyType ?? String.Empty).Replace("[BT]", bodyType ?? String.Empty);
+        string material0 = currentDom.AppearanceLoader.ApplyPartsMacros(slot.Material0, bodyType);
+        string materialMirror = currentDom.AppearanceLoader.ApplyPartsMacros(slot.MaterialMirror, bodyType);
         if (appearance.AppearanceSlotMap.TryGetValue("appSlotHead", out List<AppSlot> heads) && heads?.Count > 0 && heads[0]?.AMI?.ChildSkinMaterials != null) {
           var skin = heads[0].AMI.ChildSkinMaterials;
-          if (material0.IndexOf("_naked_", StringComparison.OrdinalIgnoreCase) >= 0 && skin.TryGetValue(slotName, out string skin0)) material0 = skin0.Replace("[bt]", bodyType ?? String.Empty);
-          if (model.numMaterials > 1 && String.IsNullOrWhiteSpace(materialMirror) && skin.TryGetValue(slotName, out string skin1)) materialMirror = skin1.Replace("[bt]", bodyType ?? String.Empty);
+          if (material0.IndexOf("_naked_", StringComparison.OrdinalIgnoreCase) >= 0 && skin.TryGetValue(slotName, out string skin0)) material0 = currentDom.AppearanceLoader.ApplyPartsMacros(skin0, bodyType);
+          if (model.numMaterials > 1 && String.IsNullOrWhiteSpace(materialMirror) && skin.TryGetValue(slotName, out string skin1)) materialMirror = currentDom.AppearanceLoader.ApplyPartsMacros(skin1, bodyType);
         }
         material0 = NormalizeNpcMaterialName(ResolveNpcGenderMaterial(material0, bodyType));
         materialMirror = NormalizeNpcMaterialName(ResolveNpcGenderMaterial(materialMirror, bodyType));
@@ -1472,7 +1667,7 @@ namespace PugTools {
 
         if (slot.AttachedModels != null) {
           foreach (string attachment in slot.AttachedModels.Where(x => !String.IsNullOrWhiteSpace(x))) {
-            string attachPath = attachment.Replace("[bt]", bodyType ?? String.Empty).Replace("[BT]", bodyType ?? String.Empty);
+            string attachPath = currentDom.AppearanceLoader.ApplyPartsMacros(attachment, bodyType);
             using File attachFile = currentAssets.FindFile("/resources" + attachPath.Replace('\\', '/'));
             if (attachFile == null) continue;
             using Stream attachStream = attachFile.OpenCopyInMemory();

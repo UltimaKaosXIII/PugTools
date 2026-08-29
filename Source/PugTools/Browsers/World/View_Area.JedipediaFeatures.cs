@@ -283,6 +283,7 @@ namespace PugTools {
     private bool walkingWasEnabled;
     private bool walkingGrounded;
     private bool walkingSpaceWasDown;
+    private int walkingFloorStreamGraceFrames;
     // Moving SPN placeables and /engine/follower.fol descendants are real dynamic walkable geometry. Keep the
     // current support and its previous transform so lifts, trams and other moving parents can carry both the camera
     // position and its orientation instead of sliding/turning out from underneath the viewer.
@@ -295,6 +296,7 @@ namespace PugTools {
     private const float WalkingGravity = .98f;
     private const float WalkingJumpVelocity = .42f;
     private const float WalkingPlatformFloorEpsilon = .002f;
+    private const int WalkingFloorStreamGraceMaxFrames = 90;
 
     private void SetJedipediaFeatureData(Dictionary<string, GR2> utilityModels, List<WorldNpcPlacement> npcData, List<WorldSpnPlacement> spnData) {
       utilityMarkerModels = utilityModels ?? new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
@@ -703,7 +705,7 @@ namespace PugTools {
       triangles.Add(c[0]); triangles.Add(c[3]); triangles.Add(c[2]);
     }
 
-    private void UpdateCurrentPhase(Vector3 worldPosition) {
+    private PhaseVolumeEntry FindPhaseTrigger(Vector3 worldPosition) {
       PhaseVolumeEntry best = null;
       foreach (PhaseVolumeEntry trigger in phaseRegionTriggers) {
         if (trigger == null || String.IsNullOrWhiteSpace(trigger.Name)) continue;
@@ -715,7 +717,13 @@ namespace PugTools {
         if (!inside) continue;
         if (best == null || trigger.Volume < best.Volume) best = trigger;
       }
-      currentPhaseName = best?.Name ?? implicitPhaseName ?? String.Empty;
+      return best;
+    }
+
+    private Room FindPhaseTriggerRoom(Vector3 worldPosition) => FindPhaseTrigger(worldPosition)?.Room;
+
+    private void UpdateCurrentPhase(Vector3 worldPosition) {
+      currentPhaseName = FindPhaseTrigger(worldPosition)?.Name ?? implicitPhaseName ?? String.Empty;
     }
 
     private static void DisposeLines(List<LineGpu> lines) { foreach (LineGpu line in lines) line?.Dispose(); lines.Clear(); }
@@ -1865,6 +1873,46 @@ namespace PugTools {
       return TryWorldModelsSphere(placement.Models, world, out center, out radius);
     }
 
+    private bool TrySpnInteractionSphere(WorldSpnPlacement placement, Matrix world, WorldSpnDynState dynState, out Vector3 center, out float radius) {
+      // A Wonkavator dyn assembly often contains cabin/frame/door geometry plus one small Usable control part. Pick
+      // that same blue-glow/Usable part when it exists, matching Jedipedia's viewerInteractionUsableBounds. This both
+      // avoids opening the panel from several metres of elevator bodywork and prevents the large body from displacing
+      // the actual button in overlapping-sphere ordering. Legacy builds without an authored Usable row fall back to
+      // the full placement so RED/Beta elevators remain operable.
+      center = Vector3.Zero; radius = 0f; bool have = false;
+      if (placement == null) return false;
+      if (dynState != null && !dynState.Hidden) {
+        foreach (WorldSpnDynPart part in dynState.Parts) {
+          if (part?.Model == null || !part.BlueGlow) continue;
+          Matrix partWorld = part.LocalMatrix * world;
+          if (!TryModelSphere(part.Model, partWorld, out Vector3 partCenter, out float partRadius)) continue;
+          TryUnionSphere(ref have, ref center, ref radius, partCenter, partRadius);
+        }
+        if (have) return true;
+      }
+      return TrySpnReceiverSphere(placement, world, dynState, out center, out radius);
+    }
+
+    private float WorldInteractionPickRadius(Vector3 center, float authoredRadius, WorldRenderSettings settings) {
+      // Unlike Jedipedia's hover cursor, PugTools gets one click attempt, so preserve the authored bounds but guarantee
+      // a small screen-space target. Twelve pixels is deliberately a little more forgiving than the ordinary selection
+      // tolerance because there is no hover cursor yet. The cap keeps distant controls from becoming huge invisible hits.
+      float radius = Math.Max(.08f, authoredRadius);
+      if (camera == null || ClientHeight <= 1) return radius;
+      float pixelRadius = .10f;
+      try {
+        if (orthographicActive) {
+          pixelRadius = GetOrthographicHalfHeight(settings) * 2f / Math.Max(1, ClientHeight) * 12f;
+        } else {
+          float distance = (center - camera.Position).Length();
+          float worldPerPixel = distance * 2f * (float)Math.Tan(GetFieldOfViewRadians(settings) * .5f) / Math.Max(1, ClientHeight);
+          pixelRadius = worldPerPixel * 12f;
+        }
+      } catch { }
+      pixelRadius = Math.Max(.10f, Math.Min(.35f, pixelRadius));
+      return Math.Max(radius, pixelRadius);
+    }
+
     private bool TryConsumeObjectOcclusionReadback() {
       if (!objectOcclusionReadbackPending) return true;
       if (objectOcclusionVisibilityStaging == null) {
@@ -2471,16 +2519,16 @@ namespace PugTools {
     private bool UpdateWalkingMode(float dt) {
       WorldRenderSettings s = SettingsSnapshot();
       if (!s.WalkingMode) {
-        walkingWasEnabled = false; walkingVerticalVelocity = 0f; walkingGrounded = false; walkingSpaceWasDown = Util.IsKeyDown(Keys.Space);
+        walkingWasEnabled = false; walkingVerticalVelocity = 0f; walkingGrounded = false; walkingFloorStreamGraceFrames = 0; walkingSpaceWasDown = Util.IsKeyDown(Keys.Space);
         ClearWalkingPlatform();
         return false;
       }
 
       if (!walkingWasEnabled) {
-        walkingWasEnabled = true; walkingVerticalVelocity = 0f; walkingGrounded = false;
+        walkingWasEnabled = true; walkingVerticalVelocity = 0f; walkingGrounded = false; walkingFloorStreamGraceFrames = 0;
         if (TryWalkingFloor(camera.Position.X, camera.Position.Z, camera.Position.Y + .05f, 8f,
             out float initialFloor, out WalkingPlatformSupport initialPlatform)) {
-          camera.Position = new Vector3(camera.Position.X, initialFloor + WalkingEyeHeight, camera.Position.Z); walkingGrounded = true;
+          camera.Position = new Vector3(camera.Position.X, initialFloor + WalkingEyeHeight, camera.Position.Z); walkingGrounded = true; walkingFloorStreamGraceFrames = 0;
           SetWalkingPlatform(initialPlatform);
         }
       } else {
@@ -2504,7 +2552,7 @@ namespace PugTools {
 
       bool space = Util.IsKeyDown(Keys.Space);
       if (walkingGrounded && space && !walkingSpaceWasDown) {
-        walkingVerticalVelocity = WalkingJumpVelocity; walkingGrounded = false; ClearWalkingPlatform();
+        walkingVerticalVelocity = WalkingJumpVelocity; walkingGrounded = false; walkingFloorStreamGraceFrames = 0; ClearWalkingPlatform();
       }
       walkingSpaceWasDown = space;
 
@@ -2527,21 +2575,43 @@ namespace PugTools {
         if (TryWalkingFloor(candidate.X, candidate.Z, candidate.Y + WalkingEyeHeight, 1.2f,
             out float floor, out WalkingPlatformSupport landedPlatform) &&
             candidate.Y <= floor + WalkingEyeHeight + .015f && walkingVerticalVelocity <= 0f) {
-          candidate.Y = floor + WalkingEyeHeight; walkingVerticalVelocity = 0f; walkingGrounded = true;
+          candidate.Y = floor + WalkingEyeHeight; walkingVerticalVelocity = 0f; walkingGrounded = true; walkingFloorStreamGraceFrames = 0;
           SetWalkingPlatform(landedPlatform);
         }
       } else {
         if (TryWalkingFloor(candidate.X, candidate.Z, candidate.Y + .03f, .25f,
             out float floor, out WalkingPlatformSupport standingPlatform)) {
           candidate.Y = floor + WalkingEyeHeight;
+          walkingFloorStreamGraceFrames = 0;
           SetWalkingPlatform(standingPlatform);
+        } else if (WalkingFloorStreamPending() && walkingFloorStreamGraceFrames < WalkingFloorStreamGraceMaxFrames) {
+          // Collision is streamed independently from visible GR2 placement. At a doorway the render shell can already
+          // be visible while the next room's floor triangles are still being indexed. Treat that as a temporary
+          // loading gap, not as a real cliff: hold the last valid grounded position until the floor queue catches up.
+          walkingFloorStreamGraceFrames++;
+          candidate = pos;
+          walkingVerticalVelocity = 0f;
         } else {
+          walkingFloorStreamGraceFrames = 0;
           walkingGrounded = false;
           ClearWalkingPlatform();
         }
       }
       camera.Position = candidate;
       return true;
+    }
+
+    private bool WalkingFloorStreamPending() {
+      if (modelStreamer == null) return false;
+      if (pendingStreamedFloorIntegrations.Count > 0) return true;
+      foreach (string roomName in floorStreamRoomNames) {
+        if (!streamRequestsByRoom.TryGetValue(roomName, out List<WorldModelStreamRequest> requests) || requests == null) continue;
+        foreach (WorldModelStreamRequest request in requests) {
+          if (request == null) continue;
+          if (!models.TryGetValue(request.AssetId, out GR2 model) || model == null) return true;
+        }
+      }
+      return false;
     }
 
     private bool TryWalkingFloor(float x, float z, float ceilingY, float maxDrop, out float bestY) {

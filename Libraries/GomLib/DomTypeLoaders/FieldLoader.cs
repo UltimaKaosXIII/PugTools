@@ -1,7 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
 
 namespace GomLib.DomTypeLoaders
 {
@@ -14,8 +11,13 @@ namespace GomLib.DomTypeLoaders
             DomField result = new DomField();
             LoaderHelper.ParseShared(reader, result);
 
-            reader.BaseStream.Position = 0x12;
-            short typeOffset = reader.ReadInt16();
+            // Field payload starts at 0x14 in DBLB v1 and 0x18 in DBLB v2:
+            // modifiers, typeLength, typeOffset.
+            reader.BaseStream.Position = reader.DblbVersion == 1 ? 0x18 : 0x1C;
+            UInt16 typeOffset = reader.ReadUInt16();
+
+            if (typeOffset == 0 || typeOffset >= reader.BaseStream.Length)
+                throw new InvalidOperationException($"Invalid GOM field type offset 0x{typeOffset:X} for DBLB v{reader.DblbVersion}.");
 
             reader.BaseStream.Position = typeOffset;
             result.GomType = reader.ReadGomType();

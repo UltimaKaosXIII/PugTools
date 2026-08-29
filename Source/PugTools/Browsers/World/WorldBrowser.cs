@@ -142,6 +142,7 @@ namespace PugTools {
     private Label worldLoadingTitle;
     private Label worldLoadingDetails;
     private ProgressBar worldLoadingProgress;
+    private bool worldStreamingLoading;
     private string lastPhaseBannerText = String.Empty;
     private bool updatingWorldToolbar;
     private volatile bool worldWindowActive;
@@ -1590,7 +1591,19 @@ namespace PugTools {
       if (raw == null) return result;
       if (raw is string) { result.Add(raw); return result; }
       if (raw is System.Collections.IDictionary dictionary) {
-        foreach (System.Collections.DictionaryEntry entry in dictionary) result.Add(entry.Value);
+        // GOM lists are commonly exposed as an index-keyed dictionary plus an optional _count member. Preserve the
+        // authored list order explicitly; IDictionary enumeration order is not a format guarantee and older .NET
+        // runtimes can otherwise pair a floor name with the wrong destination GUID.
+        var indexed = new List<Tuple<long, int, object>>();
+        int sequence = 0;
+        foreach (System.Collections.DictionaryEntry entry in dictionary) {
+          string key = Convert.ToString(entry.Key, System.Globalization.CultureInfo.InvariantCulture) ?? String.Empty;
+          if (String.Equals(key, "_count", StringComparison.OrdinalIgnoreCase)) { sequence++; continue; }
+          long index;
+          bool numeric = Int64.TryParse(key, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out index);
+          indexed.Add(Tuple.Create(numeric ? index : Int64.MaxValue, sequence++, entry.Value));
+        }
+        foreach (Tuple<long, int, object> item in indexed.OrderBy(x => x.Item1).ThenBy(x => x.Item2)) result.Add(item.Item3);
         return result;
       }
       if (raw is System.Collections.IEnumerable enumerable) {
@@ -1654,6 +1667,60 @@ namespace PugTools {
       return null;
     }
 
+    // wnkDestinationGUIDs does not point at mpnMetadataID. It contains the world-area instance GUID of the
+    // destination object (normally the .spn_p panel at the far end). Most live-era areas happened to mirror that
+    // GUID into their wonkavator map-note metadata, which made the old map-note-only lookup appear correct. Older
+    // clients and a few current areas (notably Ziost) do not. Resolve the authored area instance first and use the
+    // map-note metadata only as a compatibility fallback.
+    private AreaMapNote ResolveWonkDestinationNote(long packageId, ulong destinationId, List<AreaMapNote> packageNotes) {
+      if (destinationId == 0) return null;
+
+      if (area?.RoomList != null) {
+        foreach (FileFormats.Room room in area.RoomList) {
+          if (room?.InstancesById == null || !room.InstancesById.TryGetValue(destinationId, out FileFormats.AssetInstance instance) || instance == null) continue;
+          try {
+            Matrix world = instance.GetAbsoluteTransform(room);
+            Vector3 position = new Vector3(world.M41, world.M42, world.M43);
+
+            // If this client also supplied a nearby wonkavator map note, retain its authored camera rotation and
+            // slightly safer landing point. Do not require its metadata id to equal the destination GUID: that is
+            // exactly the assumption that breaks RED and some later worlds.
+            AreaMapNote nearby = packageNotes?.Where(n => n != null)
+              .OrderBy(n => {
+                float dx = n.Position.X - position.X, dy = n.Position.Y - position.Y, dz = n.Position.Z - position.Z;
+                return dx * dx + dy * dy + dz * dz;
+              })
+              .FirstOrDefault();
+            if (nearby != null) {
+              float dx = nearby.Position.X - position.X, dy = nearby.Position.Y - position.Y, dz = nearby.Position.Z - position.Z;
+              // Area coordinates are one tenth of the displayed coordinates. 2.5 here is therefore a generous
+              // 25-display-unit tolerance for an icon/interaction-point offset, while still keeping stacked or
+              // neighbouring elevator packages from being cross-wired.
+              if (dx * dx + dy * dy + dz * dz <= 6.25f) return nearby;
+            }
+
+            return new AreaMapNote {
+              Id = "wnk-instance-" + destinationId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+              Fqn = "wonkavator.destination",
+              Label = "Wonkavator",
+              Icon = "Wonkavator",
+              WonkaPackageId = packageId,
+              WonkaDestinationId = destinationId,
+              Position = position,
+              // The instance's authored local rotation is a useful fallback. Parent transforms can alter it, but
+              // destination availability and position are authoritative; camera facing is cosmetic.
+              Rotation = instance.rotation
+            };
+          } catch (Exception ex) {
+            System.Diagnostics.Debug.WriteLine("Could not resolve Wonkavator destination instance " + destinationId + ": " + ex.Message);
+          }
+        }
+      }
+
+      // Compatibility fallback for areas/tools where the package GUID was copied into mpnMetadataID.
+      return packageNotes?.FirstOrDefault(n => n != null && n.WonkaDestinationId == destinationId);
+    }
+
     private WonkPackageInfo LoadWonkPackage(long packageId, string fallbackTitle) {
       if (packageId == 0 || currentDom == null) return null;
       List<AreaMapNote> packageNotes = area?.MapNotes?.Where(n => n != null && n.WonkaPackageId == packageId).ToList() ?? new List<AreaMapNote>();
@@ -1689,7 +1756,7 @@ namespace PugTools {
               name = (german ? "Etage " : french ? "Étage " : "Floor ") + (i + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
               if (nameId != 0) name += "  [" + nameId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "]";
             }
-            AreaMapNote note = destinationId == 0 ? null : packageNotes.FirstOrDefault(n => n.WonkaDestinationId == destinationId);
+            AreaMapNote note = ResolveWonkDestinationNote(packageId, destinationId, packageNotes);
             result.Destinations.Add(new WonkDestinationItem {
               Name = name.Trim(),
               Description = String.IsNullOrWhiteSpace(description) ? null : description.Trim(),
@@ -2045,6 +2112,23 @@ namespace PugTools {
       void Apply() { if (worldLoadingOverlay != null) worldLoadingOverlay.Visible = false; }
       if (_closing || IsDisposed) return;
       if (InvokeRequired) BeginInvoke((Action)Apply); else Apply();
+    }
+
+    internal void BeginWorldStreamingLoading(int catalogModels) {
+      worldStreamingLoading=true;
+      int total=Math.Max(1,catalogModels);
+      ShowWorldLoading("Preparing visible world…", "Visible rooms: waiting for first camera frame • Catalog: 0 / "+catalogModels);
+      UpdateWorldLoading("Visible rooms: waiting for first camera frame • Catalog: 0 / "+catalogModels,0,total);
+    }
+
+    internal void UpdateWorldStreamingLoading(int decoded,int catalog,int activeDecoded,int activeTotal,int outstanding,int gpuPending,int materialPending,bool initial) {
+      if(!worldStreamingLoading)return;
+      int total=Math.Max(1,catalog);int ready=Math.Max(0,Math.Min(total,decoded));
+      string details=String.Format(System.Globalization.CultureInfo.InvariantCulture,
+        "Visible rooms: {0} / {1} decoded • Catalog: {2} / {3} • Queue: {4} • GPU: {5} • Materials: {6}",
+        activeDecoded,activeTotal,ready,total,Math.Max(0,outstanding),Math.Max(0,gpuPending),Math.Max(0,materialPending));
+      UpdateWorldLoading(details,ready,total);
+      if(!initial){worldStreamingLoading=false;HideWorldLoading();}
     }
 
     private void InitializeWorldMiniMap() {
@@ -3287,11 +3371,11 @@ namespace PugTools {
         foreach (AreaAsset asset in gr2Assets) if (asset != null) renderAssetById[asset.Id] = asset;
         foreach (AreaAsset asset in speedTreeAssets) if (asset != null && !renderAssetById.ContainsKey(asset.Id)) renderAssetById[asset.Id] = asset;
 
-        int totalInstances = 0, matchedAssets = 0, ignoredGr2Assets = 0, missingGr2Files = 0, loadedModels = 0, failedGr2Loads = 0;
+        int totalInstances = 0, matchedAssets = 0, ignoredGr2Assets = 0, missingGr2Files = 0, failedGr2Loads = 0;
         int speedTreeLoaded = 0, speedTreeMissingFallback = 0;
         var matchedSpeedTreeAssets = new HashSet<ulong>();
         var attemptedRenderAssets = new HashSet<ulong>();
-        var modelLoadRequests = new List<(AreaAsset Asset, File File, bool IsSpeedTree)>();
+        var modelLoadRequests = new List<WorldModelStreamRequest>();
         int roomIndex = 0;
         foreach (FileFormats.Room room in area.RoomList) {
           roomIndex++;
@@ -3303,10 +3387,12 @@ namespace PugTools {
             bool isSpeedTree = String.Equals((asset.Extension ?? String.Empty).Trim().TrimStart('.'), "spt", StringComparison.OrdinalIgnoreCase);
             if (isSpeedTree) matchedSpeedTreeAssets.Add(asset.Id);
             if (ShouldIgnoreAreaModel(asset)) { ignoredGr2Assets++; continue; }
-            if (models.ContainsKey(asset.Id) || kvp.Value == null || !kvp.Value.Any(instance => instance != null && !instance.hidden)) continue;
-            // A missing SpeedTree fallback may have thousands of placements. Probe each asset only once instead of
-            // hammering FindFile once per tree instance while loading an open-world room set. Finding the files here
-            // also initializes the TOR archive tables before the bounded parallel decoder starts.
+            // Match Jedipedia's area asset queue rather than dropping an asset merely because every placement is
+            // authored hidden. Hidden/viewability is a draw-time decision in View_AREA, and phase/editor-authored
+            // rooms can otherwise end up with an incomplete streaming catalog and a permanently missing shell.
+            if (models.ContainsKey(asset.Id) || kvp.Value == null || !kvp.Value.Any(instance => instance != null)) continue;
+            // v6 keeps only this tiny asset catalog at area-load time. Actual TOR reads and GR2 parsing happen when
+            // the room enters the camera working set, rather than decoding every normal world model up front.
             if (!attemptedRenderAssets.Add(asset.Id)) continue;
             string modelPath = "/resources/" + asset.Path.Replace("\\", "/") + ".gr2";
             File modelFile = currentAssets.FindFile(modelPath);
@@ -3314,49 +3400,18 @@ namespace PugTools {
               if (isSpeedTree) speedTreeMissingFallback++; else missingGr2Files++;
               continue;
             }
-            modelLoadRequests.Add((asset, modelFile, isSpeedTree));
+            modelLoadRequests.Add(new WorldModelStreamRequest(asset.Id, asset.Path, isSpeedTree));
           }
         }
         int speedTreeMatched = matchedSpeedTreeAssets.Count;
+        UpdateWorldLoading(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+          "Indexed: {0} rooms • {1:n0} placements • {2:n0} / {3:n0} world models scheduled",
+          roomIndex,totalInstances,modelLoadRequests.Count,renderAssetById.Count),roomIndex,Math.Max(1,area.RoomList.Count));
 
-        // GR2 decompression/parsing is by far the longest CPU phase on large areas. TOR File.Open creates an
-        // independent stream, so after the sequential archive lookup above the individual models can be decoded in
-        // parallel. Cap workers to avoid the memory spikes an unbounded Parallel.For would cause with large Zstd
-        // entries; this gives multicore loading speed while keeping transient RAM predictable.
-        if (modelLoadRequests.Count > 0) {
-          GR2[] parsedModels = new GR2[modelLoadRequests.Count];
-          bool[] parseFailed = new bool[modelLoadRequests.Count];
-          int completedModels = 0;
-          int workers = Math.Max(1, Math.Min(4, Environment.ProcessorCount > 1 ? Environment.ProcessorCount - 1 : 1));
-          UpdateWorldLoading("Decoding world geometry with " + workers + " CPU workers…", 0, modelLoadRequests.Count);
-          Parallel.For(0, modelLoadRequests.Count, new ParallelOptions { MaxDegreeOfParallelism = workers }, index => {
-            var request = modelLoadRequests[index];
-            try {
-              using Stream modelStream = request.File.OpenCopyInMemory();
-              using BinaryReader br = new BinaryReader(modelStream);
-              // Each parser owns its material objects. Merge the small material-name table deterministically below;
-              // sharing the Dictionary here would serialize workers and is not thread-safe.
-              parsedModels[index] = new GR2(br, request.Asset.Path, null);
-            } catch { parseFailed[index] = true; }
-            int done = Interlocked.Increment(ref completedModels);
-            int progressStep = Math.Max(1, modelLoadRequests.Count / 50);
-            if (done == modelLoadRequests.Count || (done % progressStep) == 0)
-              UpdateWorldLoading("Decoding world geometry " + done + " / " + modelLoadRequests.Count + "…", done, modelLoadRequests.Count);
-          });
-
-          for (int index = 0; index < modelLoadRequests.Count; index++) {
-            GR2 gr2Model = parsedModels[index];
-            if (parseFailed[index] || gr2Model == null) { failedGr2Loads++; continue; }
-            AreaAsset asset = modelLoadRequests[index].Asset;
-            if (!models.ContainsKey(asset.Id)) models.Add(asset.Id, gr2Model);
-            foreach (GR2_Material material in gr2Model.materials) {
-              if (material == null || String.IsNullOrEmpty(material.materialName) || materials.ContainsKey(material.materialName)) continue;
-              materials.Add(material.materialName, material);
-            }
-            loadedModels++;
-            if (modelLoadRequests[index].IsSpeedTree) speedTreeLoaded++;
-          }
-        }
+        // Four workers keep the visible-room queue fed while render-thread uploads remain bounded. The old
+        // two-worker setup was a principal reason a Corellia block assembled for 20+ seconds.
+        int streamWorkers = Math.Max(1, Math.Min(6, Environment.ProcessorCount > 1 ? Environment.ProcessorCount - 1 : 1));
+        var modelStreamer = new WorldModelStreamer(area, streamWorkers);
 
         UpdateWorldLoading("Loading utilities, NPCs, SPN objects and animations…");
         LoadWorldUtilityModels();
@@ -3364,21 +3419,23 @@ namespace PugTools {
         LoadWorldTaxiRoutes();
 
         SetStatusLabel(string.Format(
-          "Rooms:{0} GR2Assets:{1} SPTAssets:{2} Instanzen:{3} zugeordnet:{4} ignoriert:{5} geladen:{6} GR2fehlt:{7} GR2Fehler:{8} | SpeedTree fallback:{9}/{10} (ohne GR2:{11}) | Utilities:{12} NPCs:{13} SPN:{14} | {15}",
+          "Rooms:{0} GR2Assets:{1} SPTAssets:{2} Instanzen:{3} zugeordnet:{4} ignoriert:{5} vorgemerkt:{6} GR2fehlt:{7} GR2Fehler:{8} | SpeedTree fallback:{9}/{10} (ohne GR2:{11}) | Utilities:{12} NPCs:{13} SPN:{14} | {15}",
           area.RoomList.Count, gr2Assets.Count, speedTreeAssets.Count, totalInstances, matchedAssets, ignoredGr2Assets,
-          loadedModels, missingGr2Files, failedGr2Loads, speedTreeLoaded, speedTreeMatched, speedTreeMissingFallback,
+          modelLoadRequests.Count, missingGr2Files, failedGr2Loads, speedTreeLoaded, speedTreeMatched, speedTreeMissingFallback,
           worldUtilityModels.Count, worldNpcPlacements.Count, worldSpnPlacements.Count, area.DebugHeaderInfo));
 
-        UpdateWorldLoading("Uploading scene to the renderer…");
+        UpdateWorldLoading("Starting visible-room streaming…",0,Math.Max(1,modelLoadRequests.Count));
         panelRender.SetSettings(worldSettings);
         panelRender.SetImplicitPhaseName(worldImplicitPhaseName);
-        panelRender.LoadModel(models, materials, area.RoomList, area.Id.ToString(), area, worldUtilityModels, worldNpcPlacements, worldSpnPlacements);
+        panelRender.LoadModel(models, materials, area.RoomList, area.Id.ToString(), area, worldUtilityModels, worldNpcPlacements, worldSpnPlacements, modelStreamer, modelLoadRequests);
         RebuildMapnoteNavigator();
+        // Put the local first-frame gate in front before the D3D thread can present an empty spawn frame.
+        BeginWorldStreamingLoading(modelLoadRequests.Count);
         render = new Thread(panelRender.StartRender) { IsBackground = true };
         render.Start();
         if (miniMapPanel != null && miniMapPanel.Visible) panelRender.RequestMiniMapSnapshot();
       } finally {
-        HideWorldLoading();
+        if(!worldStreamingLoading)HideWorldLoading();
       }
     }
 #pragma warning restore CS1998, CS4014

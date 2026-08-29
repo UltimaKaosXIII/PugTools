@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 
 namespace FileFormats {
@@ -11,6 +11,8 @@ namespace FileFormats {
     public Int32 parentBoneIndex;
     public SlimDX.Matrix root;
     public SlimDX.Matrix rootToBoneRaw;
+
+    public GR2_Bone_Skeleton() { }
 
     public GR2_Bone_Skeleton(BinaryReader br, Int32 index, Boolean is64Bit) {
       offsetBoneName = is64Bit ? br.ReadUInt64() : br.ReadUInt32();

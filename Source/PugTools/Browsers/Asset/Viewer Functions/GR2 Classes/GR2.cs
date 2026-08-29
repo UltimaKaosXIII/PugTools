@@ -43,9 +43,14 @@ namespace FileFormats {
         throw new InvalidDataException("GR2 stream is too short.");
 
       UInt32 header = br.ReadUInt32();
+      if (header == GrannyGR2Reader.Magic1) {
+        br.BaseStream.Position = 0;
+        GrannyGR2Reader.Populate(this, br, globalMaterials);
+        return;
+      }
       if (header != 0x42574147)
         throw new InvalidDataException(
-          $"Invalid GR2/BWAG header 0x{header:X8} in '{this.filename}'."
+          $"Invalid GR2 header 0x{header:X8} in '{this.filename}'."
         );
 
       UInt32 version = br.ReadUInt32();

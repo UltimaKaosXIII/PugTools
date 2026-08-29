@@ -464,6 +464,21 @@ namespace nsHashDictionary {
       return null;
     }
 
+    /// <summary>
+    /// Enumerates the known named files for one physical TOR archive.
+    /// This is used by legacy clients that predate manifest files (for example beta string tables).
+    /// The returned HashData objects are the dictionary entries themselves and must not be modified.
+    /// </summary>
+    public IEnumerable<HashData> EnumerateArchiveFiles(String archiveName) {
+      if (String.IsNullOrWhiteSpace(archiveName)) yield break;
+      if (!m_hashList.TryGetValue(archiveName, out SortedList<UInt64, HashData> archiveHashes) ||
+          archiveHashes == null) yield break;
+
+      foreach (HashData data in archiveHashes.Values) {
+        if (data != null) yield return data;
+      }
+    }
+
     public void UpdateCRC(UInt32 ph, UInt32 sh, Int32 crc, String archiveName) {
       UInt64 sig = (UInt64)ph << 32 | sh;
 

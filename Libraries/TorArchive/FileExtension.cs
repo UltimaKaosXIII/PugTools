@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -12,6 +12,7 @@ namespace TorArchive {
       _fileTypes.Add("CFX", "gfx");
       _fileTypes.Add("PROT", "node");
       _fileTypes.Add("GAWB", "gr2");
+      _fileTypes.Add("JAWB", "jba");
       _fileTypes.Add("SCPT", "scpt");
       _fileTypes.Add("FACE", "fxe");
       _fileTypes.Add("PK", "zip");
@@ -81,6 +82,27 @@ namespace TorArchive {
 
       if (bytes.Length < 4) return "unknown";
 
+      // Original RAD Granny v7 geometry used by early SWTOR beta builds.
+      if (bytes.Length >= 16
+          && BitConverter.ToUInt32(bytes, 0) == 0xC06CDE29
+          && BitConverter.ToUInt32(bytes, 4) == 0x2B53A4BA
+          && BitConverter.ToUInt32(bytes, 8) == 0xA5B7F525
+          && BitConverter.ToUInt32(bytes, 12) == 0xEEE266F6)
+        return "gr2";
+
+      // Beta JBA files can be raw 32-bit heap snapshots and therefore have no
+      // stable magic. Their common object header is still distinctive: finite
+      // duration, exactly 30 fps and 1..3 keyframe blocks.
+      if (bytes.Length >= 0x2C) {
+        Single duration = BitConverter.ToSingle(bytes, 4);
+        Single fps = BitConverter.ToSingle(bytes, 8);
+        UInt32 blocks = BitConverter.ToUInt32(bytes, 0x0C);
+        if (Single.IsFinite(duration) && duration >= 0 && duration <= 3600
+            && Math.Abs(fps - 30.0F) < 0.001F
+            && blocks >= 1 && blocks <= 3)
+          return "jba";
+      }
+
       if ((bytes[0] == 0x01) && (bytes[1] == 0x00) && (bytes[2] == 0x00)) {
         return "stb";
       }
@@ -90,7 +112,7 @@ namespace TorArchive {
       }
 
       if ((bytes[0] == 0x21) && (bytes[1] == 0x0d) && (bytes[2] == 0x0a) && (bytes[3] == 0x21)) {
-        String str5 = Encoding.ASCII.GetString(bytes, 0, 64);
+        String str5 = Encoding.ASCII.GetString(bytes, 0, Math.Min(64, bytes.Length));
 
         if (str5.Contains("Particle Specification", StringComparison.CurrentCulture)) {
           return "prt";
@@ -125,7 +147,7 @@ namespace TorArchive {
       foreach (KeyValuePair<String, String> item in _fileTypes) {
         if (str2.Contains(item.Key, StringComparison.CurrentCulture)) {
           if (item.Key == "RIFF") {
-            if (Encoding.ASCII.GetString(bytes, 8, 4)
+            if (bytes.Length >= 12 && Encoding.ASCII.GetString(bytes, 8, 4)
                               .Contains("WAVE", StringComparison.CurrentCulture)) {
               return "wav";
             }
@@ -144,7 +166,7 @@ namespace TorArchive {
       }
 
       if (str2.Contains("<", StringComparison.CurrentCulture)) {
-        String str4 = Encoding.ASCII.GetString(bytes, 0, 64);
+        String str4 = Encoding.ASCII.GetString(bytes, 0, Math.Min(64, bytes.Length));
 
         foreach (KeyValuePair<String, String> item in xml_types) {
           if (str4.Contains(item.Key, StringComparison.CurrentCulture)) {

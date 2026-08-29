@@ -7,6 +7,7 @@ using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using FileFormats;
 using GomLib;
+using SlimDX;
 
 namespace PugTools {
   public partial class WorldBrowser {
@@ -192,10 +193,12 @@ namespace PugTools {
         SetStatusLabel("Taxi terminal selected, but no rideable route for " + missingLabel + " exists in this area.");
         return false;
       }
-      // The authored tax.* table only stores the outgoing links for one terminal. Build the shortest reachable
-      // journeys here so terminals several stations away are selectable just like they are in-game. The renderer
-      // receives the exact direct legs and never has to query the GOM while the user is riding.
-      List<WorldTaxiRouteInfo> reachable = BuildReachableTaxiRoutes(routes);
+      // The authored tax.* table is an availability graph. Expand reachability here, then prefer the area's complete
+      // source-to-destination Generated_Taxi spline instead of physically concatenating graph hops at stations.
+      Vector3? selectedTaxiOrigin = null;
+      if (panelRender.TryGetSelectedWorldSpawnPosition(out float taxiX, out float taxiY, out float taxiZ))
+        selectedTaxiOrigin = new Vector3(taxiX, taxiY, taxiZ);
+      List<WorldTaxiRouteInfo> reachable = BuildReachableTaxiRoutes(routes, selectedTaxiOrigin);
       if (reachable.Count > 0) routes = reachable;
       string label = routes.Select(r => r.SourceLabel).FirstOrDefault(x => !String.IsNullOrWhiteSpace(x))
         ?? (!String.IsNullOrWhiteSpace(selectedName) ? selectedName : hasTerminalReference ? TaxiFriendlyName(terminalFqn) : TaxiFriendlyName(selectedFqn));
@@ -213,12 +216,27 @@ namespace PugTools {
       return route.Legs != null && route.Legs.Count > 0 ? route.Legs : new[] { route };
     }
 
+    private const float TaxiPhysicalEndpointRadius = 5f;
+
+    private sealed class WorldTaxiTerminalAnchor {
+      public object RawSpec;
+      public string SpecFqn;
+      public string Label;
+      public Vector3 Position;
+    }
+
     /// <summary>
-    /// Expand the selected terminal's direct links into shortest-hop journeys across the area's authored taxi graph.
-    /// Cost is only used as a tie breaker because SWTOR's availability graph is defined by terminal links first. A
-    /// route containing any unknown leg cost keeps Cost=-1 instead of inventing a total.
+    /// Expand the selected terminal's authored availability graph, then map every reachable placed destination back
+    /// to the shortest physical Generated_Taxi spline that actually leaves the clicked terminal. The tax.* graph is
+    /// an availability graph, not necessarily a list of spline legs to concatenate: on planets such as Corellia a
+    /// destination may be reachable through an intermediate graph node while area.dat already contains one direct
+    /// source-to-destination flight. Concatenating graph links makes the preview fly to the intermediate station,
+    /// turn around there, and only then continue even though the game uses the direct spline.
+    ///
+    /// If endpoint/terminal identity cannot be resolved safely, retain the old graph journey for that destination so
+    /// older client revisions keep working rather than silently losing routes.
     /// </summary>
-    private List<WorldTaxiRouteInfo> BuildReachableTaxiRoutes(List<WorldTaxiRouteInfo> selectedOutgoing) {
+    private List<WorldTaxiRouteInfo> BuildReachableTaxiRoutes(List<WorldTaxiRouteInfo> selectedOutgoing, Vector3? selectedOrigin) {
       if (selectedOutgoing == null || selectedOutgoing.Count == 0) return new List<WorldTaxiRouteInfo>();
       string source = selectedOutgoing.Select(x => x?.SourceFqn).FirstOrDefault(x => !String.IsNullOrWhiteSpace(x));
       if (String.IsNullOrWhiteSpace(source)) return selectedOutgoing;
@@ -255,43 +273,270 @@ namespace PugTools {
         }
       }
 
-      var result = new List<WorldTaxiRouteInfo>();
+      // Keep the graph journeys as a compatibility fallback and as the source for fare/vehicle metadata. They are no
+      // longer assumed to describe the physical flight that should be rendered.
+      var graphJourneys = new Dictionary<string, WorldTaxiRouteInfo>(StringComparer.OrdinalIgnoreCase);
       foreach (string destination in hops.Keys.Where(x => !String.Equals(x, source, StringComparison.OrdinalIgnoreCase))) {
-        var legs = new List<WorldTaxiRouteInfo>();
-        string cursor = destination;
-        var guard = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        while (!String.Equals(cursor, source, StringComparison.OrdinalIgnoreCase) && guard.Add(cursor) && previous.TryGetValue(cursor, out WorldTaxiRouteInfo edge)) {
-          legs.Add(edge);
-          cursor = edge.SourceFqn;
-        }
-        if (!String.Equals(cursor, source, StringComparison.OrdinalIgnoreCase) || legs.Count == 0) continue;
-        legs.Reverse();
-        if (legs.Count == 1) { result.Add(legs[0]); continue; }
+        List<WorldTaxiRouteInfo> legs = BuildTaxiGraphLegs(source, destination, previous);
+        if (legs.Count == 0) continue;
+        graphJourneys[destination] = BuildTaxiGraphJourney(legs);
+      }
+      if (graphJourneys.Count == 0) return selectedOutgoing;
 
-        WorldTaxiRouteInfo first = legs[0], last = legs[legs.Count - 1];
-        bool costKnown = legs.All(x => x.Cost >= 0);
-        long totalCost = costKnown ? legs.Sum(x => (long)x.Cost) : -1L;
-        result.Add(new WorldTaxiRouteInfo {
-          SourceFqn = first.SourceFqn,
-          SourceLabel = first.SourceLabel,
-          DestinationFqn = last.DestinationFqn,
-          DestinationLabel = last.DestinationLabel,
-          PathFqn = String.Join(" + ", legs.Select(x => x.PathFqn ?? x.Path?.Fqn ?? x.Path?.Name).Where(x => !String.IsNullOrWhiteSpace(x))),
-          Path = first.Path,
-          Reversed = first.Reversed,
-          Cost = totalCost >= 0 && totalCost <= Int32.MaxValue ? (int)totalCost : -1,
-          Label = (first.SourceLabel ?? TaxiFriendlyName(first.SourceFqn)) + " → " + (last.DestinationLabel ?? TaxiFriendlyName(last.DestinationFqn)),
+      Dictionary<string, WorldTaxiRouteInfo> physical = BuildPhysicalTaxiRoutes(source, selectedOrigin, graphJourneys, graph);
+      var result = new List<WorldTaxiRouteInfo>();
+      foreach (KeyValuePair<string, WorldTaxiRouteInfo> pair in graphJourneys) {
+        if (physical.TryGetValue(pair.Key, out WorldTaxiRouteInfo direct)) result.Add(direct);
+        else result.Add(pair.Value);
+      }
+      return result.OrderBy(x => x.HopCount)
+        .ThenBy(x => x.DestinationLabel ?? x.Label ?? String.Empty, StringComparer.CurrentCultureIgnoreCase)
+        .ToList();
+    }
+
+    private static List<WorldTaxiRouteInfo> BuildTaxiGraphLegs(string source, string destination,
+      Dictionary<string, WorldTaxiRouteInfo> previous) {
+      var legs = new List<WorldTaxiRouteInfo>();
+      string cursor = destination;
+      var guard = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      while (!String.Equals(cursor, source, StringComparison.OrdinalIgnoreCase) && guard.Add(cursor) &&
+        previous.TryGetValue(cursor, out WorldTaxiRouteInfo edge)) {
+        legs.Add(edge);
+        cursor = edge.SourceFqn;
+      }
+      if (!String.Equals(cursor, source, StringComparison.OrdinalIgnoreCase) || legs.Count == 0) return new List<WorldTaxiRouteInfo>();
+      legs.Reverse();
+      return legs;
+    }
+
+    private static WorldTaxiRouteInfo BuildTaxiGraphJourney(List<WorldTaxiRouteInfo> legs) {
+      if (legs == null || legs.Count == 0) return null;
+      if (legs.Count == 1) return legs[0];
+      WorldTaxiRouteInfo first = legs[0], last = legs[legs.Count - 1];
+      bool costKnown = legs.All(x => x.Cost >= 0);
+      long totalCost = costKnown ? legs.Sum(x => (long)x.Cost) : -1L;
+      return new WorldTaxiRouteInfo {
+        SourceFqn = first.SourceFqn,
+        SourceLabel = first.SourceLabel,
+        DestinationFqn = last.DestinationFqn,
+        DestinationLabel = last.DestinationLabel,
+        PathFqn = String.Join(" + ", legs.Select(x => x.PathFqn ?? x.Path?.Fqn ?? x.Path?.Name).Where(x => !String.IsNullOrWhiteSpace(x))),
+        Path = first.Path,
+        Reversed = first.Reversed,
+        Cost = totalCost >= 0 && totalCost <= Int32.MaxValue ? (int)totalCost : -1,
+        Label = (first.SourceLabel ?? TaxiFriendlyName(first.SourceFqn)) + " → " + (last.DestinationLabel ?? TaxiFriendlyName(last.DestinationFqn)),
+        FromTaxiGom = true,
+        VehicleSpec = first.VehicleSpec,
+        VehicleAppearance = first.VehicleAppearance,
+        VehicleModelPath = first.VehicleModelPath,
+        VehicleModel = first.VehicleModel,
+        VehicleScale = first.VehicleScale,
+        VehicleFallback = first.VehicleFallback,
+        Legs = legs
+      };
+    }
+
+    /// <summary>
+    /// One Generated_Taxi path is already the complete physical flight between two placed terminals. Use the terminal
+    /// placements to identify the path's far endpoint, and choose the shortest complete spline for each destination.
+    /// This mirrors the client data more closely than joining availability-graph edges at intermediate stations.
+    /// </summary>
+    private Dictionary<string, WorldTaxiRouteInfo> BuildPhysicalTaxiRoutes(string source, Vector3? selectedOrigin,
+      Dictionary<string, WorldTaxiRouteInfo> graphJourneys, List<WorldTaxiRouteInfo> graph) {
+      var result = new Dictionary<string, WorldTaxiRouteInfo>(StringComparer.OrdinalIgnoreCase);
+      if (area?.Paths == null || graphJourneys == null || graphJourneys.Count == 0) return result;
+
+      List<WorldTaxiTerminalAnchor> anchors = BuildTaxiTerminalAnchors(graph);
+      Vector3? origin = selectedOrigin;
+      if (!origin.HasValue) {
+        WorldTaxiTerminalAnchor sourceAnchor = anchors
+          .Where(x => TaxiTerminalAnchorMatches(x, source))
+          .OrderBy(x => TaxiClosestOutgoingDistanceSquared(x.Position, graphJourneys.Values))
+          .FirstOrDefault();
+        if (sourceAnchor != null) origin = sourceAnchor.Position;
+      }
+      if (!origin.HasValue) return result;
+
+      float endpointRadius2 = TaxiPhysicalEndpointRadius * TaxiPhysicalEndpointRadius;
+      var bestLengths = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+      foreach (AreaPath path in area.Paths) {
+        if (!LooksLikeGeneratedTaxiPath(path) || path?.Points == null || path.Points.Count < 2) continue;
+        Vector3 start = path.Points[0].Position;
+        if ((start - origin.Value).LengthSquared() > endpointRadius2) continue;
+        Vector3 end = path.Points[path.Points.Count - 1].Position;
+        string destination = TaxiTerminalSpecAt(anchors, end, endpointRadius2);
+        if (String.IsNullOrWhiteSpace(destination) || String.Equals(destination, source, StringComparison.OrdinalIgnoreCase) ||
+          !graphJourneys.TryGetValue(destination, out WorldTaxiRouteInfo graphJourney)) continue;
+
+        float length = TaxiPathLength(path);
+        if (!(length > 0f) || Single.IsNaN(length) || Single.IsInfinity(length)) continue;
+        if (bestLengths.TryGetValue(destination, out float oldLength) && oldLength <= length) continue;
+        bestLengths[destination] = length;
+
+        WorldTaxiRouteInfo first = TaxiRouteLegs(graphJourney).FirstOrDefault() ?? graphJourney;
+        result[destination] = new WorldTaxiRouteInfo {
+          SourceFqn = source,
+          SourceLabel = graphJourney.SourceLabel,
+          DestinationFqn = destination,
+          DestinationLabel = graphJourney.DestinationLabel,
+          PathFqn = path.Fqn ?? path.Name,
+          Path = path,
+          Reversed = false,
+          Cost = graphJourney.Cost,
+          Label = (graphJourney.SourceLabel ?? TaxiFriendlyName(source)) + " → " +
+            (graphJourney.DestinationLabel ?? TaxiFriendlyName(destination)),
           FromTaxiGom = true,
           VehicleSpec = first.VehicleSpec,
           VehicleAppearance = first.VehicleAppearance,
           VehicleModelPath = first.VehicleModelPath,
           VehicleModel = first.VehicleModel,
           VehicleScale = first.VehicleScale,
-          VehicleFallback = first.VehicleFallback,
-          Legs = legs
-        });
+          VehicleFallback = first.VehicleFallback
+          // Deliberately no Legs: this path is the complete authored physical flight.
+        };
       }
-      return result.OrderBy(x => x.HopCount).ThenBy(x => x.DestinationLabel ?? x.Label ?? String.Empty, StringComparer.CurrentCultureIgnoreCase).ToList();
+      return result;
+    }
+
+    private List<WorldTaxiTerminalAnchor> BuildTaxiTerminalAnchors(List<WorldTaxiRouteInfo> graph) {
+      var anchors = new List<WorldTaxiTerminalAnchor>();
+      if (currentDom == null) return anchors;
+
+      foreach (WorldNpcPlacement placement in worldNpcPlacements) {
+        if (placement?.Instance == null || placement.Room == null || !placement.IsTaxiTerminal) continue;
+        Vector3 position = TaxiNpcPlacementPosition(placement);
+        AddTaxiTerminalAnchor(anchors, placement.SourceFqn, placement.Name, position);
+      }
+      foreach (WorldSpnPlacement placement in worldSpnPlacements) {
+        if (placement?.Instance == null || placement.Room == null) continue;
+        object raw = TaxiTerminalReference(placement.SourceFqn);
+        if (raw == null && !WorldNpcLooksLikeTaxiTerminal(placement.SourceFqn, placement.Name, null)) continue;
+        Matrix world = placement.Instance.GetAbsoluteTransform(placement.Room);
+        AddTaxiTerminalAnchor(anchors, placement.SourceFqn, placement.Name, new Vector3(world.M41, world.M42, world.M43), raw);
+      }
+
+      // Normalize every reference to the actual tax.* names used by this area's graph. Some revisions store a stable
+      // ID in plcTaxiTerminalSpec/taxTerminalSpec instead of a direct GOM object reference; TaxiLookupKeyEquals knows
+      // how to compare that ID with the FNV stable ID of the graph FQN.
+      List<string> graphSpecs = graph
+        .SelectMany(x => new[] { x?.SourceFqn, x?.DestinationFqn })
+        .Where(x => !String.IsNullOrWhiteSpace(x))
+        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+      foreach (WorldTaxiTerminalAnchor anchor in anchors) {
+        List<string> matches = graphSpecs.Where(spec => TaxiTerminalAnchorMatches(anchor, spec)).ToList();
+        if (matches.Count == 1) anchor.SpecFqn = matches[0];
+      }
+
+      // Older builds sometimes expose a taxi-looking NPC without a directly readable terminalSpec. Infer only from a
+      // nearby authored graph endpoint, and only when the nearest endpoint is unique enough to avoid cross-faction
+      // terminals sharing the same pad.
+      foreach (WorldTaxiTerminalAnchor anchor in anchors.Where(x => String.IsNullOrWhiteSpace(x.SpecFqn)).ToList()) {
+        string inferred = TaxiInferTerminalSpec(anchor.Position, graph);
+        if (!String.IsNullOrWhiteSpace(inferred)) anchor.SpecFqn = inferred;
+      }
+      return anchors.Where(x => !String.IsNullOrWhiteSpace(x.SpecFqn)).ToList();
+    }
+
+    private void AddTaxiTerminalAnchor(List<WorldTaxiTerminalAnchor> anchors, string sourceFqn, string label, Vector3 position, object knownRaw = null) {
+      object raw = knownRaw ?? TaxiTerminalReference(sourceFqn);
+      string spec = ResolveTaxiReferenceName(raw);
+      if (String.IsNullOrWhiteSpace(spec) && !String.IsNullOrWhiteSpace(sourceFqn) && sourceFqn.StartsWith("tax.", StringComparison.OrdinalIgnoreCase))
+        spec = sourceFqn;
+      anchors.Add(new WorldTaxiTerminalAnchor { RawSpec = raw, SpecFqn = spec, Label = label, Position = position });
+    }
+
+    private object TaxiTerminalReference(string sourceFqn) {
+      if (String.IsNullOrWhiteSpace(sourceFqn) || currentDom == null) return null;
+      if (sourceFqn.StartsWith("tax.", StringComparison.OrdinalIgnoreCase)) return sourceFqn;
+      try {
+        GomObject selected = currentDom.GetObject(sourceFqn);
+        return TaxiDataValue(selected?.Data, "plcTaxiTerminalSpec", "4611686035128171095")
+          ?? TaxiDataValue(selected?.Data, "taxTerminalSpec", "4611686035046870025");
+      } catch { return null; }
+    }
+
+    private static Vector3 TaxiNpcPlacementPosition(WorldNpcPlacement placement) {
+      if (placement?.SpawnPoints != null && placement.SpawnPoints.Count > 0) {
+        unchecked {
+          ulong seed = placement.Instance?.ID ?? 0UL;
+          int index = (int)(seed % (ulong)placement.SpawnPoints.Count);
+          return placement.SpawnPoints[index].Position;
+        }
+      }
+      Matrix world = placement.Instance.GetAbsoluteTransform(placement.Room);
+      return new Vector3(world.M41, world.M42, world.M43);
+    }
+
+    private static bool TaxiTerminalAnchorMatches(WorldTaxiTerminalAnchor anchor, string specFqn) {
+      if (anchor == null || String.IsNullOrWhiteSpace(specFqn)) return false;
+      if (!String.IsNullOrWhiteSpace(anchor.SpecFqn) && String.Equals(anchor.SpecFqn.Trim(), specFqn.Trim(), StringComparison.OrdinalIgnoreCase)) return true;
+      return anchor.RawSpec != null && TaxiLookupKeyEquals(anchor.RawSpec, specFqn);
+    }
+
+    private static string TaxiTerminalSpecAt(List<WorldTaxiTerminalAnchor> anchors, Vector3 position, float maxDistanceSquared) {
+      if (anchors == null || anchors.Count == 0) return null;
+      WorldTaxiTerminalAnchor best = null;
+      float bestDistance = maxDistanceSquared;
+      var specs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      foreach (WorldTaxiTerminalAnchor anchor in anchors) {
+        float distance = (anchor.Position - position).LengthSquared();
+        if (distance > maxDistanceSquared) continue;
+        string spec = anchor.SpecFqn;
+        if (String.IsNullOrWhiteSpace(spec)) continue;
+        specs.Add(spec);
+        if (best == null || distance < bestDistance) { best = anchor; bestDistance = distance; }
+      }
+      // Different terminal specs inside the same endpoint radius are ambiguous. Failing closed here prevents nearby
+      // Imperial/Republic droids from lending each other routes.
+      if (best == null || specs.Count != 1) return null;
+      return best.SpecFqn;
+    }
+
+    private static string TaxiInferTerminalSpec(Vector3 position, List<WorldTaxiRouteInfo> graph) {
+      if (graph == null || graph.Count == 0) return null;
+      float maxDistance2 = TaxiPhysicalEndpointRadius * TaxiPhysicalEndpointRadius;
+      float bestDistance = maxDistance2;
+      string bestSpec = null;
+      bool ambiguous = false;
+      foreach (WorldTaxiRouteInfo edge in graph) {
+        if (edge?.Path?.Points == null || edge.Path.Points.Count < 2) continue;
+        Vector3 start = edge.Reversed ? edge.Path.Points[edge.Path.Points.Count - 1].Position : edge.Path.Points[0].Position;
+        Vector3 end = edge.Reversed ? edge.Path.Points[0].Position : edge.Path.Points[edge.Path.Points.Count - 1].Position;
+        TaxiConsiderEndpoint(position, start, edge.SourceFqn, ref bestSpec, ref bestDistance, ref ambiguous);
+        TaxiConsiderEndpoint(position, end, edge.DestinationFqn, ref bestSpec, ref bestDistance, ref ambiguous);
+      }
+      return ambiguous ? null : bestSpec;
+    }
+
+    private static void TaxiConsiderEndpoint(Vector3 position, Vector3 endpoint, string spec, ref string bestSpec, ref float bestDistance, ref bool ambiguous) {
+      if (String.IsNullOrWhiteSpace(spec)) return;
+      float distance = (position - endpoint).LengthSquared();
+      if (distance > bestDistance + .0001f) return;
+      if (distance + .0001f < bestDistance) {
+        bestDistance = distance;
+        bestSpec = spec;
+        ambiguous = false;
+      } else if (!String.IsNullOrWhiteSpace(bestSpec) && !String.Equals(bestSpec, spec, StringComparison.OrdinalIgnoreCase)) {
+        ambiguous = true;
+      }
+    }
+
+    private static float TaxiClosestOutgoingDistanceSquared(Vector3 position, IEnumerable<WorldTaxiRouteInfo> journeys) {
+      float best = Single.MaxValue;
+      foreach (WorldTaxiRouteInfo journey in journeys ?? Enumerable.Empty<WorldTaxiRouteInfo>()) {
+        WorldTaxiRouteInfo first = TaxiRouteLegs(journey).FirstOrDefault();
+        if (first?.Path?.Points == null || first.Path.Points.Count == 0) continue;
+        Vector3 start = first.Reversed ? first.Path.Points[first.Path.Points.Count - 1].Position : first.Path.Points[0].Position;
+        best = Math.Min(best, (start - position).LengthSquared());
+      }
+      return best;
+    }
+
+    private static float TaxiPathLength(AreaPath path) {
+      if (path?.Points == null || path.Points.Count < 2) return 0f;
+      float length = 0f;
+      for (int i = 1; i < path.Points.Count; i++) length += (path.Points[i].Position - path.Points[i - 1].Position).Length();
+      return length;
     }
 
     private static string TaxiRouteToolTip(WorldTaxiRouteInfo route) {

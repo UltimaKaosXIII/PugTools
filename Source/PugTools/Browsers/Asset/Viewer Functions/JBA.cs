@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
@@ -8,6 +8,8 @@ namespace FileFormats {
   public sealed class JBAAnimation {
     public UInt32 Version { get; internal set; }
     public Boolean Is64BitLayout { get; internal set; }
+    public Boolean IsBetaHeapLayout { get; internal set; }
+    public String ClipName { get; internal set; }
     public Single Length { get; internal set; }
     public Single FPS { get; internal set; }
     public Int32 BlockCount { get; internal set; }
@@ -305,9 +307,14 @@ namespace FileFormats {
         throw new InvalidDataException("JBA file is too short.");
 
       UInt32 magic = ReadUInt32At(br, start);
-      return magic == JAWB
-        ? ReadCurrent64(br, start)
-        : ReadLegacy32(br, start);
+      if (magic == JAWB) return ReadCurrent64(br, start);
+      if (magic == 0) return ReadLegacy32(br, start);
+
+      // Very early beta assets are not an on-disk JBA/MBA container at all.
+      // They are a 32-bit debug-heap snapshot of the live animation object.
+      // Jedipedia identifies these by their plausible object header (30 fps)
+      // and reconstructs the heap base from ptr@0x1c -> file offset 0x110.
+      return ReadBetaHeap(br, start);
     }
 
     // Faithful C# port of Jedipedia's static-dev/js/reader/filereader/jba-read.js.
@@ -505,6 +512,7 @@ namespace FileFormats {
       br.BaseStream.Position = pos;
       ReadBoneCompressionData(br, a);
       pos = Align(br.BaseStream.Position, 0x80);
+      Int64 lastBlockDataEnd = pos;
 
       for (Int32 blockIndex = 0; blockIndex < headers.Count; blockIndex++) {
         var h = headers[blockIndex];
@@ -575,13 +583,249 @@ namespace FileFormats {
         }
 
         a.Blocks.Add(block);
-        pos = start + (pos - start) + h.byteLength;
+        lastBlockDataEnd = br.BaseStream.Position;
+        pos += h.byteLength;
       }
 
+      TryReadLegacy32Names(br, a, lastBlockDataEnd);
       while (a.BoneNames.Count < a.BoneCount)
         a.BoneNames.Add("bone_" + a.BoneNames.Count);
 
       return a;
+    }
+
+    private static void TryReadLegacy32Names(BinaryReader br, JBAAnimation a, Int64 searchFrom) {
+      Int64 length = br.BaseStream.Length;
+      Int64 pos = Math.Max(0, searchFrom);
+
+      // CharacterWorldSpaceTM starts after zero padding with {u32 0, f32 fps}.
+      while (pos + 8 <= length) {
+        if (ReadUInt32At(br, pos) == 0
+            && Math.Abs(ReadSingleAt(br, pos + 4) - a.FPS) < 0.0001F)
+          break;
+        pos += 4;
+      }
+      if (pos + 8 > length) return;
+
+      pos += 8;
+      if (pos + 0x30 + 16 > length) return;
+      pos += 0x30;
+
+      UInt32 rotationCount = ReadUInt32At(br, pos); pos += 4;
+      UInt32 rotationOffset = ReadUInt32At(br, pos); pos += 4;
+      UInt32 translationCount = ReadUInt32At(br, pos); pos += 4;
+      UInt32 translationOffset = ReadUInt32At(br, pos); pos += 4;
+      if (rotationCount != (UInt32)a.FrameCount || rotationOffset != 0
+          || translationCount != (UInt32)a.FrameCount || translationOffset != 0)
+        return;
+
+      pos += 6L * a.FrameCount;
+      pos = Align(pos, 4);
+      pos += 4L * a.FrameCount;
+      if (pos + 20 > length) return;
+
+      Int64 nameStart = pos;
+      UInt32 count = ReadUInt32At(br, pos); pos += 4;
+      if (count != (UInt32)a.BoneCount) return;
+      pos += 4; // stringsLength
+      UInt32 indicesOffset = ReadUInt32At(br, pos); pos += 4;
+      UInt32 offsetsOffset = ReadUInt32At(br, pos); pos += 4;
+      UInt32 namesOffset = ReadUInt32At(br, pos);
+      if (indicesOffset != 20
+          || offsetsOffset != 20U + 4U * count
+          || namesOffset != 20U + 8U * count)
+        return;
+
+      for (Int32 i = 0; i < a.BoneCount; i++) {
+        UInt32 index = ReadUInt32At(br, nameStart + indicesOffset + i * 4L);
+        UInt32 offset = ReadUInt32At(br, nameStart + offsetsOffset + i * 4L);
+        if (index != (UInt32)i) return;
+        Int64 stringPos = nameStart + namesOffset + offset;
+        if (stringPos < 0 || stringPos >= length) return;
+        a.BoneNames.Add(ReadCString(br, stringPos));
+      }
+    }
+
+    private sealed class BetaBlockMeta {
+      public UInt32 TranslationCount;
+      public Int64 TranslationOffset;
+      public UInt32 RotationCount;
+      public Int64 RotationOffset;
+    }
+
+    private static JBAAnimation ReadBetaHeap(BinaryReader br, Int64 start) {
+      Int64 length = br.BaseStream.Length - start;
+      if (length < 0x2C)
+        throw new InvalidDataException("Beta JBA heap dump is too short.");
+
+      Single duration = ReadSingleAt(br, start + 0x04);
+      Single fps = ReadSingleAt(br, start + 0x08);
+      Int32 numBlocks = checked((Int32)ReadUInt32At(br, start + 0x0C));
+      UInt32 tag = ReadUInt32At(br, start + 0x18);
+
+      if (!Single.IsFinite(duration) || duration < 0 || duration > 3600
+          || !Single.IsFinite(fps) || Math.Abs(fps - 30.0F) > 0.001F)
+        throw new InvalidDataException("Unrecognized JBA header.");
+
+      JBAAnimation a = new JBAAnimation {
+        Version = 0,
+        Is64BitLayout = false,
+        IsBetaHeapLayout = true,
+        Length = duration,
+        FPS = fps,
+        BlockCount = Math.Max(1, numBlocks)
+      };
+
+      // A second beta class shares the broad signature but only exposes a clip
+      // name; its remaining heap layout is unrelated/undecoded. Keep it readable
+      // in the browser instead of treating it as a corrupt release JBA.
+      if (tag != 87) {
+        a.ClipName = ReadCStringLimited(br, start + 0x1C, 256);
+        a.BoneCount = 0;
+        return a;
+      }
+
+      if (numBlocks < 1 || numBlocks > 3 || length < 0x1190)
+        throw new InvalidDataException("Invalid beta JBA block layout.");
+
+      const Int64 boneReferenceStart = 0x110;
+      const Int32 maxBones = 88;
+      UInt32 keyframeBufferPtr = ReadUInt32At(br, start + 0x1C);
+      if (keyframeBufferPtr < boneReferenceStart)
+        throw new InvalidDataException("Invalid beta JBA heap base pointer.");
+      UInt32 heapBase = keyframeBufferPtr - (UInt32)boneReferenceStart;
+
+      Int64 ToOffset(UInt32 pointer) {
+        if (pointer < heapBase)
+          throw new InvalidDataException("Beta JBA pointer precedes the recovered heap base.");
+        UInt64 relative = (UInt64)pointer - heapBase;
+        if (relative > (UInt64)length)
+          throw new EndOfStreamException("Beta JBA pointer points outside the heap dump.");
+        return start + (Int64)relative;
+      }
+
+      Int32 frameCount = Math.Max(1, (Int32)Math.Round(duration * fps) + 1);
+      Int64 pointerArray = start + 0x2C + (numBlocks - 1) * 8L;
+      var headers = new List<(Int32 startFrame, Int32 byteLength, Int64 dataStart, Int32 numFrames)>();
+      for (Int32 i = 0; i < numBlocks; i++) {
+        Int32 startFrame = i == 0
+          ? 0
+          : checked((Int32)ReadUInt32At(br, start + 0x2C + (i - 1) * 8L));
+        Int32 byteLength = i == 0
+          ? checked((Int32)ReadUInt32At(br, start + 0x28))
+          : checked((Int32)ReadUInt32At(br, start + 0x30 + (i - 1) * 8L));
+        Int64 dataStart = ToOffset(ReadUInt32At(br, pointerArray + i * 4L));
+        Int32 nextStart = i + 1 < numBlocks
+          ? checked((Int32)ReadUInt32At(br, start + 0x2C + i * 8L))
+          : frameCount;
+        Int32 blockFrames = i + 1 < numBlocks
+          ? 1 + nextStart - startFrame
+          : frameCount - startFrame;
+        if (blockFrames <= 0 || dataStart < start || dataStart >= br.BaseStream.Length)
+          throw new InvalidDataException("Invalid beta JBA block descriptor.");
+        headers.Add((startFrame, byteLength, dataStart, blockFrames));
+      }
+
+      // Recover the real bone count from the first block's 16-byte metadata
+      // table; beta's field@0x18 is a class tag (87), not numBones.
+      var allMeta = new List<List<BetaBlockMeta>>();
+      Int32 boneCount = -1;
+      for (Int32 bi = 0; bi < headers.Count; bi++) {
+        var h = headers[bi];
+        var metas = new List<BetaBlockMeta>();
+        Int64 pos = h.dataStart;
+        while (pos + 16 <= br.BaseStream.Length && metas.Count < maxBones) {
+          UInt32 translationCount = ReadUInt32At(br, pos);
+          UInt32 translationPtr = ReadUInt32At(br, pos + 4);
+          UInt32 rotationCount = ReadUInt32At(br, pos + 8);
+          UInt32 rotationPtr = ReadUInt32At(br, pos + 12);
+          if (rotationCount != (UInt32)h.numFrames) break;
+          if (translationCount != 0 && translationCount != (UInt32)h.numFrames)
+            throw new InvalidDataException("Invalid beta JBA translation metadata.");
+          metas.Add(new BetaBlockMeta {
+            TranslationCount = translationCount,
+            TranslationOffset = translationCount == 0 ? 0 : ToOffset(translationPtr),
+            RotationCount = rotationCount,
+            RotationOffset = ToOffset(rotationPtr)
+          });
+          pos += 16;
+        }
+        if (boneCount < 0) boneCount = metas.Count;
+        if (metas.Count != boneCount || boneCount <= 0)
+          throw new InvalidDataException("Inconsistent beta JBA bone metadata.");
+        allMeta.Add(metas);
+      }
+
+      a.BoneCount = boneCount;
+      for (Int32 i = 0; i < boneCount; i++) {
+        Int64 p = start + boneReferenceStart + i * 0x30L;
+        Ensure(br, p, 0x30);
+        br.BaseStream.Position = p;
+        a.Bones.Add(new JBA_Bone {
+          TranslationStride = ReadV3(br),
+          TranslationBase = ReadV3(br),
+          RotationStride = ReadV3(br),
+          RotationBase = ReadV3(br)
+        });
+      }
+
+      for (Int32 bi = 0; bi < headers.Count; bi++) {
+        var h = headers[bi];
+        JBA_Block block = new JBA_Block {
+          StartFrame = h.startFrame,
+          Size = h.byteLength,
+          BoneCount = boneCount,
+          NumFrames = h.numFrames
+        };
+
+        for (Int32 boneIndex = 0; boneIndex < boneCount; boneIndex++) {
+          JBA_Bone bone = a.Bones[boneIndex];
+          BetaBlockMeta meta = allMeta[bi][boneIndex];
+          JBA_KeyLayout key = new JBA_KeyLayout {
+            HasTranslation = meta.TranslationCount != 0
+          };
+
+          Ensure(br, meta.RotationOffset, 6L * h.numFrames);
+          br.BaseStream.Position = meta.RotationOffset;
+          for (Int32 frame = 0; frame < h.numFrames; frame++)
+            key.Rotations.Add(ReadRotation(br, bone.RotationBase, bone.RotationStride));
+
+          if (meta.TranslationCount != 0) {
+            Ensure(br, meta.TranslationOffset, 4L * h.numFrames);
+            br.BaseStream.Position = meta.TranslationOffset;
+            for (Int32 frame = 0; frame < h.numFrames; frame++)
+              key.Translations.Add(ReadTranslation(br, bone.TranslationBase, bone.TranslationStride));
+          } else {
+            for (Int32 frame = 0; frame < h.numFrames; frame++)
+              key.Translations.Add(bone.TranslationBase);
+          }
+
+          block.Layout.Add(key);
+        }
+        a.Blocks.Add(block);
+      }
+
+      while (a.BoneNames.Count < a.BoneCount)
+        a.BoneNames.Add("bone_" + a.BoneNames.Count);
+      return a;
+    }
+
+    private static String ReadCStringLimited(BinaryReader br, Int64 pos, Int32 maxBytes) {
+      if (pos < 0 || pos >= br.BaseStream.Length) return String.Empty;
+      Int64 old = br.BaseStream.Position;
+      try {
+        br.BaseStream.Position = pos;
+        var bytes = new List<Byte>();
+        for (Int32 i = 0; i < maxBytes && br.BaseStream.Position < br.BaseStream.Length; i++) {
+          Byte b = br.ReadByte();
+          if (b == 0) break;
+          if (b < 0x20 || b > 0x7E) break;
+          bytes.Add(b);
+        }
+        return Encoding.ASCII.GetString(bytes.ToArray());
+      } finally {
+        br.BaseStream.Position = old;
+      }
     }
 
     private static void TryReadCurrentNames(

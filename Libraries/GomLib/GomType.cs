@@ -24,13 +24,13 @@ namespace GomLib {
     GuiControl = 0x10,
     Timer = 0x11,
     Vec3 = 0x12,
+    FsGuid = 0x13,
     TimeSpan = 0x14,
     Time = 0x15,
     Rawdata = 0x16,
-    // Introduced with the 64-bit client. Semantics not fully reverse-engineered yet -
-    // confirmed (via byte-boundary analysis of real 64-bit .tor data) to consume exactly
-    // 4 further bytes after its own ID; the meaning of those 4 bytes is still unknown.
-    NewType18 = 0x18
+    FuncRef = 0x17,
+    Tuple = 0x18,
+    Any = 0x19
   }
 
   public abstract class GomType {

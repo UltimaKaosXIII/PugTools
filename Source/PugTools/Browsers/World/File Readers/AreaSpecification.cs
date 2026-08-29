@@ -294,17 +294,22 @@ namespace FileFormats {
 
     public void Read() {
       using Stream stream = File.OpenCopyInMemory();
-      using BinaryReader br = new BinaryReader(stream);
-      if (br.ReadUInt32() != 0x18) throw new InvalidDataException("Only binary area.dat (0x18) is currently supported by the World renderer.");
+      if (stream.Length < 4) throw new InvalidDataException("area.dat is truncated.");
+      using BinaryReader br = new BinaryReader(stream, Encoding.UTF8, true);
+      uint signature = br.ReadUInt32();
+      br.BaseStream.Position = 0;
+      if (signature == 0x18) ReadBinary(br);
+      else ReadText(br);
+    }
+
+    private void ReadBinary(BinaryReader br) {
+      _ = br.ReadUInt32();
       br.BaseStream.Position = 0x1C;
       roomsOffset = br.ReadUInt32(); assetsOffset = br.ReadUInt32(); pathsOffset = br.ReadUInt32(); schemesOffset = br.ReadUInt32();
       terrainTexOffset = br.ReadUInt32(); dynDetailTexOffset = br.ReadUInt32(); dydChnlParamsOffset = br.ReadUInt32(); settingsOffset = br.ReadUInt32(); guidOffset = br.ReadUInt32();
-      DebugHeaderInfo = string.Format(CultureInfo.InvariantCulture, "rooms=0x{0:X} assets=0x{1:X} paths=0x{2:X} schemes=0x{3:X} terrain=0x{4:X} settings=0x{5:X}", roomsOffset, assetsOffset, pathsOffset, schemesOffset, terrainTexOffset, settingsOffset);
+      DebugHeaderInfo = string.Format(CultureInfo.InvariantCulture, "binary rooms=0x{0:X} assets=0x{1:X} paths=0x{2:X} schemes=0x{3:X} terrain=0x{4:X} settings=0x{5:X}", roomsOffset, assetsOffset, pathsOffset, schemesOffset, terrainTexOffset, settingsOffset);
       // Room vertex payloads are decoded immediately while ReadRooms() walks the room DATs. Those payloads
-      // need BOTH lookup tables below already populated: AssetIdMap identifies whether a blob is HMS or WTR,
-      // and TerrainTextureNames resolves the signed splat indices stored by each heightmap. PugTools used to
-      // read rooms first, which made every heightmap fall back to terrain_checkered and could even try to parse
-      // water blobs as heightmaps. Jedipedia finishes these area-level tables before the room payload jobs run.
+      // need BOTH lookup tables below already populated.
       ReadAssets(br);
       ReadTerrainTextures(br);
       ReadRooms(br);
@@ -317,10 +322,162 @@ namespace FileFormats {
       ReadMapNotes();
     }
 
+    // Text area.dat was used by all client builds before the binary 0x18 format (pre-3.3.2).
+    // This mirrors Jedipedia's dat_area_text reader and populates the same Area model as ReadBinary.
+    private void ReadText(BinaryReader br) {
+      br.BaseStream.Position = 0;
+      byte[] bytes = br.ReadBytes(checked((int)br.BaseStream.Length));
+      string text = DecodeTextFile(bytes);
+      string[] lines = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+      string section = String.Empty;
+      var roomNames = new List<string>();
+      DebugHeaderInfo = "legacy text area.dat";
+
+      foreach (string rawLine in lines) {
+        string line = (rawLine ?? String.Empty).Trim();
+        if (line.Length == 0 || line == "!" || line.StartsWith("! Area Specification", StringComparison.OrdinalIgnoreCase) || line.StartsWith("Version=", StringComparison.OrdinalIgnoreCase)) continue;
+        if (line.StartsWith("[", StringComparison.Ordinal) && line.EndsWith("]", StringComparison.Ordinal)) { section = line.ToUpperInvariant(); continue; }
+
+        switch (section) {
+          case "[ROOMS]":
+            roomNames.Add(line);
+            break;
+          case "[ASSETS]": {
+            int eq=line.IndexOf('='); if(eq<=0) break;
+            if (UInt64.TryParse(line.Substring(0,eq).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong id))
+              AddAreaAsset(id,line.Substring(eq+1).Trim());
+            break;
+          }
+          case "[PATHS]": ReadTextPath(line); break;
+          case "[SCHEMES]": {
+            Match m=Regex.Match(line,"^\"([^\"]+)\"\\s+(~0\\|.*)$");
+            if(m.Success) EnvironmentSchemes[m.Groups[1].Value.ToLowerInvariant()]=ParseEnvironmentScheme(m.Groups[1].Value.ToLowerInvariant(),m.Groups[2].Value);
+            break;
+          }
+          case "[TERRAINTEXTURES]": ReadTextTerrainTexture(line); break;
+          case "[DYDTEXTURES]": {
+            int colon=line.IndexOf(':'); if(colon<=0) break;
+            if(UInt32.TryParse(line.Substring(0,colon),NumberStyles.Integer,CultureInfo.InvariantCulture,out uint id))
+              DynamicDetailTextures[id]=new AreaDynamicDetailTexture{Id=id,Name=line.Substring(colon+1).Trim()};
+            break;
+          }
+          case "[DYDCHANNELPARAMS]": ReadTextDynamicChannel(line); break;
+          case "[SETTINGS]": ReadTextSetting(line); break;
+        }
+      }
+
+      // Text areas do not carry the binary environment-material table. Schemes and terrain
+      // must be ready before rooms because old room payloads can reference them during load.
+      ResolveTextArrivalPoint();
+      FinalizeEnvironmentSchemes();
+      foreach(string rawName in roomNames) {
+        string name=(rawName??String.Empty).Trim().Replace('\\','/').Replace(".dat",String.Empty,StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
+        if(String.IsNullOrWhiteSpace(name)) continue;
+        TorArchive.File roomFile=assets.FindFile(Path+"/"+name+".dat");
+        if(roomFile==null){System.Diagnostics.Debug.WriteLine("Cannot find legacy area room file: "+Path+"/"+name+".dat");continue;}
+        Room room=new Room(roomFile,name,this); room.Read(); RoomList.Add(room);
+      }
+      ReadMapNotes();
+    }
+
     private static string ReadFixed(BinaryReader br, uint length, bool unicode = false) {
       byte[] bytes = br.ReadBytes(checked((int)length));
       Encoding enc = unicode ? Encoding.Unicode : Encoding.UTF8;
       return enc.GetString(bytes).TrimEnd('\0');
+    }
+
+
+    private static string DecodeTextFile(byte[] bytes) {
+      if (bytes == null || bytes.Length == 0) return String.Empty;
+      if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return Encoding.Unicode.GetString(bytes,2,bytes.Length-2).TrimEnd('\0');
+      if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return Encoding.BigEndianUnicode.GetString(bytes,2,bytes.Length-2).TrimEnd('\0');
+      if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return Encoding.UTF8.GetString(bytes,3,bytes.Length-3).TrimEnd('\0');
+      return Encoding.UTF8.GetString(bytes).TrimEnd('\0');
+    }
+
+    private void AddAreaAsset(ulong id,string raw) {
+      raw=(raw??String.Empty).Trim(); Match m=PathParser.Match(raw);
+      string path,ext,encounter=null;
+      if(m.Success){encounter=m.Groups[1].Value;path=m.Groups[2].Value;ext=m.Groups[3].Value;}
+      else{string normalized=raw.TrimStart('\\','/').Replace('\\','/');int dot=normalized.LastIndexOf('.');path=dot>0?normalized.Substring(0,dot):normalized;ext=dot>0?normalized.Substring(dot+1):String.Empty;}
+      // Authored text assets can include a leading "resources/" while binary tables normally do not.
+      path=(path??String.Empty).Replace('\\','/').TrimStart('/');
+      if(path.StartsWith("resources/",StringComparison.OrdinalIgnoreCase))path=path.Substring("resources/".Length);
+      var asset=new AreaAsset{Id=id,Path=path,Extension=(ext??String.Empty).TrimStart('.')};
+      if(!String.IsNullOrEmpty(encounter))asset.EncounterIndex=encounter.ToLowerInvariant();
+      AssetIdMap[id]=asset;
+      if(!AssetsByExtension.TryGetValue(asset.Extension,out List<AreaAsset> list))AssetsByExtension[asset.Extension]=list=new List<AreaAsset>();
+      list.Add(asset);
+    }
+
+    private void ReadTextPath(string line) {
+      if(line.StartsWith("addpath",StringComparison.OrdinalIgnoreCase)){
+        // Match Jedipedia's pre-3.3.2 parser: colour/FQN may be empty and the trailing
+        // Circular/Cardinal booleans are optional in the oldest authored files.
+        Match m=Regex.Match(line,"^addpath\\s+\\\"([0-9]+)\\\"\\s+\\\"([^\\\"]*)\\\"\\s+\\\"([^\\\"]*)\\\"\\s+\\\"([^\\\"]*)\\\"(?:\\s+\\\"(true|false)\\\"\\s+\\\"(true|false)\\\")?",RegexOptions.IgnoreCase);
+        if(!m.Success)return;
+        if(!UInt64.TryParse(m.Groups[1].Value,NumberStyles.Integer,CultureInfo.InvariantCulture,out ulong id))return;
+        var path=new AreaPath{Id=id,Name=m.Groups[2].Value,Fqn=m.Groups[4].Value,Circular=String.Equals(m.Groups[5].Value,"true",StringComparison.OrdinalIgnoreCase),Smooth=String.Equals(m.Groups[6].Value,"true",StringComparison.OrdinalIgnoreCase)};
+        string color=m.Groups[3].Value.TrimStart('#');string[] cp=color.Split(',');if(cp.Length==4)path.Color=new Vector4(ParseF(cp[0]),ParseF(cp[1]),ParseF(cp[2]),ParseF(cp[3]));
+        Paths.Add(path);return;
+      }
+      if(line.StartsWith("addpoint",StringComparison.OrdinalIgnoreCase)){
+        Match m=Regex.Match(line,"^addpoint\\s+\\\"([0-9]+)\\\"\\s+\\\"([0-9]+)\\\"\\s+\\(([^)]*)\\)\\s+\\(([^)]*)\\)(?:\\s+\\\"([^\\\"]*)\\\")?",RegexOptions.IgnoreCase);if(!m.Success)return;
+        if(!UInt64.TryParse(m.Groups[1].Value,NumberStyles.Integer,CultureInfo.InvariantCulture,out ulong pathId)||!UInt64.TryParse(m.Groups[2].Value,NumberStyles.Integer,CultureInfo.InvariantCulture,out ulong pointId))return;
+        AreaPath path=Paths.FirstOrDefault(x=>x.Id==pathId);if(path==null)return;
+        string data=m.Groups[5].Success?m.Groups[5].Value:String.Empty;
+        path.Points.Add(new AreaPathPoint{PathId=pathId,PointId=pointId,Position=ParseTextVec3(m.Groups[3].Value),Rotation=ParseTextVec3(m.Groups[4].Value),Data=data,Tension=PathNumber(data,"tension",.75f),Speed=PathNumber(data,"speed",1f),HoldTime=PathNumber(data,"holdtime",0f)});
+      }
+    }
+
+    private void ReadTextTerrainTexture(string line) {
+      int colon=line.IndexOf(':');if(colon<=0||!UInt32.TryParse(line.Substring(0,colon),NumberStyles.Integer,CultureInfo.InvariantCulture,out uint id))return;
+      string payload=line.Substring(colon+1).Trim(),name=null;int layer=0;
+      Match bwa=Regex.Match(payload,"^bwa:([A-Za-z0-9_]+):(-?[0-9]+)$",RegexOptions.IgnoreCase);
+      Match simple=Regex.Match(payload,"^([A-Za-z0-9_]+)(?::(-?[0-9]+))?$");
+      Match path=Regex.Match(payload,"^(.+?)(?:::(-?[0-9]+):(-?[0-9]+))?$");
+      if(bwa.Success){name=bwa.Groups[1].Value;Int32.TryParse(bwa.Groups[2].Value,out layer);}
+      else if(simple.Success){name=simple.Groups[1].Value;if(simple.Groups[2].Success)Int32.TryParse(simple.Groups[2].Value,out layer);}
+      else if(path.Success){name=path.Groups[1].Value;if(path.Groups[2].Success)Int32.TryParse(path.Groups[2].Value,out layer);}
+      name=NormalizeTerrainName(name);TerrainTextureNames[id]=name;TerrainTextures.Add(new AreaTerrainTexture{Id=id,Layer=unchecked((uint)Math.Max(0,layer)),Name=name});
+    }
+
+    private void ReadTextDynamicChannel(string line) {
+      int colon=line.IndexOf(':');if(colon<=0||!UInt32.TryParse(line.Substring(0,colon),NumberStyles.Integer,CultureInfo.InvariantCulture,out uint rawId))return;
+      string payload=line.Substring(colon+1);
+      if(rawId<2000){string[] parts=payload.Split(':');var values=new uint[parts.Length];for(int i=0;i<parts.Length;i++){if(String.Equals(parts[i],"false",StringComparison.OrdinalIgnoreCase))values[i]=0;else UInt32.TryParse(parts[i],NumberStyles.Integer,CultureInfo.InvariantCulture,out values[i]);}DynamicDetailChannelParams[rawId]=new AreaDynamicDetailChannelParam{Id=rawId,Type=0,Values=values};}
+      else if(rawId<=2999){Int32.TryParse(payload,NumberStyles.Integer,CultureInfo.InvariantCulture,out int value);uint id=rawId-2000;DynamicDetailChannelParams[id]=new AreaDynamicDetailChannelParam{Id=id,Type=2,IntValue=value};}
+      else if(rawId<=3999){uint id=rawId-3000;DynamicDetailChannelParams[id]=new AreaDynamicDetailChannelParam{Id=id,Type=3,StringValue=payload,Floats=Array.Empty<float>()};}
+    }
+
+    private void ReadTextSetting(string line) {
+      int eq=line.IndexOf('=');if(eq<=0)return;string key=line.Substring(0,eq).Trim(),value=line.Substring(eq+1).Trim();
+      if(key.Equals("AreaGUID",StringComparison.OrdinalIgnoreCase)){if(TryParseTextId(value,out ulong areaId))Id=areaId;}
+      else if(key.Equals("AreaDisplayName",StringComparison.OrdinalIgnoreCase))InternalName=value;
+      else if(key.Equals("SkyRotation",StringComparison.OrdinalIgnoreCase)){if(Int32.TryParse(value,NumberStyles.Integer,CultureInfo.InvariantCulture,out int rot))SkyRotation=rot;}
+      else if(key.Equals("SkyDome",StringComparison.OrdinalIgnoreCase)){if(TryParseTextId(value,out ulong sky))DefaultSkySceneAssetId=sky;}
+    }
+
+    private static bool TryParseTextId(string value,out ulong id) {
+      id=0; string text=(value??String.Empty).Trim().Trim('"');
+      if(UInt64.TryParse(text,NumberStyles.Integer,CultureInfo.InvariantCulture,out id))return true;
+      int split=text.IndexOf('|');
+      if(split>0&&UInt32.TryParse(text.Substring(0,split),NumberStyles.Integer,CultureInfo.InvariantCulture,out uint low)&&UInt32.TryParse(text.Substring(split+1),NumberStyles.Integer,CultureInfo.InvariantCulture,out uint high)){id=((ulong)high<<32)|low;return true;}
+      return false;
+    }
+
+    private void ResolveTextArrivalPoint() {
+      int best=int.MaxValue;
+      string[] names={"arrival","arrival_jedi_knight","arrival_jedi_wizard","arrival_smuggler","arrival_trooper","arrival_sith_warrior","arrival_sith_sorcerer","arrival_spy","arrival_bounty_hunter"};
+      foreach(AreaPath p in Paths){
+        if(p==null||p.Points.Count==0||String.IsNullOrWhiteSpace(p.Name))continue;
+        int rank=Array.FindIndex(names,n=>n.Equals(p.Name,StringComparison.OrdinalIgnoreCase));
+        if(rank>=0&&rank<best){best=rank;ArrivalPoint=p.Points[0];}
+      }
+    }
+
+    private static Vector3 ParseTextVec3(string value) {
+      string[] p=(value??String.Empty).Trim().Trim('(',')').Split(',');if(p.Length<3)return Vector3.Zero;return new Vector3(ParseF(p[0]),ParseF(p[1]),ParseF(p[2]));
     }
 
     private void ReadRooms(BinaryReader br) {
@@ -339,15 +496,7 @@ namespace FileFormats {
       uint count = br.ReadUInt32();
       for (int i = 0; i < count; i++) {
         ulong id = br.ReadUInt64(); uint len = br.ReadUInt32(); string raw = ReadFixed(br, len).Trim();
-        Match m = PathParser.Match(raw);
-        string path, ext, encounter = null;
-        if (m.Success) { encounter = m.Groups[1].Value; path = m.Groups[2].Value; ext = m.Groups[3].Value; }
-        else { string normalized = raw.TrimStart('\\', '/').Replace('\\', '/'); int dot = normalized.LastIndexOf('.'); path = dot > 0 ? normalized.Substring(0, dot) : normalized; ext = dot > 0 ? normalized.Substring(dot + 1) : string.Empty; }
-        var asset = new AreaAsset { Id = id, Path = path, Extension = ext };
-        if (!string.IsNullOrEmpty(encounter)) asset.EncounterIndex = encounter.ToLowerInvariant();
-        AssetIdMap[id] = asset;
-        if (!AssetsByExtension.TryGetValue(ext, out List<AreaAsset> list)) AssetsByExtension[ext] = list = new List<AreaAsset>();
-        list.Add(asset);
+        AddAreaAsset(id, raw);
       }
     }
 

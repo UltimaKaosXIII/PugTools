@@ -4,9 +4,9 @@ using System.IO;
 
 namespace PugTools {
   internal class FileFormat_BNK {
-    // private FileFormat_BNK_BKHD _bkhd;
     private readonly FileFormat_BNK_DATA _data;
 
+    internal FileFormat_BNK_BKHD BKHD { get; private set; }
     internal FileFormat_BNK_DIDX DIDX { get; set; }
     internal FileFormat_BNK_HIRC HIRC { get; set; }
     internal FileFormat_BNK_STID STID { get; set; }
@@ -19,9 +19,9 @@ namespace PugTools {
         String header_str = String.Join("", section_header);
 
         switch (header_str) {
-          // case "BKHD":
-          //   _bkhd = new FileFormat_BNK_BKHD(br);
-          //   break;
+          case "BKHD":
+            BKHD = new FileFormat_BNK_BKHD(br);
+            break;
 
           case "DIDX":
             DIDX = new FileFormat_BNK_DIDX(br);
@@ -48,51 +48,48 @@ namespace PugTools {
 
       if (loadWEMs) {
         if (DIDX != null && _data != null) {
+          Boolean isBeta = BKHD != null && BKHD.Version == 56;
           foreach (ViewWEM wem in DIDX.Wems) {
             br.BaseStream.Seek(_data.Offset /*+4*/, SeekOrigin.Begin);
             br.BaseStream.Seek(wem.Offset, SeekOrigin.Current);
             wem.Data = br.ReadBytes((Int32)wem.Length);
+            // Jedipedia keys the legacy codebook set off BKHD version 56. Carry that
+            // information with embedded WEMs so preview does not have to guess.
+            wem.IsBeta = isBeta;
           }
         }
       }
     }
   }
-  /*
-  internal class FileFormat_BNK_BKHD {
-    private UInt32 _id;
-    private UInt32 _length;
-    private Int64 _offset;
-    private UInt32 _version;
-
-    internal UInt32 Id {
-      get => _id;
-      set => _id = value;
-    }
-    internal UInt32 Length {
-      get => _length;
-      set => _length = value;
-    }
-    internal Int64 Offset {
-      get => _offset;
-      set => _offset = value;
-    }
-    internal UInt32 Version {
-      get => _version;
-      set => _version = value;
-    }
+  internal sealed class FileFormat_BNK_BKHD {
+    internal UInt32 Length { get; }
+    internal UInt32 Version { get; }
+    internal UInt32 Id { get; }
 
     internal FileFormat_BNK_BKHD(BinaryReader br) {
-      _offset = br.BaseStream.Position;
-      _length = br.ReadUInt32();
-      _version = br.ReadUInt32();
-      _id = br.ReadUInt32();
+      Length = br.ReadUInt32();
+      Int64 payloadStart = br.BaseStream.Position;
+      Int64 payloadEnd = payloadStart + Length;
 
-      br.ReadUInt32();
-      br.ReadUInt32();
-      br.BaseStream.Seek(_length - 0x10, SeekOrigin.Current);
+      // Every SWTOR bank we care about stores version/id first, but do not assume
+      // the remainder has one fixed Wwise revision-specific size.
+      if (Length >= 4) Version = br.ReadUInt32();
+      if (Length >= 8) Id = br.ReadUInt32();
+
+      if (br.BaseStream.CanSeek) {
+        br.BaseStream.Seek(payloadEnd, SeekOrigin.Begin);
+      } else {
+        Int64 consumed = br.BaseStream.Position - payloadStart;
+        Int64 remaining = Math.Max(0, (Int64)Length - consumed);
+        while (remaining > 0) {
+          Int32 take = (Int32)Math.Min(8192, remaining);
+          Byte[] skipped = br.ReadBytes(take);
+          if (skipped.Length == 0) throw new EndOfStreamException("Unexpected end of BKHD section.");
+          remaining -= skipped.Length;
+        }
+      }
     }
   }
-  */
   internal class FileFormat_BNK_DATA {
     private readonly UInt32 _length;
 
@@ -509,24 +506,29 @@ namespace PugTools {
       using BinaryReader br = new BinaryReader(fileStream);
       FileFormat_BNK bnk = new FileFormat_BNK(br);
 
+      Boolean isBeta = bnk.BKHD != null && bnk.BKHD.Version == 56;
+      String streamedRoot = isBeta ? "/resources/bnk/streamed/" : "/resources/bnk2/streamed/";
+      String streamedExtension = isBeta ? ".ogg" : ".wem";
+      String bankRoot = isBeta ? "/resources/bnk/" : "/resources/bnk2/";
+
       if (bnk.HIRC != null) {
         if (bnk.HIRC.NumObject != 0) {
           foreach (var obj in bnk.HIRC.Objects) {
             if (obj.Type == 2) {
               if (obj.Embed != 0) {
                 if (obj.AudioId != 0)
-                  _fileNames.Add("/resources/bnk2/streamed/" + obj.AudioId + ".wem");
+                  _fileNames.Add(streamedRoot + obj.AudioId + streamedExtension);
 
                 if (obj.AudioSourceId != 0)
-                  _fileNames.Add("/resources/bnk2/streamed/" + obj.AudioSourceId + ".wem");
+                  _fileNames.Add(streamedRoot + obj.AudioSourceId + streamedExtension);
               }
 
             } else if (obj.Type == 11) {
               if (obj.AudioId != 0)
-                _fileNames.Add("/resources/bnk2/streamed/" + obj.AudioId + ".wem");
+                _fileNames.Add(streamedRoot + obj.AudioId + streamedExtension);
 
               if (obj.AudioSourceId != 0)
-                _fileNames.Add("/resources/bnk2/streamed/" + obj.AudioSourceId + ".wem");
+                _fileNames.Add(streamedRoot + obj.AudioSourceId + streamedExtension);
             }
           }
         }
@@ -535,8 +537,8 @@ namespace PugTools {
       if (bnk.STID != null) {
         if (bnk.STID.NumSoundBanks != 0) {
           foreach (var obj in bnk.STID.SoundBanks) {
-            _fileNames.Add("/resources/bnk2/" + obj.Name + ".bnk");
-            _fileNames.Add("/resources/en-us/bnk2/" + obj.Name + ".bnk");
+            _fileNames.Add(bankRoot + obj.Name + ".bnk");
+            _fileNames.Add((isBeta ? "/resources/en-us/bnk/" : "/resources/en-us/bnk2/") + obj.Name + ".bnk");
           }
         }
       }

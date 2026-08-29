@@ -91,6 +91,8 @@ namespace FileFormats {
     public Vector3 scale = new Vector3(1, 1, 1);
     public Matrix transformMatrix;
     public Dictionary<uint, object> ParsedProperties { get; } = new Dictionary<uint, object>();
+    // Legacy text room.dat properties keep their authored names instead of 32-bit hashed ids.
+    public Dictionary<string, string> TextProperties { get; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     // SWTOR local-light placement properties (same hashes used by Jedipedia's room reader).
     public bool IsLocalLight { get; private set; }
@@ -126,6 +128,9 @@ namespace FileFormats {
     public float WaterNormalMap1CoordScale { get; private set; } = .05f;
     public float WaterNormalMap2CoordScale { get; private set; } = .04f;
     public float WaterSurfaceMapCoordScale { get; private set; } = .03f;
+    // Present in pre-3.3.2 text WTR instances. Jedipedia multiplies all three UV
+    // coordinate scales by this world-space factor before deriving scroll velocity.
+    public float WaterWorldCoordScale { get; private set; } = 1f;
     public float WaterNormalMapScale { get; private set; } = 1f;
     public float WaterDepthModulator { get; private set; } = 1f;
     public float WaterSurfaceMapShininess { get; private set; } = 1f;
@@ -151,6 +156,136 @@ namespace FileFormats {
     public float WaterSurfaceKneeValueAt1 { get; private set; } = 1f;
 
     public AssetInstance(ulong ID, ulong assetID, Area area) { this.ID = ID; this.assetID = assetID; this.area = area; }
+
+    public void AddTextProperty(string name, string rawValue) {
+      if (String.IsNullOrWhiteSpace(name)) return;
+      string value=(rawValue??String.Empty).Trim(); TextProperties[name]=value;
+      string text=value.Trim().Trim('"');
+      switch(name.Trim().ToLowerInvariant()) {
+        case "hidden": hidden=ParseTextBool(text); return;
+        case "depth": if(TryTextFloat(text,out float depthValue)){depth=depthValue;HasDepthProperty=true;} return;
+        case "height": if(TryTextFloat(text,out float heightValue)){height=heightValue;HasHeightProperty=true;} return;
+        case "width": if(TryTextFloat(text,out float widthValue)){width=widthValue;HasWidthProperty=true;} return;
+        case "parentinstance": case "parentinstanceid": if(UInt64.TryParse(text,System.Globalization.NumberStyles.Integer,System.Globalization.CultureInfo.InvariantCulture,out ulong parent))parentInstance=parent; return;
+        case "position": if(TryTextVec3(text,out Vector3 pos))position=pos; return;
+        case "rotation": if(TryTextVec3(text,out Vector3 rot))rotation=rot; return;
+        case "scale": if(TryTextVec3(text,out Vector3 scl))scale=scl; return;
+        case "lodfactor": if(TryTextFloat(text,out float lod))LodFactor=lod; return;
+        case "path": PathFollowerPath=text; return;
+        case "speed": if(TryTextFloat(text,out float speed))PathFollowerSpeed=Math.Abs(speed); return;
+        case "turnrate": if(TryTextFloat(text,out float turn))PathFollowerTurnRate=Math.Abs(turn); return;
+        case "portaltarget": PortalTarget=text; return;
+        case "triggerparam": TriggerParam=text; return;
+        case "tag": TriggerTag=text; return;
+        case "ellipsoid": TriggerEllipsoid=ParseTextBool(text); return;
+        case "environmentmaterialindex": case "envmaterialindex": if(Int32.TryParse(text,System.Globalization.NumberStyles.Integer,System.Globalization.CultureInfo.InvariantCulture,out int env))EnvironmentMaterialIndex=env; return;
+        case "viewability":
+          if(Int32.TryParse(text,System.Globalization.NumberStyles.Integer,System.Globalization.CultureInfo.InvariantCulture,out int viewRaw)&&viewRaw>=1&&viewRaw<=4)Viewability=(AssetInstanceViewability)viewRaw;
+          else if(text.Equals("WORLD_ONLY",StringComparison.OrdinalIgnoreCase))Viewability=AssetInstanceViewability.WorldOnly;
+          else if(text.Equals("MAP_ONLY",StringComparison.OrdinalIgnoreCase))Viewability=AssetInstanceViewability.MapOnly;
+          else if(text.Equals("OCCLUDER_ONLY",StringComparison.OrdinalIgnoreCase))Viewability=AssetInstanceViewability.OccluderOnly;
+          return;
+        case "triggerclasstype": TriggerClassType=text; return;
+        case "vertexdata": case "wtrvertexdata": vertexData=DecodePayloadBytes(Encoding.UTF8.GetBytes(text)); return;
+        case "rgnvolumedata": regionVolumeData=DecodePayloadBytes(Encoding.UTF8.GetBytes(text)); return;
+        case "depthtexture": waterDepthData=DecodePayloadBytes(Encoding.UTF8.GetBytes(text)); return;
+        // Legacy text rooms use the same authored property names that Jedipedia maps to the
+        // binary hashes. Route them through the same semantic handlers as binary rooms so
+        // local lights and water do not silently lose most of their parameters in Beta worlds.
+        case "lighttype": ApplyLocalLightProperty(0x36A29A30,text); return;
+        case "sourceoffset": ApplyLocalLightProperty(0x6CB280CE,text); return;
+        case "falloff": ApplyLocalLightProperty(0x3B92D7B4,text); return;
+        case "illuminationmap": ApplyLocalLightProperty(0x6C84A1CD,text); return;
+        case "rampmap": ApplyLocalLightProperty(0x429C878A,text); return;
+        case "range": ApplyLocalLightProperty(0x16E929FD,text); return;
+        case "intensity": ApplyLocalLightProperty(0xBC68CFF3,text); return;
+        case "restricttoroom": ApplyLocalLightProperty(0x279A7732,text); return;
+        case "doheightmaps": ApplyLocalLightProperty(0xC5B29609,text); return;
+        case "dogranny": ApplyLocalLightProperty(0x925224AE,text); return;
+        case "dospeedtree": ApplyLocalLightProperty(0x3902C81A,text); return;
+        case "dowater": ApplyLocalLightProperty(0xB37CB64C,text); return;
+        case "docharacters": ApplyLocalLightProperty(0x0D59B255,text); return;
+        case "color": ApplyLocalLightProperty(0xA67AE663,text); return;
+
+        // /engine/basewater.wtr.  Text room.dat stores the same names as Jedipedia's
+        // binary property-name table; vectors need converting before the shared handler.
+        case "worldcoordscale": if(TryTextFloat(text,out float worldCoordScale))WaterWorldCoordScale=worldCoordScale; return;
+        case "surfacemapshininess": ApplyWaterProperty(0x9EB346D7,text); return;
+        case "deepcolor": if(TryTextVec4(text,out Vector4 deep))ApplyWaterProperty(0xA4DEE397,deep); return;
+        case "wtrtextureindex": ApplyWaterProperty(0x67D56C2C,text); return;
+        case "kneevalue2": ApplyWaterProperty(0x79252004,text); return;
+        case "normalmap2dir": ApplyWaterProperty(0x22232EB0,text); return;
+        case "normalmap2direction": if(TryTextFloat(text,out float normal2Direction))WaterNormalMap2Dir=normal2Direction; return;
+        case "normalmap1rotation": ApplyWaterProperty(0x309B8EDA,text); return;
+        case "surfacekneeposition2": ApplyWaterProperty(0x34B33599,text); return;
+        case "normalmap1": ApplyWaterProperty(0x97BD57BC,text); return;
+        case "surfacemapcoordscale": ApplyWaterProperty(0xAF219C64,text); return;
+        case "kneevalue3": ApplyWaterProperty(0x79252005,text); return;
+        case "surfacekneeposition3": ApplyWaterProperty(0x34B3359A,text); return;
+        case "kneeposition3": ApplyWaterProperty(0x012A9C47,text); return;
+        case "normalmap1speed": ApplyWaterProperty(0x62720B6B,text); return;
+        case "normalmap2speed": ApplyWaterProperty(0x789E6CAA,text); return;
+        case "glosscolor": if(TryTextVec4(text,out Vector4 gloss))ApplyWaterProperty(0xEF241B39,gloss); return;
+        case "surfacemap": ApplyWaterProperty(0x5430EB0F,text); return;
+        case "normalmap2": ApplyWaterProperty(0x97BD57BD,text); return;
+        case "normalmap2rotation": ApplyWaterProperty(0x03B54CDB,text); return;
+        case "surfacekneeposition1": ApplyWaterProperty(0x34B33598,text); return;
+        case "kneeposition2": ApplyWaterProperty(0x012A9C46,text); return;
+        case "normalmap1coordscale": ApplyWaterProperty(0xA0A2E891,text); return;
+        case "depthmodulator": ApplyWaterProperty(0x9458550C,text); return;
+        case "normalmap2coordscale": ApplyWaterProperty(0x073BB612,text); return;
+        case "normalmap1dir": ApplyWaterProperty(0xF39C5DF1,text); return;
+        case "normalmap1direction": if(TryTextFloat(text,out float normal1Direction))WaterNormalMap1Dir=normal1Direction; return;
+        case "shallowcolor": if(TryTextVec4(text,out Vector4 shallow))ApplyWaterProperty(0x6F62ABAF,shallow); return;
+        case "kneeposition": case "kneeposition1": ApplyWaterProperty(0x012A9C45,text); return;
+        case "kneevalue": case "kneevalue1": ApplyWaterProperty(0x79252003,text); return;
+        case "kneevalueat1": ApplyWaterProperty(0x12265370,text); return;
+        case "distanceopacityscale": ApplyWaterProperty(0xC7A1E914,text); return;
+        case "angleopacityscale": ApplyWaterProperty(0xE19C6092,text); return;
+        case "surfacekneeposition": ApplyWaterProperty(0x34B33598,text); return;
+        case "surfacekneevalue": case "surfacekneevalue1": ApplyWaterProperty(0x6EB96870,text); return;
+        case "surfacekneevalue2": ApplyWaterProperty(0x6EB96871,text); return;
+        case "surfacekneevalue3": ApplyWaterProperty(0x6EB96872,text); return;
+        case "surfacekneevalueat0": ApplyWaterProperty(0x27C3355C,text); return;
+        case "surfacekneevalueat1": ApplyWaterProperty(0x27C3355D,text); return;
+        case "normalmapscale": ApplyWaterProperty(0xA1DF4EB5,text); return;
+        case "reflectionmodulator": ApplyWaterProperty(0x059903C4,text); return;
+        case "specularpower": ApplyWaterProperty(0x172A4EC2,text); return;
+
+        // Region metadata uses the rgn-prefixed names in legacy text rooms. Keep the
+        // older short aliases too because a handful of early generated rooms use them.
+        case "rgnclasstype": RegionClassType=TextRegionClassType(text); return;
+        case "rgncharacteristics": case "characteristics": RegionCharacteristics=text; return;
+        case "rgnrespawnmedcenter": case "respawnmedcenter": RegionRespawnMedCenter=text; return;
+      }
+    }
+
+    private static bool ParseTextBool(string value) => value != null && (value.Equals("true",StringComparison.OrdinalIgnoreCase)||value=="1");
+    private static bool TryTextFloat(string value,out float result) => float.TryParse(value,System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,out result)&&Single.IsFinite(result);
+    private static bool TryTextVec3(string value,out Vector3 result) {
+      string[] parts=(value??String.Empty).Trim().Trim('(',')').Split(',');
+      if(parts.Length>=3&&TryTextFloat(parts[0],out float x)&&TryTextFloat(parts[1],out float y)&&TryTextFloat(parts[2],out float z)){result=new Vector3(x,y,z);return true;}
+      result=Vector3.Zero;return false;
+    }
+
+    private static bool TryTextVec4(string value,out Vector4 result) {
+      string text=(value??String.Empty).Trim().Trim('(',')').TrimStart('#');
+      string[] parts=text.Split(',');
+      if(parts.Length>=3&&TryTextFloat(parts[0],out float x)&&TryTextFloat(parts[1],out float y)&&TryTextFloat(parts[2],out float z)){
+        float w=1f;if(parts.Length>=4&&!TryTextFloat(parts[3],out w)){result=default;return false;}
+        result=new Vector4(x,y,z,w);return true;
+      }
+      result=default;return false;
+    }
+
+    private static string TextRegionClassType(string value) {
+      string text=(value??String.Empty).Trim().Trim('"');
+      if(Int32.TryParse(text,System.Globalization.NumberStyles.Integer,System.Globalization.CultureInfo.InvariantCulture,out int raw)) {
+        string[] classes={"GENERIC","MAP","AUDIO","RESPAWN","PVP","DEATH","EXHAUSTION","WORLD_QUEST","SHARED_WORLD_QUEST","META_WORLD_QUEST","PLANETARY_WORLD_QUEST"};
+        return raw>=1&&raw<=classes.Length?classes[raw-1]:"GENERIC";
+      }
+      return String.IsNullOrWhiteSpace(text)?"GENERIC":text.ToUpperInvariant();
+    }
 
     public void AddProperty(ref BinaryReader br, uint name, uint type) {
       if (name == 0x3C472B4A && type == 0) { hidden = br.ReadBoolean(); return; }
@@ -398,7 +533,7 @@ namespace FileFormats {
       if (value is Vector4 direct) { color = direct; return true; }
       string text = LocalLightText(value);
       if (String.IsNullOrWhiteSpace(text) || text.StartsWith("[", StringComparison.Ordinal)) { color = default; return false; }
-      string[] parts = text.TrimStart('#').Split(',');
+      string[] parts = text.Trim('(', ')').TrimStart('#').Split(',');
       if (parts.Length < 3) { color = default; return false; }
       float[] c = new float[4] { 1, 1, 1, 1 };
       for (int i = 0; i < Math.Min(parts.Length, 4); i++) {

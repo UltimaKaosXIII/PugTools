@@ -126,14 +126,18 @@ namespace PugTools {
       if (i == null) { ClearWater(); return; }
       float dir1=WaterAngle(i.WaterNormalMap1Dir), dir2=WaterAngle(i.WaterNormalMap2Dir);
       float rot1=WaterAngle(i.WaterNormalMap1Rotation), rot2=WaterAngle(i.WaterNormalMap2Rotation);
-      float s1=i.WaterNormalMap1CoordScale, s2=i.WaterNormalMap2CoordScale;
+      // Legacy text WTR instances can author WorldCoordScale. Jedipedia applies it to all
+      // water UV scales before both texture scrolling and shader parameter upload.
+      float worldScale=Single.IsFinite(i.WaterWorldCoordScale)?i.WaterWorldCoordScale:1f;
+      float s1=i.WaterNormalMap1CoordScale*worldScale, s2=i.WaterNormalMap2CoordScale*worldScale;
+      float surfaceScale=i.WaterSurfaceMapCoordScale*worldScale;
       float v1x=(float)Math.Cos(dir1)*i.WaterNormalMap1Speed*s1, v1y=(float)Math.Sin(dir1)*i.WaterNormalMap1Speed*s1;
       float v2x=(float)Math.Cos(dir2)*i.WaterNormalMap2Speed*s2, v2y=(float)Math.Sin(dir2)*i.WaterNormalMap2Speed*s2;
       waterDeep.Set(i.WaterDeepColor); waterShallow.Set(i.WaterShallowColor); waterGloss.Set(i.WaterGlossColor);
       waterNmOffsets.Set(new Vector4(v1x*elapsedSeconds,v1y*elapsedSeconds,v2x*elapsedSeconds,v2y*elapsedSeconds));
       waterParams.Set(new Vector4(rot1,rot2,0,i.WaterDistanceOpacityScale));
       waterParams2.Set(new Vector4(i.WaterAngleOpacityScale,i.WaterNormalMapScale,i.WaterDepthModulator,i.WaterSurfaceMapShininess));
-      waterParams3.Set(new Vector4(s1,s2,i.WaterSurfaceMapCoordScale,i.WaterReflectionModulator));
+      waterParams3.Set(new Vector4(s1,s2,surfaceScale,i.WaterReflectionModulator));
       waterAlpha1.Set(new Vector4(i.WaterKneePosition1,i.WaterKneePosition2,i.WaterKneePosition3,i.WaterSpecularPower));
       waterAlpha2.Set(new Vector4(i.WaterKneeValue1,i.WaterKneeValue2,i.WaterKneeValue3,i.WaterKneeValueAt1));
       waterAlpha3.Set(new Vector4(i.WaterSurfaceKneePosition1,i.WaterSurfaceKneePosition2,i.WaterSurfaceKneePosition3,i.WaterSurfaceKneeValueAt0));

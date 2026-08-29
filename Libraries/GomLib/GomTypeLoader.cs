@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 
 namespace GomLib
@@ -30,16 +30,25 @@ namespace GomLib
             AddLoader(new GomTypeLoaders.ListLoader(dom));
             AddLoader(new GomTypeLoaders.MapLoader(dom));
             AddLoader(new GomTypeLoaders.EmbeddedClassLoader());
-            // Array
-            // Table
-            // Cubic
+            // Jedipedia's client.gom reader treats these legacy declarations as one-byte
+            // schema types. Their stored NODE payloads are not generically decoded there,
+            // either, so recognise the schema without guessing at instance byte lengths.
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.Association));
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.Array));
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.Table));
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.Cubic));
             AddLoader(new GomTypeLoaders.ScriptLoader());
             AddLoader(new GomTypeLoaders.ClassRefLoader());
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.GuiControl));
             AddLoader(new GomTypeLoaders.TimerLoader());
             AddLoader(new GomTypeLoaders.VectorLoader());
             AddLoader(new GomTypeLoaders.TimeSpanLoader());
             AddLoader(new GomTypeLoaders.TimeLoader());
-            AddLoader(new GomTypeLoaders.NewType18Loader());
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.FsGuid));
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.Rawdata));
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.FuncRef));
+            AddLoader(new GomTypeLoaders.TupleLoader());
+            AddLoader(new GomTypeLoaders.OpaqueLoader(GomTypeId.Any));
         }
 
         public void Flush()
@@ -52,13 +61,13 @@ namespace GomLib
             long typeIdPos = reader.BaseStream.CanSeek ? reader.BaseStream.Position : -1;
             GomTypeId typeId = (GomTypeId)reader.ReadByte();
 
-            // In 64-bit GOM data a container may omit an inline type declaration.
-            // Type ID 0 therefore means "use the type declared by the container"
-            // rather than "UInt64".  Map/List already have the declared type and
-            // use the null result as their fallback.
+            // Type 0 is a real Void/None DOM type. It consumes no value bytes.
+            // Do not use it as a generic "missing inline type" sentinel: Jedipedia and
+            // SWTOR both preserve the tag. The only data-level special case is a
+            // LookupList whose *key* type is Void; Map.ReadData maps that key to String.
             if (typeId == GomTypeId.None)
             {
-                return null;
+                return new GomTypes.Void();
             }
 
             if (!gomTypeLoaderMap.TryGetValue(typeId, out GomTypeLoaders.IGomTypeLoader gomTypeLoader))

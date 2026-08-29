@@ -1,61 +1,87 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using System.Xml.Linq;
+
+using nsHashDictionary;
+using TorArchive;
 
 using GomLib;
 
 namespace PugTools {
   internal partial class Tools {
     private static HashSet<String> DiscoverStringTables(DataObjectModel dom) {
-      List<GomObject> itmList = dom.GetObjectsStartingWith("cnv.");
-      XDocument doc =
-        XDocument.Load(
-          dom.Assets.FindFile("\\resources\\gamedata\\str\\stb.manifest").OpenCopyInMemory()
-        );
+      dom.StringTable.Flush(); // flushing out any loaded string tables that might have been altered.
+      var foundStringTables = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
 
-      dom.StringTable.Flush(); //flushing out any loaded string tables that might have been altered.
-
-      HashSet<String> foundStringTables = new HashSet<String>();
-
-      foreach (XElement element in doc.Element("manifest").Elements("file")) {
-        foundStringTables.Add(element.Attribute("val").Value);
-        // XElement stringTable = StbToXElement(element.Attribute("val").Value);
-        // if (stringTable.Elements().Count() > 0) stringTables.Add(stringTable);
+      // Retail clients have a manifest, but RED/BLUE beta archives predate it. Never make
+      // the extractor dependent on stb.manifest being present.
+      TorArchive.File manifest = dom.Assets.FindFile("/resources/gamedata/str/stb.manifest");
+      if (manifest != null) {
+        try {
+          XDocument doc = XDocument.Load(manifest.OpenCopyInMemory());
+          XElement root = doc.Element("manifest");
+          if (root != null) foreach (XElement element in root.Elements("file")) {
+            String value = element.Attribute("val")?.Value?.Trim();
+            if (!String.IsNullOrWhiteSpace(value)) foundStringTables.Add(value);
+          }
+        } catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("String table manifest could not be read: " + ex.Message);
+        }
       }
 
-      foreach (GomObject itm in itmList) {
-        /*
-        Dictionary<Object, Object> dialogNodeMap = 
-          itm.Data.ValueOrDefault<Dictionary<Object, Object>>(
-            "cnvTreeDialogNodes_Prototype", 
-            new Dictionary<Object, Object>()
-          );
+      // Beta has no manifest. Discover named .stb (RED) and legacy XML .str (BLUE)
+      // entries from the hash dictionary for the physical TORs that are actually loaded.
+      if (manifest == null || foundStringTables.Count == 0) try {
+        foreach (Library library in dom.Assets.Libraries) {
+          if (library == null) continue;
+          try { library.Load(); } catch { continue; }
 
-        foreach (KeyValuePair<Object, Object> dialogKvp in dialogNodeMap) {
-          long nodeNumber = ((GomObjectData)dialogKvp.Value).Get<long>("cnvNodeNumber");
-          Dictionary<Object, Object> textMap = 
-            ((GomObjectData)dialogKvp.Value).Get<Dictionary<Object, Object>>("locTextRetrieverMap");
-          if (textMap.ContainsKey(nodeNumber)) {
-            string stb = 
-              ((GomObjectData)textMap[(Int64)nodeNumber]).Get<String>(
-                "strLocalizedTextRetrieverBucket"
-              );
-            foundStringTables.Add(stb);
+          foreach (Archive archive in library.Archives.Values) {
+            if (archive == null || String.IsNullOrWhiteSpace(archive.FileName)) continue;
+            String archiveName = Path.GetFileNameWithoutExtension(archive.FileName);
+
+            foreach (HashData hash in HashDictionaryInstance.Instance.Dictionary.EnumerateArchiveFiles(archiveName)) {
+              String fqn = StringTableFqnFromResourcePath(hash?.FileName);
+              if (fqn != null) foundStringTables.Add(fqn);
+            }
           }
         }
-        // This is always equal to the conversation node name. We can save a ton of time by just 
-        // looking at that.
-        */
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Legacy string table discovery failed: " + ex.Message);
+      }
 
-        String potentialStb = "str." + itm.Name;
-
-        foundStringTables.Add(potentialStb);
-        itm.Unload();
+      // Conversation tables are a useful fallback for partially named/custom archives.
+      List<GomObject> itmList = null;
+      try { itmList = dom.GetObjectsStartingWith("cnv."); } catch { }
+      if (itmList != null) foreach (GomObject itm in itmList) {
+        if (itm == null || String.IsNullOrWhiteSpace(itm.Name)) continue;
+        foundStringTables.Add("str." + itm.Name);
+        try { itm.Unload(); } catch { }
       }
 
       return foundStringTables;
     }
+
+    private static String StringTableFqnFromResourcePath(String fileName) {
+      if (String.IsNullOrWhiteSpace(fileName)) return null;
+      String normalized = fileName.Replace('\\', '/').Trim().ToLowerInvariant();
+      if (!normalized.EndsWith(".stb", StringComparison.OrdinalIgnoreCase) &&
+          !normalized.EndsWith(".str", StringComparison.OrdinalIgnoreCase))
+        return null;
+
+      int marker = normalized.IndexOf("/str/", StringComparison.OrdinalIgnoreCase);
+      if (marker < 0) return null;
+
+      String relative = normalized.Substring(marker + 5);
+      int dot = relative.LastIndexOf('.');
+      if (dot <= 0) return null;
+      relative = relative.Substring(0, dot).Trim('/');
+      if (relative.Length == 0) return null;
+      return "str." + relative.Replace('/', '.');
+    }
+
     internal void GetStrings() {
       Clearlist2();
       LoadData();

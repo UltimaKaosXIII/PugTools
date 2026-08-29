@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+﻿using System;
 
 namespace GomLib.DomTypeLoaders
 {
@@ -11,27 +11,31 @@ namespace GomLib.DomTypeLoaders
             DomEnum result = new DomEnum();
             LoaderHelper.ParseShared(reader, result);
 
-            reader.BaseStream.Position = 0x12;
-            var nameOffset = reader.ReadInt16();
+            // DBLB v1 payload starts at 0x14, DBLB v2 at 0x18.
+            reader.BaseStream.Position = reader.DblbVersion == 1 ? 0x14 : 0x18;
+            UInt16 numVals = reader.ReadUInt16();
+            UInt16 offsetsOffset = reader.ReadUInt16();
 
-            reader.BaseStream.Position = 0x18;
-            var numVals = reader.ReadInt16();
-            var valOffset = reader.ReadInt16();
+            if (numVals == 0)
+                return result;
 
-            // Read in names
-            reader.BaseStream.Position = nameOffset;
-            for (var i = 0; i < numVals; i++)
+            if (offsetsOffset == 0 || offsetsOffset + (numVals * 2L) > reader.BaseStream.Length)
+                throw new InvalidOperationException($"Invalid GOM enum offset table 0x{offsetsOffset:X} for DBLB v{reader.DblbVersion}.");
+
+            for (Int32 i = 0; i < numVals; i++)
             {
-                var name = reader.ReadNullTerminatedString();
-                result.AddName(name);
-            }
+                reader.BaseStream.Position = offsetsOffset + (i * 2L);
+                UInt16 stringOffset = reader.ReadUInt16();
 
-            // Read in values
-            reader.BaseStream.Position = valOffset;
-            for (var i = 0; i < numVals; i++)
-            {
-                var val = reader.ReadInt16();
-                result.AddValue(val);
+                if (stringOffset == 0 || stringOffset >= reader.BaseStream.Length)
+                    throw new InvalidOperationException($"Invalid GOM enum string offset 0x{stringOffset:X} for DBLB v{reader.DblbVersion}.");
+
+                reader.BaseStream.Position = stringOffset;
+                result.AddName(reader.ReadNullTerminatedString());
+
+                // Legacy DomEnum keeps the raw enum table values. In this format the
+                // table entries are offsets to the corresponding strings.
+                result.AddValue(unchecked((Int16)stringOffset));
             }
 
             return result;

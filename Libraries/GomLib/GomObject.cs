@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Xml.Linq;
@@ -322,25 +323,41 @@ namespace GomLib {
         if (isZstd) {
           using var decompressor = new ZstdSharp.Decompressor();
           System.Span<byte> span = decompressor.Unwrap(DataBuffer, maxLen);
-          readBytes = System.Math.Min(span.Length, maxLen);
-          span.Slice(0, readBytes).CopyTo(buffer);
+          if (span.Length > maxLen)
+            throw new InvalidDataException($"GOM node {Id} decompressed to {span.Length} bytes; expected at most {maxLen}.");
+          readBytes = span.Length;
+          span.CopyTo(buffer);
         } else if (isZlib) {
           try {
             using var ms = new System.IO.MemoryStream(DataBuffer);
             using var istream = new ICSharpCode.SharpZipLib.Zip.Compression.Streams.InflaterInputStream(ms, new ICSharpCode.SharpZipLib.Zip.Compression.Inflater(false));
-            readBytes = istream.Read(buffer, 0, maxLen);
+            readBytes = 0;
+            // Stream.Read is allowed to return a short read. The previous single call could therefore
+            // truncate perfectly valid nodes and make the following field byte look like a GomType.
+            while (readBytes < maxLen) {
+              int n = istream.Read(buffer, readBytes, maxLen - readBytes);
+              if (n <= 0) break;
+              readBytes += n;
+            }
+            // Detect output larger than our expected content+alignment envelope as a format error.
+            if (readBytes == maxLen && istream.ReadByte() >= 0)
+              throw new InvalidDataException($"GOM node {Id} decompressed beyond the expected {maxLen} bytes.");
           } catch (Exception ex) {
             DumpFailedNodeBuffer(ex);
             throw;
           }
         } else {
           // Not actually compressed - use the raw bytes directly.
-          readBytes = System.Math.Min(DataBuffer.Length, maxLen);
+          if (DataBuffer.Length > maxLen)
+            throw new InvalidDataException($"Raw GOM node {Id} has {DataBuffer.Length} bytes; expected at most {maxLen}.");
+          readBytes = DataBuffer.Length;
           System.Array.Copy(DataBuffer, buffer, readBytes);
         }
 
         Zeroes = readBytes - dataLen;
-        //istream.Read(buffer, 0, 0xF);
+        if (Zeroes < 0 || Zeroes > 7)
+          throw new InvalidDataException($"GOM node {Id} has invalid leading alignment padding {Zeroes} (decoded={readBytes}, content={dataLen}).");
+        if (readBytes != buffer.Length) System.Array.Resize(ref buffer, readBytes);
       } else {
         string path = string.Format("/resources/systemgenerated/prototypes/{0}.node", Id);
         TorArchive.File protoFile = Dom_.Assets.FindFile(path);
@@ -351,7 +368,7 @@ namespace GomLib {
           buffer = br.ReadBytes(ObjectSizeInFile);
           Zeroes = 0;
         } else {
-          buffer = null;
+          throw new System.IO.FileNotFoundException($"Prototype node file not found for {Id}.", path);
         }
       }
 

@@ -46,10 +46,12 @@ namespace GomLib {
         return new KeyValuePair<string, string>("", "");
       if (!MaterialList.TryGetValue(id, out Dictionary<long, string> matDict)) { }
 
-      if (matDict == null)
+      if (matDict == null || matDict.Count == 0)
         return new KeyValuePair<string, string>("", "");
-      else
-        return new KeyValuePair<string, string>(matDict[0], matDict.ContainsKey(-1) ? matDict[-1] : matDict.ContainsKey(1) ? matDict[1] : "");
+      string primary = matDict.TryGetValue(0, out string zero) ? zero : matDict.OrderBy(x => x.Key).First().Value;
+      string mirror = matDict.TryGetValue(-1, out string negative) ? negative
+        : (matDict.TryGetValue(1, out string one) ? one : "");
+      return new KeyValuePair<string, string>(primary ?? "", mirror ?? "");
 
     }
 

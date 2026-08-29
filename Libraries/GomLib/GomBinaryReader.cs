@@ -14,103 +14,89 @@ namespace GomLib {
   public class GomBinaryReader : BinaryReader {
     readonly DataObjectModel _dom;
 
-    public GomBinaryReader(Stream str, DataObjectModel dom) : base(str) {
+    /// <summary>
+    /// DBLB container version for definition-entry readers. Version 2 is the
+    /// live-client layout; version 1 is used by the beta client and beta PBUK
+    /// buckets. Non-DBLB readers keep the default value.
+    /// </summary>
+    public Int32 DblbVersion { get; }
+
+    public GomBinaryReader(Stream str, DataObjectModel dom, Int32 dblbVersion = 2) : base(str) {
       _dom = dom;
+      DblbVersion = dblbVersion;
     }
-    public GomBinaryReader(Stream str, Encoding encoding, DataObjectModel dom) : base(str, encoding) {
+    public GomBinaryReader(Stream str, Encoding encoding, DataObjectModel dom, Int32 dblbVersion = 2) : base(str, encoding) {
       _dom = dom;
+      DblbVersion = dblbVersion;
     }
 
+    /// <summary>
+    /// Reads SWTOR's unsigned varint form. The client accepts only literal 0x00-0xBF
+    /// and positive 0xC8-0xCF length prefixes here; negative prefixes and INT64_MIN
+    /// are invalid for an unsigned value.
+    /// </summary>
     public ulong ReadNumber() {
-      //Debug.WriteLine(this.ToString());
-      ulong val = 0;
       byte b0 = ReadByte();
-      if (b0 == 0xD2) { b0 = ReadByte(); } //flag on lookup lists. Unsure of function.
-      if (b0 < 0xC0) { return b0; }
-      if (b0 < 0xC8) {
-        byte[] byteBuffer = new byte[b0 - 0xBF];
-        Read(byteBuffer, 0, byteBuffer.Length);
+      if (b0 < 0xC0) return b0;
+      if (b0 < 0xC8 || b0 >= 0xD0)
+        throw new InvalidOperationException(string.Format("Invalid unsigned number prefix: 0x{0:X2}", b0));
 
-        for (int i = 0; i < byteBuffer.Length; i++) {
-          val <<= 8;
-          val += byteBuffer[i];
-        }
-
-        return val;
-      } else if (b0 < 0xD0) {
-        byte[] byteBuffer = new byte[b0 - 0xC7];
-        Read(byteBuffer, 0, byteBuffer.Length);
-
-        for (int i = 0; i < byteBuffer.Length; i++) {
-          val <<= 8;
-          val += byteBuffer[i];
-        }
-
-        return val;
-      }
-        /*else if (b0 == 0xD8)
-        {
-            return (ulong)this.ReadInt32(); // This is wrong, but I don't know wtf it's looking for.
-        }*/
-        else if (b0 == 0xD0) {
-        return ReadByte();
-      } else if (b0 == 0xEF) //this is likely a bug due to not having a GomTypeId.RawData reader
-        {
-        byte[] byteBuffer = new byte[4];//this is wrong, but it avoids the exception for now.
-        Read(byteBuffer, 0, byteBuffer.Length); // it's almost right, but the ctlCoverMovementDirection_c value isn't being read right, which throws the following values off.
-
-        for (int i = 0; i < byteBuffer.Length; i++) {
-          val <<= 8;
-          val += byteBuffer[i];
-        }
-
-        //var bs = this.ReadByte();
-        return val;
-      } else {
-        throw new InvalidOperationException(string.Format("Unknown Number Prefix: 0x{0:X}", b0));
-      }
+      int length = (b0 & 0x07) + 1;
+      ulong value = 0;
+      for (int i = 0; i < length; i++)
+        value = (value << 8) | ReadByte();
+      return value;
     }
 
     public long ReadSignedNumber() {
-      long val = 0;
       byte b0 = ReadByte();
-      if (b0 == 0xD2) {
-        int num = ReadByte();
-        string result = ReadFixedLengthString(num);
-        val = long.Parse(result);
-      } //flag on lookup lists. Unsure of function.
-      else {
-        if (b0 < 0xC0) { return b0; }
-        if (b0 < 0xC8) {
-          byte[] byteBuffer = new byte[b0 - 0xBF];
-          Read(byteBuffer, 0, byteBuffer.Length);
+      if (b0 < 0xC0) return b0;
+      if (b0 == 0xD0) return long.MinValue;
+      if (b0 >= 0xD1)
+        throw new InvalidOperationException(string.Format("Invalid signed number prefix: 0x{0:X2}", b0));
 
-          for (int i = 0; i < byteBuffer.Length; i++) {
-            val <<= 8;
-            val |= byteBuffer[i];
-          }
-          val = -val;
-        } else if (b0 < 0xD0) {
-          byte[] byteBuffer = new byte[b0 - 0xC7];
-          Read(byteBuffer, 0, byteBuffer.Length);
+      int length = (b0 & 0x07) + 1;
+      ulong magnitude = 0;
+      for (int i = 0; i < length; i++)
+        magnitude = (magnitude << 8) | ReadByte();
 
-          for (int i = 0; i < byteBuffer.Length; i++) {
-            val <<= 8;
-            val |= byteBuffer[i];
-          }
-        } else if (b0 == 0xD0) {
-          return 0; // (long)this.ReadByte(); // this was wrong
-        } else {
-          throw new InvalidOperationException(string.Format("Unknown Number Prefix: 0x{0:X}", b0));
-        }
+      if (b0 < 0xC8) {
+        if (magnitude > 0x7FFFFFFFFFFFFFFFUL)
+          throw new InvalidOperationException("Negative varint magnitude exceeds Int64 range.");
+        return -(long)magnitude;
       }
+      // Current x64 GOM data can serialize the full positive 64-bit magnitude even for
+      // DOM type Int64 (for example table/map keys that are really 64-bit ids). Jedipedia
+      // preserves that full 64-bit value. PugTools historically stores these values in a
+      // System.Int64, so preserve the raw two's-complement bit pattern instead of rejecting
+      // magnitudes above Int64.MaxValue. Counts still reject the resulting negative value
+      // in ReadCount32, while true object/node ids use ReadIdNumber/ReadNumber (UInt64).
+      return unchecked((long)magnitude);
+    }
 
-      //if (val == -2305634256081214423)
-      //{
-      //    Debug.WriteLine("Gotcha! long");
-      //}
+    /// <summary>
+    /// Reads a SWTOR object/node id. IDs use the non-negative/unsigned half of
+    /// the GOM varint alphabet and may legitimately occupy the full UInt64
+    /// range (many beta prototype ids are greater than Int64.MaxValue).
+    /// </summary>
+    public ulong ReadIdNumber() => ReadNumber();
 
-      return val;
+    /// <summary>Reads a non-negative 32-bit count/length encoded with SWTOR's signed varint.</summary>
+    public int ReadCount32(string what) {
+      long value = ReadSignedNumber();
+      if (value < 0 || value > Int32.MaxValue)
+        throw new InvalidDataException($"Invalid {what}: {value}.");
+      return (int)value;
+    }
+
+    /// <summary>Consumes a one-byte container marker only when it is actually present.</summary>
+    public bool TryConsumeMarker(byte marker) {
+      if (!BaseStream.CanSeek) return false;
+      long pos = BaseStream.Position;
+      int value = BaseStream.ReadByte();
+      if (value == marker) return true;
+      BaseStream.Position = pos;
+      return false;
     }
 
     public TypedValue ReadTypedValue() {
@@ -197,7 +183,9 @@ namespace GomLib {
     }
 
     public string ReadLengthPrefixString(Encoding encoding) {
-      int len = (int)ReadNumber();
+      int len = ReadCount32("string length");
+      if (BaseStream.CanSeek && len > BaseStream.Length - BaseStream.Position)
+        throw new EndOfStreamException($"String declares {len} bytes but only {BaseStream.Length - BaseStream.Position} remain.");
       return ReadFixedLengthString(len, encoding);
     }
 

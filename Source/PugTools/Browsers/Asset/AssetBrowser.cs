@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -1202,9 +1202,12 @@ namespace PugTools {
 
             case "WAV":
             case "WEM":
+            case "OGG":
               toolStrip1.Visible = true;
               m_audioPlaying = false;
-              await PreviewAssetWEM(asset.HashInfo.FileName);
+              // Beta streamed audio is named *.ogg but contains RIFF/Wwise data. Pass the
+              // archive path so ViewWEM can select the beta codebook family.
+              await PreviewAssetWEM(asset.HashInfo.Directory + "/" + asset.HashInfo.FileName);
               break;
 
             case "DEP":
@@ -2214,7 +2217,9 @@ namespace PugTools {
             }));
 
           } else {
-            StatusLabel1Text("Audio Processing Failed.");
+            StatusLabel1Text(String.IsNullOrWhiteSpace(wem?.LastError)
+              ? "Audio Processing Failed."
+              : "Audio Processing Failed: " + wem.LastError);
           }
         }
       }
@@ -3143,10 +3148,7 @@ namespace PugTools {
 
       using (Stream file = assetFile.File.Open()) {
         using FileStream outputStream = System.IO.File.Create(fileName);
-        Byte[] fileBuffer = new Byte[assetFile.File.FileInfo.UncompressedSize];
-
-        file.Read(fileBuffer, 0, fileBuffer.Length);
-        outputStream.Write(fileBuffer, 0, fileBuffer.Length);
+        file.CopyTo(outputStream, 128 * 1024);
       }
 
       m_extractCount++;

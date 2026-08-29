@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.RegularExpressions;
 
 namespace TorArchive {
   public class Assets : IDisposable {
@@ -20,7 +19,7 @@ namespace TorArchive {
     #region Fields
     private readonly String m_gamePath;
     private readonly String m_assetPath;
-    private readonly Regex m_fileNameParse = new Regex("swtor_(?:test_)?(.*)_1");
+    private readonly HashSet<String> m_loadedArchivePaths = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
 
     #endregion Fields
 
@@ -142,8 +141,22 @@ namespace TorArchive {
     }
 
     public void Load(Boolean isPtr) {
+      // Preserve the historical LIVE -> PTS auto-fallback even when neutral/common beta archives are
+      // present in the same Assets directory. Common archives alone must not hide an explicit PTS branch.
+      if (!isPtr && Directory.Exists(m_assetPath)) {
+        String[] names = Directory.EnumerateFiles(m_assetPath, "*", SearchOption.TopDirectoryOnly)
+          .Where(path => Path.GetExtension(path).Equals(".tor", StringComparison.OrdinalIgnoreCase))
+          .Select(Path.GetFileName)
+          .ToArray();
+        Boolean hasPts = names.Any(name => name.StartsWith("swtor_test_", StringComparison.OrdinalIgnoreCase));
+        Boolean hasExplicitLive = names.Any(name => name.StartsWith("swtor_", StringComparison.OrdinalIgnoreCase)
+          && !name.StartsWith("swtor_test_", StringComparison.OrdinalIgnoreCase));
+        if (!hasExplicitLive && hasPts) { Load(true); return; }
+      }
+
       Libraries = new List<Library>();
       LoadedFileGroups.Clear();
+      m_loadedArchivePaths.Clear();
 
       LoadAssetFiles("main", isPtr);
       LoadAssetFiles("en-us", isPtr);
@@ -153,6 +166,12 @@ namespace TorArchive {
       // Beta
       LoadAssetFiles("locale_en_us", isPtr);
       LoadAssetFiles("system", isPtr);
+
+      // Do not assume that every valid archive belongs to one of the historical main/locale/system
+      // families. SWTOR has shipped additional split libraries over the years and beta/dev builds
+      // use several different prefixes. Load every remaining TOR as a direct archive library so the
+      // Asset Browser can display it even when its naming convention is unknown to PugTools.
+      LoadUnclaimedAssetFiles(isPtr);
 
       // Preserve the old LIVE -> PTS fallback, but base it only on the actual Assets folder.
       // A retailclient TOR by itself must not make an incomplete installation look valid.
@@ -173,45 +192,93 @@ namespace TorArchive {
     private void LoadAssetFiles(String fileGroup, Boolean isPTS) {
       if (!Directory.Exists(m_assetPath)) return;
 
-      // LIVE & PTS
-      String searchPattern = isPTS ? $"swtor_test_{fileGroup}_*.tor" : $"swtor_{fileGroup}_*.tor";
-      String[] assetFilePaths = Directory.GetFiles(m_assetPath, searchPattern, SearchOption.TopDirectoryOnly);
+      // Discover logical libraries from the TORs that are physically present. Modern
+      // clients split e.g. "main" into main_global/main_art/main_area/... while old
+      // 32-bit/beta clients commonly use just main_N. Group by the stem before the
+      // final numeric archive suffix so both layouts work, archive-number gaps are OK,
+      // and metadata.bin is not required merely to browse/extract an archive.
+      String[] prefixes = isPTS
+        ? new[] { "swtor_test_" }
+        : new[] { "swtor_", "he32_", "red_", "assets_", "green_" };
 
-      if (assetFilePaths.Length > 0) {
-        foreach (String assetFilePath in assetFilePaths) {
-          String assetFileName = Path.GetFileNameWithoutExtension(assetFilePath);
-          Match match = m_fileNameParse.Match(assetFileName);
+      foreach (String prefix in prefixes) {
+        String familyStart = prefix + fileGroup;
+        var groups = Directory.EnumerateFiles(m_assetPath, familyStart + "*.tor", SearchOption.TopDirectoryOnly)
+          .Select(path => ParseArchivePath(path, prefix))
+          .Where(item => item != null
+                      && (item.LogicalName.Equals(fileGroup, StringComparison.OrdinalIgnoreCase)
+                          || item.LogicalName.StartsWith(fileGroup + "_", StringComparison.OrdinalIgnoreCase)))
+          .GroupBy(item => item.LogicalName, StringComparer.OrdinalIgnoreCase)
+          .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+          .ToArray();
 
-          if (match.Success) {
-            String libName = match.Groups[1].Value;
-            Library lib = new Library(libName, m_assetPath, isPTS);
-            Libraries.Add(lib);
-          }
+        if (groups.Length == 0) continue;
+
+        foreach (var group in groups) {
+          String[] paths = group
+            .OrderBy(item => item.Number)
+            .ThenBy(item => Path.GetFileName(item.Path), StringComparer.OrdinalIgnoreCase)
+            .Select(item => item.Path)
+            .ToArray();
+
+          Libraries.Add(new Library(prefix.TrimEnd('_') + "_" + group.Key, paths));
+          foreach (String path in paths) m_loadedArchivePaths.Add(Path.GetFullPath(path));
         }
 
-        LoadedFileGroups.Add(fileGroup);
-        return;
+        if (!LoadedFileGroups.Contains(fileGroup)) LoadedFileGroups.Add(fileGroup);
+        return; // Prefer the first matching environment family, same as the old loader.
+      }
+    }
+
+    private void LoadUnclaimedAssetFiles(Boolean isPtr) {
+      if (!Directory.Exists(m_assetPath)) return;
+
+      String[] archiveFiles = Directory.EnumerateFiles(m_assetPath, "*", SearchOption.TopDirectoryOnly)
+        .Where(path => Path.GetExtension(path).Equals(".tor", StringComparison.OrdinalIgnoreCase))
+        .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+
+      Boolean loadedAny = false;
+      foreach (String archiveFile in archiveFiles) {
+        String fullPath = Path.GetFullPath(archiveFile);
+        if (m_loadedArchivePaths.Contains(fullPath)) continue;
+
+        String name = Path.GetFileName(archiveFile);
+        Boolean ptsArchive = name.StartsWith("swtor_test_", StringComparison.OrdinalIgnoreCase);
+        Boolean liveArchive = name.StartsWith("swtor_", StringComparison.OrdinalIgnoreCase) && !ptsArchive;
+        // Jedipedia treats non-swtor/non-swtor_test archives as common. Keep beta/dev/legacy TORs available
+        // regardless of the selected LIVE/PTS branch, while never mixing the two explicit SWTOR branches.
+        if ((isPtr && liveArchive) || (!isPtr && ptsArchive)) continue;
+
+        String archiveName = Path.GetFileNameWithoutExtension(archiveFile);
+        Libraries.Add(new Library("archive_" + archiveName, new[] { archiveFile }));
+        m_loadedArchivePaths.Add(fullPath);
+        loadedAny = true;
       }
 
-      // BETA: RED
-      assetFilePaths = Directory.GetFiles(m_assetPath, $"red_{fileGroup}_*.tor", SearchOption.TopDirectoryOnly);
+      if (loadedAny && !LoadedFileGroups.Contains("other")) LoadedFileGroups.Add("other");
+    }
 
-      if (assetFilePaths.Length > 0) {
-        Library lib = new Library(fileGroup, m_assetPath);
-        Libraries.Add(lib);
-        LoadedFileGroups.Add(fileGroup);
-        return;
-      }
+    private sealed class ArchivePathInfo {
+      public String Path { get; set; }
+      public String LogicalName { get; set; }
+      public Int32 Number { get; set; }
+    }
 
-      // BETA: ASSETS
-      assetFilePaths = Directory.GetFiles(m_assetPath, $"assets_{fileGroup}_*.tor", SearchOption.TopDirectoryOnly);
+    private static ArchivePathInfo ParseArchivePath(String path, String prefix) {
+      String fileName = Path.GetFileNameWithoutExtension(path);
+      if (!fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return null;
 
-      if (assetFilePaths.Length > 0) {
-        Library lib = new Library(fileGroup, m_assetPath);
-        Libraries.Add(lib);
-        LoadedFileGroups.Add(fileGroup);
-        return;
-      }
+      String remainder = fileName.Substring(prefix.Length);
+      Int32 split = remainder.LastIndexOf('_');
+      if (split <= 0 || split == remainder.Length - 1) return null;
+      if (!Int32.TryParse(remainder.Substring(split + 1), out Int32 number) || number <= 0) return null;
+
+      return new ArchivePathInfo {
+        Path = path,
+        LogicalName = remainder.Substring(0, split),
+        Number = number
+      };
     }
 
     private void LoadRetailClientFiles(Boolean isPtr) {
@@ -229,6 +296,7 @@ namespace TorArchive {
         String archiveName = Path.GetFileNameWithoutExtension(clientTorFile);
         String libraryName = "retailclient_" + archiveName;
         Libraries.Add(new Library(libraryName, new[] { clientTorFile }));
+        m_loadedArchivePaths.Add(Path.GetFullPath(clientTorFile));
       }
     }
 

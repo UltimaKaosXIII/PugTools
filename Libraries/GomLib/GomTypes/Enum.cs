@@ -13,7 +13,7 @@ namespace GomLib.GomTypes {
     public override object ReadData(DataObjectModel dom, GomBinaryReader reader) {
       ScriptEnum result = new ScriptEnum();
 
-      Int32 val = (Int32)reader.ReadNumber();
+      Int32 val = checked((Int32)reader.ReadSignedNumber());
       // The DomEnum is zero-indexed, but the value that was stored to reference it wasn't. 
       // Fixed this discrepancy by making the stored value zero-indexed when read in.
       result.Value = val - 1;

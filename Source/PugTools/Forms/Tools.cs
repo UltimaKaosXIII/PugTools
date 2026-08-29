@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -620,15 +620,27 @@ namespace PugTools {
       String assetsPath = TorArchive.Assets.GetAssetsDirectory(path);
       if (!Directory.Exists(assetsPath)) return false;
 
-      String[] fileList = Directory.GetFiles(assetsPath, "swtor_main*.tor");
-      return fileList.Length > 0;
+      // Do not gate valid beta/legacy/current installations on one historical "main" filename.
+      // Explicit swtor_ archives identify LIVE; neutral beta/dev archives count as LIVE/legacy only
+      // when there is no explicit PTS branch, mirroring Jedipedia's "common archive" handling.
+      String[] torFiles = Directory.EnumerateFiles(assetsPath, "*", SearchOption.TopDirectoryOnly)
+        .Where(file => Path.GetExtension(file).Equals(".tor", StringComparison.OrdinalIgnoreCase))
+        .ToArray();
+      Boolean hasPts = torFiles.Any(file => Path.GetFileName(file).StartsWith("swtor_test_", StringComparison.OrdinalIgnoreCase));
+      Boolean hasExplicitLive = torFiles.Any(file => {
+        String name = Path.GetFileName(file);
+        return name.StartsWith("swtor_", StringComparison.OrdinalIgnoreCase)
+          && !name.StartsWith("swtor_test_", StringComparison.OrdinalIgnoreCase);
+      });
+      return hasExplicitLive || (!hasPts && torFiles.Length > 0);
     }
     public static Boolean PathContainsPTSAssets(String path) {
       String assetsPath = TorArchive.Assets.GetAssetsDirectory(path);
       if (!Directory.Exists(assetsPath)) return false;
 
-      String[] fileList = Directory.GetFiles(assetsPath, "swtor_test*.tor");
-      return fileList.Length > 0;
+      return Directory.EnumerateFiles(assetsPath, "*", SearchOption.TopDirectoryOnly)
+        .Where(file => Path.GetExtension(file).Equals(".tor", StringComparison.OrdinalIgnoreCase))
+        .Any(file => Path.GetFileName(file).StartsWith("swtor_test_", StringComparison.OrdinalIgnoreCase));
     }
     public static String PrepExtractPath(String filename) {
       String subPath = "";

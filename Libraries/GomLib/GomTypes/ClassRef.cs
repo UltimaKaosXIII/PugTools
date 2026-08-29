@@ -12,7 +12,7 @@ namespace GomLib.GomTypes {
     }
     public override Object ReadData(DataObjectModel dom, GomBinaryReader reader) {
       _dom ??= dom;
-      return _dom.Get<GomObject>(reader.ReadNumber());
+      return _dom.Get<GomObject>(reader.ReadIdNumber());
     }
     public override System.String ToString() {
       return System.String.Format("ClassRef {0}", DomClass);

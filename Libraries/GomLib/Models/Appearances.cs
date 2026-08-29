@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 // using System.Diagnostics;
@@ -282,42 +282,61 @@ namespace GomLib.Models {
 
           uint header = br.ReadUInt32();
           if (header != 0x42574147) continue;
+          uint version = br.ReadUInt32();
+          if (version != 4 && version != 5) continue;
+          bool is64Bit = version >= 5;
 
-          // Current SWTOR 64-bit BWAG assets can contain offsets that are not valid
-          // for the legacy reader. Keep the old layout, but never let malformed data
-          // terminate the whole extractor.
           br.BaseStream.Seek(0x10, System.IO.SeekOrigin.Begin);
           br.ReadUInt32(); br.ReadUInt32();
           br.ReadUInt16(); br.ReadUInt16();
           br.ReadUInt16();
           ushort numAttach = br.ReadUInt16();
+          if (numAttach == 0) continue;
 
-          br.BaseStream.Seek(0x60, System.IO.SeekOrigin.Begin);
-          if (br.BaseStream.Position + 4 > length) continue;
-          uint offsetAttach = br.ReadUInt32();
-          if (numAttach == 0 || offsetAttach >= length) continue;
-          if ((ulong)offsetAttach + (ulong)numAttach * 8UL > (ulong)length) continue;
-
-          br.BaseStream.Seek(offsetAttach, System.IO.SeekOrigin.Begin);
-          for (int intCount = 0; intCount < numAttach; intCount++) {
-            if (br.BaseStream.Position + 8 > length) break;
-            uint offsetAttachName = br.ReadUInt32();
+          // BWAG v4 uses 32-bit pointers in the table at 0x50; BWAG v5 uses
+          // 64-bit pointers. Read the attachment pointer from the real layout
+          // instead of interpreting the v5 bone pointer as a v4 attachment.
+          br.BaseStream.Seek(0x50, System.IO.SeekOrigin.Begin);
+          ulong offsetAttach;
+          if (is64Bit) {
+            br.ReadUInt64(); // cached offsets
+            br.ReadUInt64(); // mesh headers
+            br.ReadUInt64(); // material names
+            br.ReadUInt64(); // skeleton
+            offsetAttach = br.ReadUInt64();
+          } else {
             br.ReadUInt32();
-            if (offsetAttachName >= length) continue;
+            br.ReadUInt32();
+            br.ReadUInt32();
+            br.ReadUInt32();
+            offsetAttach = br.ReadUInt32();
+          }
 
-            long originalPosition = br.BaseStream.Position;
-            br.BaseStream.Seek(offsetAttachName, System.IO.SeekOrigin.Begin);
-            List<byte> strBytes = new List<byte>();
-            while (br.BaseStream.Position < length) {
-              byte b = br.ReadByte();
-              if (b == 0) break;
-              strBytes.Add(b);
-              if (strBytes.Count > 4096) break;
+          ulong recordSize = is64Bit ? 80UL : 72UL;
+          if (offsetAttach >= (ulong)length
+              || offsetAttach + (ulong)numAttach * recordSize > (ulong)length) continue;
+
+          br.BaseStream.Seek((long)offsetAttach, System.IO.SeekOrigin.Begin);
+          for (int intCount = 0; intCount < numAttach; intCount++) {
+            long recordStart = br.BaseStream.Position;
+            ulong offsetAttachName = is64Bit ? br.ReadUInt64() : br.ReadUInt32();
+            if (is64Bit) br.ReadUInt64(); else br.ReadUInt32(); // bone-name pointer
+            if (offsetAttachName < (ulong)length) {
+              long resume = br.BaseStream.Position;
+              br.BaseStream.Seek((long)offsetAttachName, System.IO.SeekOrigin.Begin);
+              List<byte> strBytes = new List<byte>();
+              while (br.BaseStream.Position < length) {
+                byte b = br.ReadByte();
+                if (b == 0) break;
+                strBytes.Add(b);
+                if (strBytes.Count > 4096) break;
+              }
+              if (strBytes.Count > 0)
+                ret.Add(Encoding.ASCII.GetString(strBytes.ToArray()));
+              br.BaseStream.Seek(resume, System.IO.SeekOrigin.Begin);
             }
-            if (strBytes.Count > 0)
-              ret.Add(Encoding.ASCII.GetString(strBytes.ToArray()));
 
-            long next = originalPosition + 16 * 4;
+            long next = recordStart + (long)recordSize;
             if (next > length) break;
             br.BaseStream.Seek(next, System.IO.SeekOrigin.Begin);
           }

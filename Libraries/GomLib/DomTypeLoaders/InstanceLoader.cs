@@ -1,5 +1,5 @@
-﻿using System.Collections.Generic;
-// using System.Diagnostics;
+﻿using System;
+using System.Collections.Generic;
 
 namespace GomLib.DomTypeLoaders {
     class InstanceLoader : IDomTypeLoader {
@@ -14,60 +14,48 @@ namespace GomLib.DomTypeLoaders {
             GomObject result = new GomObject();
             LoaderHelper.ParseShared(reader, result);
 
-            reader.BaseStream.Position = 0x12;
-            short headerEnd = reader.ReadInt16();
+            UInt16 headerEnd;
 
-            reader.BaseStream.Position = 0x18;
-            //result.Offset20 = reader.ReadInt32();
+            if (reader.DblbVersion == 1) {
+                // DBLB v1 / beta layout:
+                // flags@04, compressedDataOffset@06, id@08, name@10, desc@12,
+                // unknown@14, classId@18, glomCount@20, glomOffset@22,
+                // contentLength@24, dataOffset@28, minor@2A, style@2C, nodeType@2D.
+                reader.BaseStream.Position = 0x06;
+                headerEnd = reader.ReadUInt16();
 
-            result.ClassId = reader.ReadUInt64(); // Offset 0x18
+                reader.BaseStream.Position = 0x14;
+                result.Offset20 = reader.ReadInt32();
+                result.ClassId = reader.ReadUInt64();
+                result.NumGlommed = reader.ReadInt16();
+                result.Offset26 = reader.ReadInt16();
+                result.ObjectSizeInFile = reader.ReadInt32();
+                result.Offset2C = reader.ReadInt16();
+                result.Offset2E = reader.ReadInt16();
+                result.Offset30 = reader.ReadByte();
+                result.Offset31 = reader.ReadByte();
+            } else {
+                reader.BaseStream.Position = 0x12;
+                headerEnd = reader.ReadUInt16();
 
-            result.Offset20 = reader.ReadInt32(); // 0x20
+                reader.BaseStream.Position = 0x18;
+                result.ClassId = reader.ReadUInt64();
+                result.Offset20 = reader.ReadInt32();
+                result.NumGlommed = reader.ReadInt16();
+                result.Offset26 = reader.ReadInt16();
+                result.ObjectSizeInFile = reader.ReadInt32();
+                result.Offset2C = reader.ReadInt16();
+                result.Offset2E = reader.ReadInt16();
+                result.Offset30 = reader.ReadByte();
+                result.Offset31 = reader.ReadByte();
+            }
 
-            result.NumGlommed = reader.ReadInt16(); // 0x24
-            result.Offset26 = reader.ReadInt16(); // 0x26
-            result.ObjectSizeInFile = reader.ReadInt32(); // 0x28
-            result.Offset2C = reader.ReadInt16(); // 0x2C
-            result.Offset2E = reader.ReadInt16(); // 0x2E
-            result.Offset30 = reader.ReadByte();  // 0x30
-            result.Offset31 = reader.ReadByte();  // 0x31
+            if (headerEnd > reader.BaseStream.Length)
+                throw new InvalidOperationException($"Invalid GOM node data offset 0x{headerEnd:X} for DBLB v{reader.DblbVersion}.");
 
             reader.BaseStream.Position = headerEnd;
 
             if (headerEnd != reader.BaseStream.Length) {
-                //InflaterInputStream istream = new InflaterInputStream(reader.BaseStream);
-                //string outFileName = result.Name;
-                //outFileName = outFileName.Replace('/', '_');
-                //outFileName = outFileName.Replace('.', '\\');
-                //outFileName = outFileName + ".node";
-                //string path = System.IO.Path.Combine("c:\\code\\swtorfiles\\prototypes\\", outFileName);
-                //if (path.Contains("\\con\\"))
-                //{
-                //    path = path.Replace("\\con\\", "\\_con\\");
-                //}
-                ////path = String.Format("c:\\code\\swtorfiles\\prototypes\\{1}", result.Id, result.Name);
-                //string dir = System.IO.Path.GetDirectoryName(path);
-
-                //if (!outDirs.Contains(dir))
-                //{
-                //    try
-                //    {
-                //        System.IO.Directory.CreateDirectory(dir);
-                //        outDirs.Add(dir);
-                //    }
-                //    catch (System.IO.IOException)
-                //    {
-                //        Debug.WriteLine("Cannot create directory {0} for {1}", dir, path);
-                //        return result;
-                //    }
-                //}
-
-                //using (var fs = System.IO.File.Open(path, System.IO.FileMode.Create, System.IO.FileAccess.Write))
-                //{
-                //    ICSharpCode.SharpZipLib.Core.StreamUtils.Copy(istream, fs, outBuff);
-                //}
-
-                // Copy the compressed data to the instance
                 int compressedLength = (int)(reader.BaseStream.Length - reader.BaseStream.Position);
                 var buff = reader.ReadBytes(compressedLength);
 
@@ -81,8 +69,6 @@ namespace GomLib.DomTypeLoaders {
             } else {
                 result.DataLength = 0;
             }
-
-            // Gom.AddObject(result);
 
             return result;
         }

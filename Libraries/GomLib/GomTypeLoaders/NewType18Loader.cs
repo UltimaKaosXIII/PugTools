@@ -2,19 +2,25 @@
 
 namespace GomLib.GomTypeLoaders
 {
-    class NewType18Loader : IGomTypeLoader
+    class TupleLoader : IGomTypeLoader
     {
-        public GomTypeId SupportedType { get { return GomTypeId.NewType18; } }
+        public GomTypeId SupportedType { get { return GomTypeId.Tuple; } }
 
         public GomType Load(GomBinaryReader reader, bool fromGom, DataObjectModel dom)
         {
-            GomTypes.NewType18 t = new GomTypes.NewType18();
+            var tuple = new GomTypes.Tuple();
+            if (!fromGom) return tuple;
 
-            // Confirmed via byte-boundary analysis: exactly 4 bytes follow the type-id byte
-            // in the schema/type definition. We keep them raw since their meaning is unknown.
-            t.RawBytes = reader.ReadBytes(4);
-
-            return t;
+            long countRaw = reader.ReadSignedNumber();
+            if (countRaw < 0 || countRaw > Int32.MaxValue)
+                throw new InvalidOperationException($"Invalid Tuple type count {countRaw}.");
+            int count = (int)countRaw;
+            for (int i = 0; i < count; i++)
+            {
+                GomType element = dom.GomTypeLoader.Load(reader, dom, true);
+                tuple.ElementTypes.Add(element);
+            }
+            return tuple;
         }
     }
 }

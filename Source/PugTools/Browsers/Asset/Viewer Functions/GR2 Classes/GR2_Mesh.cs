@@ -29,6 +29,13 @@ namespace FileFormats {
     public UInt64 offsetMeshVerts;
     public Buffer vertBuffer;
 
+    public GR2_Mesh() {
+      meshBones = new List<GR2_Mesh_Bone>();
+      meshPieces = new List<GR2_Mesh_Piece>();
+      meshVertIndex = new List<GR2_Mesh_Vertex_Index>();
+      meshVerts = new List<GR2_Mesh_Vertex>();
+    }
+
     public GR2_Mesh(BinaryReader br, Boolean is64Bit) {
       meshBones = new List<GR2_Mesh_Bone>();
       meshPieces = new List<GR2_Mesh_Piece>();

@@ -264,6 +264,132 @@ namespace PugTools {
     private Dictionary<ulong, GR2> models = new Dictionary<ulong, GR2>();
     private Dictionary<string, GR2_Material> materials = new Dictionary<string, GR2_Material>();
     private List<Room> rooms = new List<Room>();
+    // v6 resource streaming: only decoded models are added to models/render entries. The catalog itself is cheap
+    // (asset id + archive path) and lets the initial frame avoid decoding an entire planet.
+    private WorldModelStreamer modelStreamer;
+    private WorldMaterialMetadataStreamer materialMetadataStreamer;
+    private readonly Dictionary<string,List<WorldModelStreamRequest>> streamRequestsByRoom = new Dictionary<string,List<WorldModelStreamRequest>>(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<ulong,List<(Room Room,AssetInstance Instance)>> streamPlacementsByAsset = new Dictionary<ulong,List<(Room Room,AssetInstance Instance)>>();
+    // Direct room->asset placement slices avoid repeatedly filtering Corellia's ~345k global placements whenever a
+    // shared GR2 is decoded, a room becomes current, or the startup readiness gate runs.
+    private readonly Dictionary<string,Dictionary<ulong,List<(Room Room,AssetInstance Instance)>>> streamPlacementsByRoomAsset = new Dictionary<string,Dictionary<ulong,List<(Room Room,AssetInstance Instance)>>>(StringComparer.OrdinalIgnoreCase);
+    private sealed class StreamRoomAssetHint { public Vector3 Min=new Vector3(float.MaxValue,float.MaxValue,float.MaxValue),Max=new Vector3(float.MinValue,float.MinValue,float.MinValue); public bool Any; }
+    private readonly Dictionary<string,Dictionary<ulong,StreamRoomAssetHint>> streamRoomAssetHints = new Dictionary<string,Dictionary<ulong,StreamRoomAssetHint>>(StringComparer.OrdinalIgnoreCase);
+    // Room bounds are derived from GR2 geometry, so they cannot be the only source of the first streaming
+    // decision.  This inexpensive XZ grid is built from the already-authored instance transforms and gives the
+    // spawn path a non-circular, physical working set before any room shell has been decoded.
+    private readonly Dictionary<(int X,int Z),HashSet<ulong>> streamBootstrapAssetsByCell = new Dictionary<(int X,int Z),HashSet<ulong>>();
+    // The asset-only bootstrap cannot tell the integration stage which room owns a nearby placement. Keep the same
+    // cheap XZ broad phase for room owners as well so startup can gate/integrate the actual local cells rather than
+    // merely decoding a GR2 whose placement remains invisible because its room never entered the working set.
+    private readonly Dictionary<(int X,int Z),HashSet<string>> streamBootstrapRoomsByCell = new Dictionary<(int X,int Z),HashSet<string>>();
+    private readonly Dictionary<ulong,WorldModelStreamRequest> streamRequestsByAsset = new Dictionary<ulong,WorldModelStreamRequest>();
+    private const float StreamBootstrapCellSize = 48f;
+    // Assets referenced by the current portal/visibility working set.  They are a residency pin, not a second
+    // cache: a large planet may evict a cold room, but must never evict the floor/shell currently under camera.
+    private readonly HashSet<ulong> activeStreamAssetIds = new HashSet<ulong>();
+    // Queue persistence is intentionally separate from residency pins. A large neighbour can have more assets than
+    // the bounded GPU/CPU hot slice; once one of those assets is admitted to the bounded decode queue it must remain
+    // queued for as long as its owner room is still demanded, otherwise the rolling neighbour slice cancels its own
+    // tail every frame and the room never converges.
+    private readonly HashSet<ulong> queuedStreamDemandAssetIds = new HashSet<ulong>();
+    // Current/startup-room assets are the latency-sensitive subset of the active working set. Background workers
+    // still decode neighbours, but render-thread placement/GPU commits always drain this set first so a doorway or
+    // spawn shell cannot sit behind already-decoded speculative rooms.
+    private readonly HashSet<ulong> urgentStreamAssetIds = new HashSet<ulong>();
+    // Texture/MAT demand is intentionally narrower than geometry demand. The current room and active sky receive
+    // strong demand, while visible neighbours get a bounded progressive slice so a doorway is textured before the
+    // camera crosses it without letting planet-wide DDS work compete with structural GR2 streaming.
+    private readonly HashSet<ulong> materialStreamAssetIds = new HashSet<ulong>();
+    // Keep room demand separately from asset demand. A shared prop GR2 can have thousands of placements across a
+    // planet; integrating every placement when that GR2 decodes turns a local stream into a whole-world rebuild.
+    // Only placements belonging to rooms in this working set are integrated on the render thread.
+    private readonly HashSet<string> activeStreamRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> previousStreamRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    // Collision-floor construction is substantially heavier than adding render entries. Only the room actually under
+    // the camera (plus a phase-trigger owner at the same point) gets new floor meshes; neighbours stay geometry-only.
+    private readonly HashSet<string> floorStreamRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> previousFloorStreamRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    // Immutable readiness target for the loading overlay. The active portal set is intentionally dynamic and can
+    // grow while decoding creates additional room bounds; it is therefore unsuitable as a completion condition.
+    private readonly HashSet<ulong> initialStreamAssetIds = new HashSet<ulong>();
+    private readonly HashSet<string> initialStreamRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    // Direct neighbours are prefetched behind the loading overlay, but are not part of its completion barrier. This
+    // keeps v6 local: the spawn room is guaranteed complete without accidentally turning a broad Corellia visibility
+    // ring into Jedipedia's planet-wide first-frame gate.
+    private readonly HashSet<string> initialStreamPrefetchRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<ulong,float> initialStreamAssetDistances = new Dictionary<ulong,float>();
+    private readonly HashSet<AssetInstance> streamIndexedInstances = new HashSet<AssetInstance>();
+    private readonly HashSet<AssetInstance> streamFloorIndexedInstances = new HashSet<AssetInstance>();
+    private readonly HashSet<GR2> streamedWorldModels = new HashSet<GR2>();
+    private readonly Dictionary<GR2,ulong> streamedModelAssetIds = new Dictionary<GR2,ulong>();
+    private readonly Queue<GR2> pendingModelGpuUploads = new Queue<GR2>();
+    private readonly HashSet<GR2> queuedModelGpuUploads = new HashSet<GR2>();
+    private sealed class PendingStreamedModelIntegration { public ulong AssetId; public string RoomName; public GR2 Model; public List<(Room Room,AssetInstance Instance)> Placements; public int NextPlacement; }
+    private readonly Queue<PendingStreamedModelIntegration> pendingStreamedModelIntegrations = new Queue<PendingStreamedModelIntegration>();
+    private readonly HashSet<(ulong AssetId,string RoomName)> queuedStreamedModelIntegrations = new HashSet<(ulong AssetId,string RoomName)>();
+    // Floor/collision indexing is useful for the authoritative room locator, but it is not required to draw a model.
+    // Keep it off the render-entry commit path: on Corellia the old one-new-floor-model-per-frame guard accidentally
+    // reduced visible room assembly to roughly one unique GR2 per frame.
+    private sealed class PendingStreamedFloorIntegration { public ulong AssetId; public string RoomName; public GR2 Model; public List<(Room Room,AssetInstance Instance)> Placements; public int NextPlacement; }
+    private readonly Queue<PendingStreamedFloorIntegration> pendingStreamedFloorIntegrations = new Queue<PendingStreamedFloorIntegration>();
+    private readonly HashSet<(ulong AssetId,string RoomName)> queuedStreamedFloorIntegrations = new HashSet<(ulong AssetId,string RoomName)>();
+    private sealed class PendingStreamedModelMaterials { public GR2 Model; public Queue<GR2_Material> Materials; }
+    // While a streamed material is in the bounded prewarm queue, draw it with its already parsed MAT metadata and a
+    // textureless fallback instead of synchronously reading DDS files from ResolvePieceMaterial(). Geometry can thus
+    // appear immediately and texture detail can catch up without stalling the frame that first sees a room.
+    private readonly HashSet<GR2_Material> pendingStreamedMaterialPrepares = new HashSet<GR2_Material>();
+    private readonly HashSet<GR2_Material> streamedWorldMaterials = new HashSet<GR2_Material>();
+    private readonly HashSet<GR2_Material> streamedMaterialResourcesPrepared = new HashSet<GR2_Material>();
+    // Streaming needs a room-space broad phase before the corresponding GR2 shell has been decoded. Keep these
+    // conservative bounds separate from Room.Visibility*: they are demand-planning hints only and must never make
+    // a coarse placement-origin box participate in final visibility/culling.
+    private sealed class RoomStreamingBounds { public Vector3 Min,Max,Center; public float Radius; public bool Coarse; }
+    private readonly Dictionary<string,RoomStreamingBounds> roomStreamingBounds = new Dictionary<string,RoomStreamingBounds>(StringComparer.OrdinalIgnoreCase);
+    // Zero-authored rooms need Jedipedia-style model-derived bounds, but only after every streamed GR2 referenced by
+    // that room has reached the view. A partial heightmap/water-only box is worse than no box because it can make the
+    // wrong overlapping Corellia room authoritative before its hangar shell exists.
+    private readonly HashSet<string> streamRoomsNeedingExactBounds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private readonly Queue<PendingStreamedModelMaterials> pendingStreamedModelMaterials = new Queue<PendingStreamedModelMaterials>();
+    private readonly HashSet<GR2> queuedStreamedModelMaterials = new HashSet<GR2>();
+    private readonly HashSet<GR2> streamedModelMaterialsReady = new HashSet<GR2>();
+    private int streamCatalogAssetCount;
+    private bool initialStreamLoading;
+    // Keep the locally completed spawn shell visible for a short hand-off window while streamed floor/dPVS data
+    // replaces the provisional outdoor room selected before the hangar existed. This is visibility-only; the normal
+    // residency/eviction policy remains active and the grace expires automatically.
+    private long initialStreamVisibilityKeepUntilFrame;
+    // Decoding is asynchronous, but indexing instances and creating D3D buffers are render-thread work. Keep
+    // those commits deliberately small: a whole decoded room arriving in one frame used to cause multi-frame hitches.
+    private const int MaxDecodedModelsPerFrame = 12;
+    private const int MaxModelGpuUploadsPerFrame = 4;
+    private const int MaxMaterialPreparesPerFrame = 4;
+    private const int MaxStreamPlacementIntegrationsPerFrame = 512;
+    private const int MaxStreamFloorPlacementsPerFrame = 64;
+    private Vector3 streamPrefetchAnchor = new Vector3(float.NaN,float.NaN,float.NaN);
+    private Vector3 streamPrefetchLook = new Vector3(float.NaN,float.NaN,float.NaN);
+    private string streamPrefetchRoom = String.Empty;
+    // Prediction is recomputed only after meaningful movement/rotation, but its demand must survive every frame in
+    // between. Otherwise activeStreamRoomNames is cleared, CancelQueuedExcept() cancels the predicted queue tail,
+    // and standing still literally stops the room in front of the camera from loading.
+    private readonly Dictionary<string,int> cameraAheadStreamRooms = new Dictionary<string,int>(StringComparer.OrdinalIgnoreCase);
+    // The primary forward-projected room is more than speculative background work: at a doorway it is the room the
+    // camera is about to enter. Keep a tiny separate urgent set so its nearest shell assets can be promoted without
+    // turning the entire visible-neighbour ring into high-priority work.
+    private readonly HashSet<string> urgentCameraAheadStreamRooms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    // Keep both sides of a doorway resident for a short hand-off window. Corellia has several stacked/overlapping
+    // streaming cells; the authoritative camera room can flip as a newly streamed floor becomes available. Without a
+    // grace window the previous room immediately fell out of visibility/residency and could disappear while the next
+    // room was still assembling, producing the large empty/green gaps seen when crossing the spaceport threshold.
+    private readonly Dictionary<string,long> streamTransitionRoomGrace = new Dictionary<string,long>(StringComparer.OrdinalIgnoreCase);
+    private string lastStreamAnchorRoom = String.Empty;
+    private const long StreamTransitionGraceFrames = 180;
+    // PugTools cannot run Jedipedia's native dPVS solver. During a room-boundary hand-off keep a
+    // bounded slice of the old room's authored VisibleRooms alive as a conservative dPVS fallback.
+    // These are precisely the city-shell/backdrop cells that otherwise vanish for a frame range when
+    // the semantic camera room flips before the new room's full portal/floor state is established.
+    private const long StreamTransitionVisibleGraceFrames = 120;
+    private const int StreamTransitionVisibleGraceLimit = 24;
     // Room instances are static. Resolve parent chains once at load instead of once per render pass;
     // the old path recomputed the same absolute transform for terrain/models/water and four shadow
     // cascades every frame.
@@ -454,9 +580,12 @@ namespace PugTools {
     // occluder solver, but mirrors Jedipedia's first visibility layer: room transitions are driven by authored
     // PortalTarget links and only portals/rooms intersecting the camera frustum are expanded.
     private readonly Dictionary<string,List<PortalVisibilityEntry>> roomPortals = new Dictionary<string,List<PortalVisibilityEntry>>(StringComparer.OrdinalIgnoreCase);
-    // Direct room neighbourhood used by local room streaming. It combines authored portal/VisibleRooms links with
-    // nearby room bounds, but intentionally does not recursively traverse an outdoor planet's entire visibility set.
+    // Direct room neighbourhood used by local room streaming. Portal and conservative physical links live here.
+    // Authored VisibleRooms is kept separately and ranked at demand time: before streamed GR2 bounds exist, permanently
+    // truncating that list from coarse placement-origin boxes can discard the real doorway/hangar neighbour. Jedipedia
+    // builds its dPVS only after all GR2 bounds are known, so it never has that bootstrap ordering problem.
     private readonly Dictionary<string,HashSet<string>> roomStreamingNeighbors = new Dictionary<string,HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string,List<Room>> roomStreamingAuthoredVisible = new Dictionary<string,List<Room>>(StringComparer.OrdinalIgnoreCase);
     private Room currentCameraRoom;
     private Room displayCameraRoom;
     private readonly HashSet<string> skyRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -647,8 +776,9 @@ namespace PugTools {
       return true;
     }
 
-    public void LoadModel(Dictionary<ulong,GR2> models, Dictionary<string,GR2_Material> materials, List<Room> rooms, string fqn, Area area=null, Dictionary<string,GR2> utilityModels=null, List<WorldNpcPlacement> npcData=null, List<WorldSpnPlacement> spnData=null) {
+    public void LoadModel(Dictionary<ulong,GR2> models, Dictionary<string,GR2_Material> materials, List<Room> rooms, string fqn, Area area=null, Dictionary<string,GR2> utilityModels=null, List<WorldNpcPlacement> npcData=null, List<WorldSpnPlacement> spnData=null, WorldModelStreamer streamer=null, IEnumerable<WorldModelStreamRequest> streamRequests=null) {
       this.fqn=fqn; this.area=area; this.models=models??new Dictionary<ulong,GR2>(); this.materials=materials??new Dictionary<string,GR2_Material>(); this.rooms=rooms??new List<Room>();
+      modelStreamer=streamer;materialMetadataStreamer?.Dispose();materialMetadataStreamer=modelStreamer==null?null:new WorldMaterialMetadataStreamer(4); BuildModelStreamingCatalog(streamRequests); initialStreamLoading=modelStreamer!=null&&streamCatalogAssetCount>0;initialStreamVisibilityKeepUntilFrame=0;
       WorldRenderSettings initialSettings=SettingsSnapshot();
       appliedTextureMipSkip=TextureMipSkip(initialSettings.TextureQuality);
       SetJedipediaFeatureData(utilityModels,npcData,spnData);
@@ -664,11 +794,14 @@ namespace PugTools {
       // or a Skydome material: ordinary Dantooine rooms contain those too and would disappear from the world/map.
       BuildAuthoritativeSkyRoomSet();
       BuildInstanceWorldTransformCache();
+      BuildSpatialStreamingBootstrapIndex();
       BuildPathFollowers();
       UpdatePathFollowers(elapsed);
       PrimeRoomVisibilityBounds();
+      BuildRoomStreamingBounds();
       BuildPortalVisibilityGraph();
       BuildRoomStreamingGraph();
+      RequestSkyModels();
       BuildDynamicDetailMeshModels();
       LoadStrongholdHookModels();
       LoadAndApplyLodSchemas();
@@ -684,6 +817,17 @@ namespace PugTools {
       if(initialSettings.OrthographicProjection)SetOrthographicMode(true);
       ApplyCameraLens(initialSettings,appliedCameraFar,true);
       ResetMapCamera();
+      // Establish a semantic arrival-room demand before the broad spatial fallback. A zero-authored-bounds hangar
+      // can still be identified from conservative placement bounds, so its shell/floor gets admission to the bounded
+      // decoder queue instead of losing all 96 slots to arbitrary nearby placement origins.
+      activeStreamAssetIds.Clear();urgentStreamAssetIds.Clear();materialStreamAssetIds.Clear();activeStreamRoomNames.Clear();previousStreamRoomNames.Clear();floorStreamRoomNames.Clear();previousFloorStreamRoomNames.Clear();
+      Room arrivalStreamRoom=ResolveStreamingRoom(camera.Position,FindCameraRoom(camera.Position));
+      BuildInitialStreamWorkingSet(camera.Position,arrivalStreamRoom);
+      RequestInitialStreamWorkingSet();
+      RequestCameraRoomModels(arrivalStreamRoom,true);
+      if(initialStreamAssetIds.Count==0)RequestSpatialBootstrapModels(camera.Position,180f,48,true);
+      if(initialStreamAssetIds.Count==0)initialStreamLoading=false;
+      QueueNewlyDemandedRoomIntegrations();
     }
 
     public void FitArea(){ResetMapCamera();}
@@ -858,9 +1002,10 @@ namespace PugTools {
     public string SelectWorldModelAtScreen(int screenX,int screenY){return SelectWorldObjectAtScreen(screenX,screenY,false,false);}
 
     /// <summary>
-    /// Lightweight interaction pick used by a plain left click. It deliberately ignores ordinary geometry and editor
-    /// helpers so an NPC/SPN taxi terminal cannot be hidden behind a large model candidate. The caller immediately
-    /// clears the temporary selection again when the spawn is not a taxi terminal.
+    /// Lightweight interaction pick used by a plain left click. It deliberately ignores ordinary geometry, editor
+    /// helpers and NON-interactive spawned props. The old implementation first picked every SPN sphere and only then
+    /// asked whether the winner was a taxi/Wonkavator; a door, frame or decorative dyn object overlapping the tiny
+    /// elevator button could therefore swallow the click. Only authored taxi terminals and Wonkavators participate.
     /// </summary>
     public string SelectWorldSpawnAtScreen(int screenX,int screenY){
       if(area==null||camera==null||ClientWidth<=1||ClientHeight<=1){ClearWorldModelSelection();return "No world is loaded.";}
@@ -869,9 +1014,9 @@ namespace PugTools {
       try{
         if(!TryBuildWorldPickRay(screenX,screenY,out Vector3 rayOrigin,out Vector3 rayDirection)){ClearWorldModelSelection();return "Could not build a pick ray for this screen position.";}
         HashSet<string> visible=BuildVisibleRoomSet(currentCameraRoom,s);
-        List<WorldPickCandidate> hits=BuildWorldPickCandidates(rayOrigin,rayDirection,s,visible,true)
-          .Where(h=>h?.Npc!=null||h?.Spn!=null).OrderBy(h=>h.Distance).ToList();
-        if(hits.Count==0){ClearWorldModelSelection();return "No visible NPC or spawned object was hit.";}
+        List<WorldPickCandidate> hits=BuildWorldPickCandidates(rayOrigin,rayDirection,s,visible,true,true)
+          .Where(h=>h?.Npc?.IsTaxiTerminal==true||(h?.Spn?.WonkaPackageId??0)!=0).OrderBy(h=>h.Distance).ToList();
+        if(hits.Count==0){ClearWorldModelSelection();return "No interactive taxi terminal or Wonkavator was hit.";}
         ApplyWorldPickCandidate(hits[0]);
         selectedWorldCycleIndex=0;selectedWorldCycleCount=hits.Count;
         return selectedWorldModelDetails;
@@ -921,7 +1066,7 @@ namespace PugTools {
       origin=orthographicActive?near:camera.Position;return true;
     }
 
-    private List<WorldPickCandidate> BuildWorldPickCandidates(Vector3 rayOrigin,Vector3 rayDirection,WorldRenderSettings s,HashSet<string> visible,bool markersOnly){
+    private List<WorldPickCandidate> BuildWorldPickCandidates(Vector3 rayOrigin,Vector3 rayDirection,WorldRenderSettings s,HashSet<string> visible,bool markersOnly,bool interactionPick=false){
       var hits=new List<WorldPickCandidate>();
       if(!markersOnly){
         foreach(RenderEntry entry in NearbyRenderEntries(RenderKindModel,camera.FarZ,false,visible)){
@@ -953,7 +1098,12 @@ namespace PugTools {
             if(!moving&&!InstanceRoomVisible(spn.Instance,spn.Room,visible))continue;
             if(!InstanceVisibleInWorld(spn.Instance,s))continue;
             Matrix world=SpnPlacementWorld(spn,s.AnimateSpnObjects);WorldSpnDynState dyn=ActiveSpnDynState(spn,s.AnimateSpnObjects);if(dyn!=null&&dyn.Hidden)continue;
-            if(!TrySpnReceiverSphere(spn,world,dyn,out Vector3 center,out float radius)||!TryRaySphere(rayOrigin,rayDirection,center,Math.Max(.08f,radius),out float distance))continue;
+            bool interactiveWonk=interactionPick&&spn.WonkaPackageId!=0;
+            Vector3 center;float radius;
+            bool haveSphere=interactiveWonk?TrySpnInteractionSphere(spn,world,dyn,out center,out radius):TrySpnReceiverSphere(spn,world,dyn,out center,out radius);
+            if(!haveSphere)continue;
+            float pickRadius=interactiveWonk?WorldInteractionPickRadius(center,radius,s):Math.Max(.08f,radius);
+            if(!TryRaySphere(rayOrigin,rayDirection,center,pickRadius,out float distance))continue;
             hits.Add(new WorldPickCandidate{Kind="spn",Key="spn:"+(spn.Room.RoomName??String.Empty)+":"+spn.Instance.ID+":"+(spn.SourceFqn??String.Empty),Distance=distance,HitPoint=rayOrigin+rayDirection*distance,Center=center,Radius=Math.Max(.08f,radius),Spn=spn});
           }
         }
@@ -1047,6 +1197,7 @@ namespace PugTools {
         WorldSpnPlacement spn=pick.Spn;sb.AppendLine("Placeable: "+(spn.Name??spn.SourceFqn??"(unknown)"));sb.AppendLine("Node: "+(spn.SourceFqn??"(none)"));
         sb.AppendLine("Room: "+(spn.Room?.RoomName??"unknown"));sb.AppendLine("Instance id: "+(spn.Instance?.ID??0));if(!String.IsNullOrWhiteSpace(spn.PathFqn))sb.AppendLine("Path: "+spn.PathFqn);
         WorldSpnDynState dyn=ActiveSpnDynState(spn,SettingsSnapshot().AnimateSpnObjects);if(dyn!=null)sb.AppendLine("State: "+(dyn.Name??"(unnamed)")+(dyn.Hidden?" (hidden)":""));
+        if(spn.WonkaPackageId!=0)sb.AppendLine("Wonkavator package: "+spn.WonkaPackageId);
         sb.AppendLine("Interactable glow: "+spn.BlueGlow);sb.AppendLine(WorldPickPositionLine("World position",pick.Center));return sb.ToString().TrimEnd();
       }
       Room room=pick.Utility?.Room??pick.RenderEntry?.Room;AssetInstance inst=pick.Utility?.Instance??pick.RenderEntry?.Instance;AreaAsset asset=null;if(inst!=null&&area!=null)area.AssetIdMap.TryGetValue(inst.assetID,out asset);
@@ -1185,7 +1336,7 @@ namespace PugTools {
       foreach(var g in terrainGpu.Values)g.Dispose();terrainGpu.Clear();foreach(var g in terrainIndexCache.Values)g.Dispose();terrainIndexCache.Clear(); foreach(var g in waterGpu.Values)g.Dispose();waterGpu.Clear(); foreach(var g in roadGpu)g.Dispose();roadGpu.Clear();foreach(var g in mapNoteFallbackGpu)g.Dispose();mapNoteFallbackGpu.Clear();foreach(var g in mapArtGpu)g.Dispose();mapArtGpu.Clear();mapArtPrepared=false;foreach(var g in mapNoteIconGpu.Values)g.Dispose();mapNoteIconGpu.Clear();materialLastUseFrame.Clear();modelGeometryPrepared.Clear();modelGeometryLastUseFrame.Clear();worldRenderFrame=0;Release(ref selectedWorldBoxBuffer);ClearWorldModelSelection();
       foreach(var list in dynamicDetailGpu.Values)foreach(var g in list)g.Dispose();dynamicDetailGpu.Clear();
       foreach(var list in dynamicDetailMeshBatches.Values)foreach(var g in list)g.Dispose();dynamicDetailMeshBatches.Clear();
-      instanceWorldTransforms.Clear();heightMapFloorGrid.Clear();heightMapFloors.Clear();roomPlacementGrid.Clear();roomPlacementGlobal.Clear();volumeMembershipGrid.Clear();volumeMembershipGlobal.Clear();modelFloorData.Clear();modelFloorPlacementGrid.Clear();modelFloorPlacementGlobal.Clear();renderGrid.Clear();renderGlobal.Clear();renderEntriesByRoom.Clear();occluderRenderEntries.Clear();walkingPathFollowerRenderEntries.Clear();decorationHookRenderEntries.Clear();teleportWarmupModels.Clear();teleportWarmupQueued.Clear();cameraWarmupModels.Clear();cameraWarmupQueued.Clear();cameraWarmupAnchor=new Vector3(float.NaN,float.NaN,float.NaN);cameraWarmupRoomName=String.Empty;lock(teleportWarmupLock){teleportWarmupRequestPending=false;teleportWarmupCancelPending=false;}Release(ref regularModelInstanceBuffer);regularModelInstanceCapacity=0;regularModelInstanceScratch=Array.Empty<float>();regularModelInstancingSafe.Clear();visualLodLevels.Clear();lodSchemas.Clear();localLightGrid.Clear();localLightGlobal.Clear();localLightSelectionCache.Clear();localLightVisibilityScope=null;currentLocalLightSelection=LocalLightSelection.Empty;boundLocalLightTexturePaths.Clear();roomPortals.Clear();roomStreamingNeighbors.Clear();Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);lastLocalLightCount=-1;currentCameraRoom=null;displayCameraRoom=null;skyRoomNames.Clear();
+      instanceWorldTransforms.Clear();heightMapFloorGrid.Clear();heightMapFloors.Clear();roomPlacementGrid.Clear();roomPlacementGlobal.Clear();volumeMembershipGrid.Clear();volumeMembershipGlobal.Clear();modelFloorData.Clear();modelFloorPlacementGrid.Clear();modelFloorPlacementGlobal.Clear();renderGrid.Clear();renderGlobal.Clear();renderEntriesByRoom.Clear();occluderRenderEntries.Clear();walkingPathFollowerRenderEntries.Clear();decorationHookRenderEntries.Clear();teleportWarmupModels.Clear();teleportWarmupQueued.Clear();cameraWarmupModels.Clear();cameraWarmupQueued.Clear();cameraWarmupAnchor=new Vector3(float.NaN,float.NaN,float.NaN);cameraWarmupRoomName=String.Empty;lock(teleportWarmupLock){teleportWarmupRequestPending=false;teleportWarmupCancelPending=false;}Release(ref regularModelInstanceBuffer);regularModelInstanceCapacity=0;regularModelInstanceScratch=Array.Empty<float>();regularModelInstancingSafe.Clear();visualLodLevels.Clear();lodSchemas.Clear();localLightGrid.Clear();localLightGlobal.Clear();localLightSelectionCache.Clear();localLightVisibilityScope=null;currentLocalLightSelection=LocalLightSelection.Empty;boundLocalLightTexturePaths.Clear();roomPortals.Clear();roomStreamingNeighbors.Clear();roomStreamingAuthoredVisible.Clear();roomStreamingBounds.Clear();streamTransitionRoomGrace.Clear();lastStreamAnchorRoom=String.Empty;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);lastLocalLightCount=-1;currentCameraRoom=null;displayCameraRoom=null;skyRoomNames.Clear();
       foreach(var m in dynamicDetailMaterials.Values)ReleaseOwnedMaterial(m);dynamicDetailMaterials.Clear();
       var releasedDydModels=new HashSet<GR2>();foreach(var model in dynamicDetailMeshModels.Values)if(model!=null&&releasedDydModels.Add(model))ReleaseModelBuffers(model);dynamicDetailMeshModels.Clear();
       foreach(var model in strongholdHookModels.Values)if(model!=null&&releasedDydModels.Add(model))ReleaseModelBuffers(model);strongholdHookModels.Clear();
@@ -1194,6 +1345,7 @@ namespace PugTools {
       foreach(var m in terrainMaterials.Values){Release(ref m.diffuseSRV);Release(ref m.diffuse2SRV);Release(ref m.rotationSRV);Release(ref m.glossSRV);Release(ref m.waterSurfaceSRV);}terrainMaterials.Clear();
       foreach(var room in rooms)foreach(var inst in room.InstancesById.Values){Release(ref inst.VBO);Release(ref inst.IBO);}
       foreach(var model in models.Values)ReleaseModelBuffers(model);
+      modelStreamer?.Dispose();modelStreamer=null;materialMetadataStreamer?.Dispose();materialMetadataStreamer=null;streamRequestsByRoom.Clear();streamPlacementsByAsset.Clear();streamPlacementsByRoomAsset.Clear();streamRoomAssetHints.Clear();streamBootstrapAssetsByCell.Clear();streamBootstrapRoomsByCell.Clear();streamRequestsByAsset.Clear();activeStreamAssetIds.Clear();queuedStreamDemandAssetIds.Clear();urgentStreamAssetIds.Clear();materialStreamAssetIds.Clear();activeStreamRoomNames.Clear();previousStreamRoomNames.Clear();floorStreamRoomNames.Clear();previousFloorStreamRoomNames.Clear();initialStreamAssetIds.Clear();initialStreamRoomNames.Clear();initialStreamPrefetchRoomNames.Clear();initialStreamAssetDistances.Clear();streamIndexedInstances.Clear();streamFloorIndexedInstances.Clear();streamedWorldModels.Clear();streamedModelAssetIds.Clear();pendingModelGpuUploads.Clear();queuedModelGpuUploads.Clear();pendingStreamedModelIntegrations.Clear();queuedStreamedModelIntegrations.Clear();pendingStreamedFloorIntegrations.Clear();queuedStreamedFloorIntegrations.Clear();pendingStreamedModelMaterials.Clear();queuedStreamedModelMaterials.Clear();pendingStreamedMaterialPrepares.Clear();streamedWorldMaterials.Clear();streamedMaterialResourcesPrepared.Clear();streamedModelMaterialsReady.Clear();cameraAheadStreamRooms.Clear();urgentCameraAheadStreamRooms.Clear();streamTransitionRoomGrace.Clear();lastStreamAnchorRoom=String.Empty;streamPrefetchAnchor=new Vector3(float.NaN,float.NaN,float.NaN);streamPrefetchLook=new Vector3(float.NaN,float.NaN,float.NaN);streamPrefetchRoom=String.Empty;
     }
     private static void ReleaseModelBuffers(GR2 model){foreach(var mesh in model.meshes){Release(ref mesh.vertBuffer);Release(ref mesh.idxBuffer);}foreach(var a in model.attachedModels)ReleaseModelBuffers(a);}
     private static void Release<T>(ref T v) where T:class,IDisposable{v?.Dispose();v=null;}
@@ -1396,12 +1548,18 @@ namespace PugTools {
         s.ShowMapArt=false;
       }
       Room cameraRoom=FindCameraRoom(camera.Position);
+      // A streamed interior can be known from conservative placement bounds before its collision floor is indexed.
+      // Use that semantic room for visibility/environment while the authoritative floor locator catches up; otherwise
+      // Corellia starts in the outdoor cell underneath the hangar and immediately culls the shell we just streamed.
+      Room renderCameraRoom=cameraRoom;
+      if(modelStreamer!=null&&s.Mode!=WorldRenderMode.Map){Room streamed=ResolveStreamingRoom(camera.Position,cameraRoom);if(streamed!=null&&!IsEverywhereRoom(streamed))renderCameraRoom=streamed;}
+      UpdateStreamTransitionGrace(renderCameraRoom);
       UpdateCurrentPhase(camera.Position);
       // Jedipedia does not let the synthetic `_everywhere_` cell choose a room environment/skyscene. When the
       // camera has no concrete visibility room it explicitly falls back to envSchemes.area. Using `_everywhere_`'s
       // scheme here was enough to replace Dantooine's authored sky with the plain fog/clear colour.
-      AreaEnvironmentScheme env=cameraRoom!=null&&!IsEverywhereRoom(cameraRoom)
-        ? cameraRoom.EnvironmentScheme??area?.GetEnvironmentScheme("area")??new AreaEnvironmentScheme()
+      AreaEnvironmentScheme env=renderCameraRoom!=null&&!IsEverywhereRoom(renderCameraRoom)
+        ? renderCameraRoom.EnvironmentScheme??area?.GetEnvironmentScheme("area")??new AreaEnvironmentScheme()
         : area?.GetEnvironmentScheme("area")??new AreaEnvironmentScheme();
       UpdateActiveClipDistance(env,s);
       camera.UpdateViewMatrix();
@@ -1425,12 +1583,23 @@ namespace PugTools {
       }
 
       bool shadows=s.EnableShadows&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap&&env.CastDirectionalShadows&&shadowMaps.All(x=>x!=null);
-      HashSet<string> visible=BuildVisibleRoomSet(cameraRoom,s);
-      ProcessCameraWarmup(cameraRoom,visible,s);
+      HashSet<string> visible=BuildVisibleRoomSet(renderCameraRoom,s);
+      // Decode/MAT metadata happen on background TOR workers. The render thread commits local placements and a
+      // small time-bounded D3D upload slice; collision-floor indexing is lower priority and cannot hold geometry back.
+      RequestVisibleRoomModels(visible,renderCameraRoom,env,s);
+      PumpDecodedWorldModels();
+      ProcessStreamedModelIntegrations();
+      ProcessModelGpuUploads();
+      // Spatial correctness outranks texture refinement: finish the current/startup room locator before spending
+      // this frame's remaining archive/D3D budget on DDS resources.
+      ProcessStreamedFloorIntegrations();
+      ProcessStreamedModelMaterials();
+      if((worldRenderFrame%6)==0)ReportWorldStreamingProgress();
+      ProcessCameraWarmup(renderCameraRoom,visible,s);
       PrepareObjectOcclusionFrame(s,visible);
       // Local lights and receiver meshes are static. Keep the cell selections across frames and invalidate only
       // when the active room/visibility mode changes; this removes the remaining per-frame CPU selection cost.
-      string lightScope=(cameraRoom?.RoomName??String.Empty)+(s.ShowSky?"|sky|":"|nosky|")+VisibleRoomScope(visible);
+      string lightScope=(renderCameraRoom?.RoomName??String.Empty)+(s.ShowSky?"|sky|":"|nosky|")+VisibleRoomScope(visible);
       if(!String.Equals(lightScope,localLightVisibilityScope,StringComparison.Ordinal)){localLightSelectionCache.Clear();localLightVisibilityScope=lightScope;}
       // Dynamic-detail shadow cards need the same camera/time values as their visible pass.
       fx.SetCamera(cam);fx.SetScrolling(env,elapsed,LoadTexture(env.ScrollingTexture),LoadTexture(env.ScrollingMask));
@@ -1492,7 +1661,7 @@ namespace PugTools {
           case 2:TrimSharedTextureResidency();break;
           case 3:TrimTerrainTextureResidency(s);break;
           case 4:TrimModelGeometryResidency();break;
-          default:TrimNpcSkinStateResidency();break;
+          default:TrimNpcSkinStateResidency();TrimStreamedModelCpuResidency();break;
         }
       }
       if(captureMiniMap){
@@ -1578,6 +1747,30 @@ namespace PugTools {
     private void BuildInstanceWorldTransformCache(){
       instanceWorldTransforms.Clear();
       foreach(Room room in rooms)foreach(AssetInstance inst in room.InstancesById.Values)instanceWorldTransforms[inst]=inst.GetAbsoluteTransform(room);
+    }
+
+    private static int StreamBootstrapCell(float coordinate){return (int)Math.Floor(coordinate/StreamBootstrapCellSize);}
+    private void BuildSpatialStreamingBootstrapIndex(){
+      streamBootstrapAssetsByCell.Clear();streamBootstrapRoomsByCell.Clear();streamRoomAssetHints.Clear();
+      foreach(var assetPlacements in streamPlacementsByAsset){
+        foreach(var placement in assetPlacements.Value){
+          if(placement.Room==null||placement.Instance==null)continue;
+          Matrix world=InstanceWorld(placement.Instance,placement.Room);
+          Vector3 position=new Vector3(world.M41,world.M42,world.M43);
+          if(!IsFinite(position))continue;
+          var cell=(StreamBootstrapCell(position.X),StreamBootstrapCell(position.Z));
+          if(!streamBootstrapAssetsByCell.TryGetValue(cell,out HashSet<ulong> assets))streamBootstrapAssetsByCell[cell]=assets=new HashSet<ulong>();
+          assets.Add(assetPlacements.Key);
+          if(!String.IsNullOrWhiteSpace(placement.Room.RoomName)){
+            if(!streamBootstrapRoomsByCell.TryGetValue(cell,out HashSet<string> ownerRooms))streamBootstrapRoomsByCell[cell]=ownerRooms=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            ownerRooms.Add(placement.Room.RoomName);
+          }
+          if(!streamRoomAssetHints.TryGetValue(placement.Room.RoomName,out Dictionary<ulong,StreamRoomAssetHint> roomHints))streamRoomAssetHints[placement.Room.RoomName]=roomHints=new Dictionary<ulong,StreamRoomAssetHint>();
+          if(!roomHints.TryGetValue(assetPlacements.Key,out StreamRoomAssetHint hint))roomHints[assetPlacements.Key]=hint=new StreamRoomAssetHint();
+          hint.Min=new Vector3(Math.Min(hint.Min.X,position.X),Math.Min(hint.Min.Y,position.Y),Math.Min(hint.Min.Z,position.Z));
+          hint.Max=new Vector3(Math.Max(hint.Max.X,position.X),Math.Max(hint.Max.Y,position.Y),Math.Max(hint.Max.Z,position.Z));hint.Any=true;
+        }
+      }
     }
 
     private Matrix InstanceWorld(AssetInstance inst,Room room){
@@ -1801,6 +1994,11 @@ namespace PugTools {
     }
 
     private void PrimeRoomVisibilityBounds(){
+      // Jedipedia runs dpvsPrimeRenderableRoomBounds only after its first-pass GR2 queue is complete. In v6 a
+      // streamed room has none/only some of those models here; committing a partial heightmap/water box as final
+      // visibility bounds can select the wrong overlapping room and exclude the actual hangar. Streaming uses its
+      // separate conservative placement bounds until TryFinalizeStreamedRoomVisibilityBounds() has all room GR2s.
+      if(modelStreamer!=null)return;
       // Jedipedia's dpvsPrimeRenderableRoomBounds() repairs rooms whose authored visibility box is the common
       // all-zero placeholder. Without this fallback a perfectly valid interior can never win FindBoundsRoom(), so
       // the camera appears to remain in the exterior room (or `_everywhere_`) whenever its collision floor has a gap.
@@ -1808,7 +2006,9 @@ namespace PugTools {
         if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName)||HasUsableRoomBounds(room))continue;
         Vector3 min=new Vector3(float.MaxValue,float.MaxValue,float.MaxValue),max=new Vector3(float.MinValue,float.MinValue,float.MinValue);bool any=false;
         foreach(AssetInstance inst in room.InstancesById.Values){
-          if(!InstanceVisibleInWorld(inst)||inst.PathFollowerBoundaryExcluded)continue;Vector3 localMin,localMax;bool have=false;
+          // Jedipedia dPVS uses every static renderable placement to prime a room boundary, including authored
+          // hidden/MAP_ONLY/OCCLUDER_ONLY instances. Those flags control drawing, not spatial membership.
+          if(inst==null||inst.PathFollowerBoundaryExcluded)continue;Vector3 localMin,localMax;bool have=false;
           if(inst.hasHeightMap&&inst.HeightMap!=null){
             HeightMap hm=inst.HeightMap;int w=checked((int)hm.width),d=checked((int)hm.depth);
             float xmin=-.2f*(float)Math.Ceiling(.5f*(w-1)),zmin=-.2f*(float)Math.Ceiling(.5f*(d-1));
@@ -1830,12 +2030,157 @@ namespace PugTools {
       }
     }
 
+    private void BuildRoomStreamingBounds(){
+      roomStreamingBounds.Clear();streamRoomsNeedingExactBounds.Clear();
+      if(rooms==null)return;
+      foreach(Room room in rooms){
+        if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName)||String.IsNullOrWhiteSpace(room.RoomName))continue;
+        if(HasUsableRoomBounds(room)){
+          roomStreamingBounds[room.RoomName]=new RoomStreamingBounds{Min=room.VisibilityMin,Max=room.VisibilityMax,Center=room.VisibilityCenter,Radius=Math.Max(.01f,room.VisibilityRadius),Coarse=false};
+          continue;
+        }
+        streamRoomsNeedingExactBounds.Add(room.RoomName);
+        Vector3 min=new Vector3(float.MaxValue,float.MaxValue,float.MaxValue),max=new Vector3(float.MinValue,float.MinValue,float.MinValue);bool any=false;int count=0;
+        // Use the streaming catalog's placement origins, including authored hidden placements. Visibility is a draw
+        // decision; excluding those origins here can erase the only useful bootstrap hint for phased/interior shells.
+        if(streamRoomAssetHints.TryGetValue(room.RoomName,out Dictionary<ulong,StreamRoomAssetHint> hints))foreach(StreamRoomAssetHint hint in hints.Values){
+          if(hint==null||!hint.Any||!IsFinite(hint.Min)||!IsFinite(hint.Max))continue;Expand(ref min,ref max,hint.Min);Expand(ref min,ref max,hint.Max);any=true;count++;
+        }
+        // Terrain/water-only rooms have no normal GR2 request. Their placement origins still make a useful fallback.
+        if(!any&&room.InstancesById!=null)foreach(AssetInstance inst in room.InstancesById.Values){
+          if(inst==null||inst.PathFollowerBoundaryExcluded||(!inst.hasHeightMap&&!inst.hasWater))continue;Matrix world=InstanceWorld(inst,room);Vector3 p=new Vector3(world.M41,world.M42,world.M43);if(!IsFinite(p))continue;Expand(ref min,ref max,p);any=true;count++;
+        }
+        if(!any)continue;
+        // A single room-shell GR2 is frequently authored with its origin near an edge rather than at the centre.
+        // Use a deliberately conservative streaming-only pad; multiple placements already describe room extent and
+        // therefore need less extra reach. This never changes render culling or the authoritative camera-room result.
+        float horizontalPad=count<=2?112f:Math.Max(48f,Math.Min(96f,Math.Max(max.X-min.X,max.Z-min.Z)*.20f+32f));
+        float verticalPad=count<=2?48f:Math.Max(24f,Math.Min(64f,(max.Y-min.Y)*.20f+16f));
+        min-=new Vector3(horizontalPad,verticalPad,horizontalPad);max+=new Vector3(horizontalPad,verticalPad,horizontalPad);
+        Vector3 center=(min+max)*.5f;float radius=(max-min).Length()*.5f;
+        roomStreamingBounds[room.RoomName]=new RoomStreamingBounds{Min=min,Max=max,Center=center,Radius=Math.Max(.01f,radius),Coarse=true};
+      }
+    }
+
+    private bool TryComputeStreamedRoomVisibilityBounds(Room room,out Vector3 min,out Vector3 max){
+      min=new Vector3(float.MaxValue,float.MaxValue,float.MaxValue);max=new Vector3(float.MinValue,float.MinValue,float.MinValue);bool any=false;
+      if(room?.InstancesById==null)return false;
+      foreach(AssetInstance inst in room.InstancesById.Values){
+        // Match dpvsPrimeRenderableRoomBounds(): hidden/viewability does not remove an authored placement from the
+        // room's spatial shell. Otherwise phased Corellia interiors can collapse to an incomplete box.
+        if(inst==null||inst.PathFollowerBoundaryExcluded)continue;Vector3 localMin,localMax;bool have=false;
+        if(inst.hasHeightMap&&inst.HeightMap!=null){
+          HeightMap hm=inst.HeightMap;int w=checked((int)hm.width),d=checked((int)hm.depth);float xmin=-.2f*(float)Math.Ceiling(.5f*(w-1)),zmin=-.2f*(float)Math.Ceiling(.5f*(d-1));
+          localMin=new Vector3(xmin,hm.MinElevation,zmin);localMax=new Vector3(xmin+.2f*(w-1),hm.MaxElevation,zmin+.2f*(d-1));have=true;
+        }else if(models.TryGetValue(inst.assetID,out GR2 model)&&model?.globalBox!=null){
+          GR2_Bounding_Box box=model.globalBox;localMin=new Vector3(box.minX,box.minY,box.minZ);localMax=new Vector3(box.maxX,box.maxY,box.maxZ);have=IsFinite(localMin)&&IsFinite(localMax)&&localMin.X<=localMax.X&&localMin.Y<=localMax.Y&&localMin.Z<=localMax.Z;
+        }else if(inst.hasWater){
+          float hw=Math.Max(.01f,Math.Abs(inst.width)*.5f),hd=Math.Max(.01f,Math.Abs(inst.depth)*.5f),hh=inst.HasHeightProperty?Math.Max(.01f,Math.Abs(inst.height)*.5f):.05f;
+          localMin=new Vector3(-hw,-hh,-hd);localMax=new Vector3(hw,hh,hd);have=true;
+        }else continue;
+        if(!have)continue;Matrix world=InstanceWorld(inst,room);
+        for(int z=0;z<2;z++)for(int y=0;y<2;y++)for(int x=0;x<2;x++){
+          Vector3 p=Vector3.TransformCoordinate(new Vector3(x==0?localMin.X:localMax.X,y==0?localMin.Y:localMax.Y,z==0?localMin.Z:localMax.Z),world);
+          if(!IsFinite(p))continue;Expand(ref min,ref max,p);any=true;
+        }
+      }
+      return any&&min.X<=max.X&&min.Y<=max.Y&&min.Z<=max.Z;
+    }
+
+    private void TryFinalizeStreamedRoomVisibilityBounds(string roomName){
+      if(modelStreamer==null||String.IsNullOrWhiteSpace(roomName)||!streamRoomsNeedingExactBounds.Contains(roomName))return;
+      if(streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> requests)){
+        foreach(WorldModelStreamRequest request in requests)if(request!=null&&!models.ContainsKey(request.AssetId)&&!modelStreamer.IsFailed(request.AssetId))return;
+      }
+      Room room=rooms.FirstOrDefault(r=>r!=null&&String.Equals(r.RoomName,roomName,StringComparison.OrdinalIgnoreCase));if(room==null){streamRoomsNeedingExactBounds.Remove(roomName);return;}
+      if(!TryComputeStreamedRoomVisibilityBounds(room,out Vector3 min,out Vector3 max))return;
+      room.SetComputedVisibilityBounds(min,max);roomStreamingBounds[room.RoomName]=new RoomStreamingBounds{Min=min,Max=max,Center=(min+max)*.5f,Radius=Math.Max(.01f,(max-min).Length()*.5f),Coarse=false};
+      streamRoomsNeedingExactBounds.Remove(roomName);
+      RefreshPhysicalStreamingNeighbors(room);
+    }
+
+    private void RefreshPhysicalStreamingNeighbors(Room room){
+      // BuildRoomStreamingGraph() initially runs before v6 has GR2-derived bounds. When a Corellia outdoor cell later
+      // gets its exact shell, add newly discovered touching cells instead of keeping the origin-box adjacency forever.
+      // Only additions are needed: stale conservative neighbours cost a little prefetch but cannot create a hole.
+      if(room==null||!room.OutdoorsVisible||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName)||!TryGetRoomStreamingBounds(room,out RoomStreamingBounds rb))return;
+      const float maxGap=32f,maxVerticalGap=32f;float maxGapSq=maxGap*maxGap;
+      var nearby=new List<(Room Room,float Gap)>();
+      foreach(Room candidate in rooms){
+        if(candidate==null||ReferenceEquals(room,candidate)||!candidate.OutdoorsVisible||IsEverywhereRoom(candidate)||skyRoomNames.Contains(candidate.RoomName)||!TryGetRoomStreamingBounds(candidate,out RoomStreamingBounds cb))continue;
+        float dy=AxisGap(rb.Min.Y,rb.Max.Y,cb.Min.Y,cb.Max.Y);if(dy>maxVerticalGap)continue;
+        float dx=AxisGap(rb.Min.X,rb.Max.X,cb.Min.X,cb.Max.X),dz=AxisGap(rb.Min.Z,rb.Max.Z,cb.Min.Z,cb.Max.Z),gap=dx*dx+dz*dz;if(gap<=maxGapSq)nearby.Add((candidate,gap));
+      }
+      foreach(var item in nearby.OrderBy(x=>x.Gap).Take(8)){
+        if(!roomStreamingNeighbors.TryGetValue(room.RoomName,out HashSet<string> a))roomStreamingNeighbors[room.RoomName]=a=new HashSet<string>(StringComparer.OrdinalIgnoreCase);a.Add(item.Room.RoomName);
+        if(!roomStreamingNeighbors.TryGetValue(item.Room.RoomName,out HashSet<string> b))roomStreamingNeighbors[item.Room.RoomName]=b=new HashSet<string>(StringComparer.OrdinalIgnoreCase);b.Add(room.RoomName);
+      }
+    }
+
+    private void FinalizeReadyStreamRoomVisibilityBounds(){
+      if(modelStreamer==null||streamRoomsNeedingExactBounds.Count==0)return;
+      var candidates=new HashSet<string>(activeStreamRoomNames,StringComparer.OrdinalIgnoreCase);candidates.UnionWith(initialStreamRoomNames);candidates.UnionWith(floorStreamRoomNames);
+      foreach(string roomName in candidates.ToArray())TryFinalizeStreamedRoomVisibilityBounds(roomName);
+    }
+
+    private bool TryGetRoomStreamingBounds(Room room,out RoomStreamingBounds bounds){
+      bounds=null;if(room==null||String.IsNullOrWhiteSpace(room.RoomName))return false;
+      return roomStreamingBounds.TryGetValue(room.RoomName,out bounds)&&bounds!=null&&IsFinite(bounds.Min)&&IsFinite(bounds.Max)&&bounds.Max.X>=bounds.Min.X&&bounds.Max.Y>=bounds.Min.Y&&bounds.Max.Z>=bounds.Min.Z;
+    }
+
+    private static bool ContainsStreamingBounds(RoomStreamingBounds bounds,Vector3 p,float margin){
+      return bounds!=null&&p.X>=bounds.Min.X-margin&&p.X<=bounds.Max.X+margin&&p.Y>=bounds.Min.Y-margin&&p.Y<=bounds.Max.Y+margin&&p.Z>=bounds.Min.Z-margin&&p.Z<=bounds.Max.Z+margin;
+    }
+
+    private static float StreamingBoundsGapSquared(RoomStreamingBounds a,RoomStreamingBounds b){
+      if(a==null||b==null)return float.MaxValue;
+      float dx=AxisGap(a.Min.X,a.Max.X,b.Min.X,b.Max.X),dy=AxisGap(a.Min.Y,a.Max.Y,b.Min.Y,b.Max.Y),dz=AxisGap(a.Min.Z,a.Max.Z,b.Min.Z,b.Max.Z);
+      return dx*dx+dy*dy+dz*dz;
+    }
+
+    private float StreamingBoundsDistanceSquared(RoomStreamingBounds bounds,Vector3 p){
+      if(bounds==null)return float.MaxValue;
+      float dx=p.X<bounds.Min.X?bounds.Min.X-p.X:(p.X>bounds.Max.X?p.X-bounds.Max.X:0f);
+      float dy=p.Y<bounds.Min.Y?bounds.Min.Y-p.Y:(p.Y>bounds.Max.Y?p.Y-bounds.Max.Y:0f);
+      float dz=p.Z<bounds.Min.Z?bounds.Min.Z-p.Z:(p.Z>bounds.Max.Z?p.Z-bounds.Max.Z:0f);
+      return dx*dx+dy*dy+dz*dz;
+    }
+
+    private Room FindStreamingRoom(Vector3 p,float maxFallbackDistance=220f){
+      Room best=null;float bestScore=float.MaxValue;
+      foreach(Room room in rooms){
+        if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName)||!TryGetRoomStreamingBounds(room,out RoomStreamingBounds bounds))continue;
+        if(!ContainsStreamingBounds(bounds,p,.5f))continue;
+        // Prefer a tighter/interior box when conservative boxes overlap.
+        float score=bounds.Radius+(room.OutdoorsVisible?100000f:0f);if(best==null||score<bestScore){best=room;bestScore=score;}
+      }
+      if(best!=null)return best;
+      float maxSq=maxFallbackDistance*maxFallbackDistance;bestScore=maxSq;
+      foreach(Room room in rooms){
+        if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName)||!TryGetRoomStreamingBounds(room,out RoomStreamingBounds bounds))continue;
+        float distance=StreamingBoundsDistanceSquared(bounds,p);if(distance<bestScore){best=room;bestScore=distance;}
+      }
+      return best;
+    }
+
+    private Room ResolveStreamingRoom(Vector3 p,Room authoritative){
+      Room coarse=FindStreamingRoom(p);
+      if(authoritative!=null&&!IsEverywhereRoom(authoritative)&&!skyRoomNames.Contains(authoritative.RoomName)){
+        // Before streamed collision floors exist an outdoor heightmap can legitimately win the authoritative lookup
+        // even while the spawn sits inside an interior hangar above it. For demand planning only, prefer an overlapping
+        // interior coarse room; FindCameraRoom itself remains untouched and takes over as soon as its floor arrives.
+        if(coarse!=null&&!ReferenceEquals(coarse,authoritative)&&!coarse.OutdoorsVisible&&authoritative.OutdoorsVisible)return coarse;
+        return authoritative;
+      }
+      return coarse??authoritative;
+    }
+
     private void BuildHeightMapFloorIndex(){
       heightMapFloorGrid.Clear();heightMapFloors.Clear();
       foreach(Room room in rooms){
         if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName))continue;
         foreach(AssetInstance inst in room.InstancesById.Values){
-          HeightMap hm=inst.HeightMap;if(!InstanceVisibleInWorld(inst)||inst.PathFollowerBoundaryExcluded||!inst.hasHeightMap||hm==null||hm.width<2||hm.depth<2)continue;
+          if(inst==null||inst.PathFollowerBoundaryExcluded||!inst.hasHeightMap)continue;HeightMap hm=inst.HeightMap;if(hm==null||hm.width<2||hm.depth<2)continue;
           Matrix world=InstanceWorld(inst,room);Matrix inv;
           try{inv=Matrix.Invert(world);}catch{continue;}
           int w=(int)hm.width,d=(int)hm.depth;
@@ -1863,7 +2208,9 @@ namespace PugTools {
       foreach(Room room in rooms){
         if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName))continue;
         foreach(AssetInstance inst in room.InstancesById.Values){
-          if(!InstanceVisibleInWorld(inst)||inst.PathFollowerBoundaryExcluded||!area.AssetIdMap.TryGetValue(inst.assetID,out AreaAsset asset))continue;
+          // dPVS uses authored RoomBound/Region/Trigger/Heightmap placements for spatial membership even when the
+          // placement is hidden or MAP_ONLY/OCCLUDER_ONLY. Those flags are render policy, not room topology.
+          if(inst==null||inst.PathFollowerBoundaryExcluded||!area.AssetIdMap.TryGetValue(inst.assetID,out AreaAsset asset))continue;
           string ext=(asset.Extension??String.Empty).Trim().TrimStart('.').ToLowerInvariant();int rank;
           // Jedipedia keeps Heightmap placements in addition to the exact floor lattice. A heightmap placement is
           // an infinite vertical X/Z prism when Height was not authored, which is why flying high above a planet
@@ -2015,7 +2362,9 @@ namespace PugTools {
       foreach(Room room in rooms){
         if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName))continue;
         foreach(AssetInstance inst in room.InstancesById.Values){
-          if(!InstanceVisibleInWorld(inst)||inst.PathFollowerBoundaryExcluded||inst.hasHeightMap||inst.hasWater||IsSpeedTreeInstance(inst)||!models.TryGetValue(inst.assetID,out GR2 model)||model==null)continue;
+          // Floor/camera-room membership is independent from draw visibility in Jedipedia. Hidden and map/occluder
+          // placements can still carry the collision shell that says which room the camera occupies.
+          if(inst==null||inst.PathFollowerBoundaryExcluded||inst.hasHeightMap||inst.hasWater||IsSpeedTreeInstance(inst)||!models.TryGetValue(inst.assetID,out GR2 model)||model==null)continue;
           ModelFloorData floor=GetOrBuildModelFloorData(model,inst);if(floor==null||floor.Meshes.Count==0)continue;
           Matrix world=InstanceWorld(inst,room),inverse;try{inverse=Matrix.Invert(world);}catch{continue;}
           if(!TryModelWorldXZBounds(model,world,out float minX,out float maxX,out float minZ,out float maxZ))continue;
@@ -2235,6 +2584,812 @@ namespace PugTools {
         }
       }
     }
+
+    private void BuildModelStreamingCatalog(IEnumerable<WorldModelStreamRequest> requests) {
+      streamRequestsByRoom.Clear();streamPlacementsByAsset.Clear();streamPlacementsByRoomAsset.Clear();streamRoomAssetHints.Clear();streamBootstrapAssetsByCell.Clear();streamBootstrapRoomsByCell.Clear();streamRoomsNeedingExactBounds.Clear();streamRequestsByAsset.Clear();activeStreamAssetIds.Clear();queuedStreamDemandAssetIds.Clear();urgentStreamAssetIds.Clear();materialStreamAssetIds.Clear();activeStreamRoomNames.Clear();previousStreamRoomNames.Clear();floorStreamRoomNames.Clear();previousFloorStreamRoomNames.Clear();initialStreamAssetIds.Clear();initialStreamRoomNames.Clear();initialStreamPrefetchRoomNames.Clear();initialStreamAssetDistances.Clear();streamCatalogAssetCount=0;streamIndexedInstances.Clear();streamFloorIndexedInstances.Clear();streamedWorldModels.Clear();streamedModelAssetIds.Clear();pendingModelGpuUploads.Clear();queuedModelGpuUploads.Clear();pendingStreamedModelIntegrations.Clear();queuedStreamedModelIntegrations.Clear();pendingStreamedFloorIntegrations.Clear();queuedStreamedFloorIntegrations.Clear();pendingStreamedModelMaterials.Clear();queuedStreamedModelMaterials.Clear();pendingStreamedMaterialPrepares.Clear();streamedWorldMaterials.Clear();streamedMaterialResourcesPrepared.Clear();streamedModelMaterialsReady.Clear();cameraAheadStreamRooms.Clear();urgentCameraAheadStreamRooms.Clear();streamTransitionRoomGrace.Clear();lastStreamAnchorRoom=String.Empty;
+      if(modelStreamer==null||requests==null)return;
+      var byAsset=requests.Where(x=>x!=null).GroupBy(x=>x.AssetId).ToDictionary(x=>x.Key,x=>x.First());
+      foreach(var pair in byAsset)streamRequestsByAsset[pair.Key]=pair.Value;
+      streamCatalogAssetCount=byAsset.Count;
+      foreach(Room room in rooms) {
+        if(room?.InstancesById==null)continue;
+        foreach(AssetInstance instance in room.InstancesById.Values) {
+          if(instance==null||!byAsset.TryGetValue(instance.assetID,out WorldModelStreamRequest request))continue;
+          if(!streamRequestsByRoom.TryGetValue(room.RoomName,out List<WorldModelStreamRequest> roomRequests))streamRequestsByRoom[room.RoomName]=roomRequests=new List<WorldModelStreamRequest>();
+          if(!roomRequests.Any(x=>x.AssetId==request.AssetId))roomRequests.Add(request);
+          if(!streamPlacementsByAsset.TryGetValue(request.AssetId,out List<(Room Room,AssetInstance Instance)> placements))streamPlacementsByAsset[request.AssetId]=placements=new List<(Room Room,AssetInstance Instance)>();
+          placements.Add((room,instance));
+          if(!streamPlacementsByRoomAsset.TryGetValue(room.RoomName,out Dictionary<ulong,List<(Room Room,AssetInstance Instance)>> byRoomAsset))streamPlacementsByRoomAsset[room.RoomName]=byRoomAsset=new Dictionary<ulong,List<(Room Room,AssetInstance Instance)>>();
+          if(!byRoomAsset.TryGetValue(request.AssetId,out List<(Room Room,AssetInstance Instance)> roomPlacements))byRoomAsset[request.AssetId]=roomPlacements=new List<(Room Room,AssetInstance Instance)>();
+          roomPlacements.Add((room,instance));
+        }
+      }
+    }
+
+    private void BuildInitialStreamWorkingSet(Vector3 position,Room arrivalRoom){
+      initialStreamAssetIds.Clear();initialStreamRoomNames.Clear();initialStreamPrefetchRoomNames.Clear();initialStreamAssetDistances.Clear();
+      const int maxGateRooms=12,maxLocalCandidateRooms=7,maxPrefetchRooms=16;
+      var byName=rooms.Where(r=>r!=null&&!String.IsNullOrWhiteSpace(r.RoomName))
+        .GroupBy(r=>r.RoomName,StringComparer.OrdinalIgnoreCase).ToDictionary(g=>g.Key,g=>g.First(),StringComparer.OrdinalIgnoreCase);
+      bool AddGateRoom(Room room){
+        if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName)||String.IsNullOrWhiteSpace(room.RoomName)||initialStreamRoomNames.Contains(room.RoomName)||initialStreamRoomNames.Count>=maxGateRooms)return false;
+        initialStreamRoomNames.Add(room.RoomName);
+        if(streamRequestsByRoom.TryGetValue(room.RoomName,out List<WorldModelStreamRequest> requests))foreach(WorldModelStreamRequest request in requests){
+          if(request==null)continue;
+          // The first-frame barrier is a *visible shell* barrier, not a dPVS/editor-data barrier. Jedipedia loads the
+          // whole planet before presenting, but our local equivalent must not hold a Corellia spawn on authored-hidden
+          // or MAP/OCCLUDER-only placements. Those remain normal room demand and can settle behind the first frame.
+          bool visiblePlacement=!streamPlacementsByRoomAsset.TryGetValue(room.RoomName,out Dictionary<ulong,List<(Room Room,AssetInstance Instance)>> byAsset)||
+            !byAsset.TryGetValue(request.AssetId,out List<(Room Room,AssetInstance Instance)> placements)||placements.Any(x=>InstanceVisibleInWorld(x.Instance));
+          if(visiblePlacement)initialStreamAssetIds.Add(request.AssetId);
+        }
+        return true;
+      }
+
+      AddGateRoom(arrivalRoom);
+      // The phase/region owner is a semantic seed, but the phase label itself is not a room name. On Corellia a class
+      // hangar often overlaps a generic spaceport cell, so both the floor candidate and the trigger owner participate.
+      AddGateRoom(FindPhaseTriggerRoom(position));
+
+      // Exact authored/completed room bounds are reliable at startup. Coarse placement-origin boxes are only hints;
+      // allowing every coarse overlap to consume all gate slots was capable of selecting several outdoor/base cells
+      // while excluding the still-undecoded hangar. Admit exact overlaps freely, then at most two coarse overlaps.
+      var overlapping=rooms.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName)&&TryGetRoomStreamingBounds(r,out _))
+        .Select(r=>{TryGetRoomStreamingBounds(r,out RoomStreamingBounds b);return (Room:r,Bounds:b,Distance:StreamingBoundsDistanceSquared(b,position));})
+        .Where(x=>ContainsStreamingBounds(x.Bounds,position,18f))
+        .OrderBy(x=>x.Bounds.Coarse?1:0).ThenBy(x=>x.Bounds.Radius).ThenBy(x=>x.Distance).ToList();
+      foreach(var item in overlapping.Where(x=>!x.Bounds.Coarse)){if(initialStreamRoomNames.Count>=maxGateRooms)break;AddGateRoom(item.Room);}
+      int coarseOverlapAdds=0;
+      foreach(var item in overlapping.Where(x=>x.Bounds.Coarse)){if(initialStreamRoomNames.Count>=maxGateRooms||coarseOverlapAdds>=2)break;if(AddGateRoom(item.Room))coarseOverlapAdds++;}
+
+      // This is the important v6/Jedipedia bridge: before GR2-derived floors exist, resolve nearby *room owners* from
+      // authored placement transforms. The previous safety ring added only asset IDs to the barrier; those GR2s could
+      // finish decoding and uploading while their owner room never entered render/floor integration, allowing the
+      // loading overlay to disappear over an empty hangar. Gate a tiny number of physically local/semantic owner cells.
+      Dictionary<string,float> physicalRooms=SpatialBootstrapRoomDistances(position,260f);
+      var semanticRooms=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      foreach(string seed in initialStreamRoomNames.ToArray())foreach(string name in StreamingNeighborRoomNames(seed,96))semanticRooms.Add(name);
+      var localCandidates=byName.Values.Where(r=>r!=null&&!initialStreamRoomNames.Contains(r.RoomName)&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName))
+        .Select(r=>{
+          bool have=TryGetRoomStreamingBounds(r,out RoomStreamingBounds b);bool contains=have&&ContainsStreamingBounds(b,position,18f);
+          float boundsDistance=have?StreamingBoundsDistanceSquared(b,position):float.MaxValue;
+          bool physical=physicalRooms.TryGetValue(r.RoomName,out float physicalDistance);
+          bool semantic=semanticRooms.Contains(r.RoomName);
+          float distance=Math.Min(boundsDistance,physical?physicalDistance:float.MaxValue);
+          return (Room:r,Have:have,Contains:contains,Coarse:!have||b.Coarse,Physical:physical,Semantic:semantic,Distance:distance);
+        })
+        .Where(x=>x.Contains||x.Semantic&&x.Distance<=240f*240f||x.Physical&&x.Distance<=220f*220f)
+        .OrderBy(x=>x.Contains?0:1).ThenBy(x=>x.Room.OutdoorsVisible?1:0).ThenBy(x=>x.Physical?0:1).ThenBy(x=>x.Semantic?0:1).ThenBy(x=>x.Coarse?1:0).ThenBy(x=>x.Distance)
+        .ThenBy(x=>x.Room.RoomName,StringComparer.OrdinalIgnoreCase);
+      int localAdds=0;
+      foreach(var item in localCandidates){if(initialStreamRoomNames.Count>=maxGateRooms||localAdds>=maxLocalCandidateRooms)break;if(AddGateRoom(item.Room))localAdds++;}
+      if(initialStreamRoomNames.Count==0){Room fallback=FindStreamingRoom(position,128f);AddGateRoom(fallback);}
+
+      // Prefetch is room-based too. It can be broader than the first-frame barrier because it is normal-priority and
+      // does not decide when the loading overlay disappears. Include authored/portal neighbours plus physically local
+      // owners so a doorway already has render integration queued even when its pre-decode room bounds are inaccurate.
+      var neighbourCandidates=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      foreach(string seed in initialStreamRoomNames)foreach(string name in StreamingNeighborRoomNames(seed,32))neighbourCandidates.Add(name);
+      foreach(string name in physicalRooms.OrderBy(x=>x.Value).Select(x=>x.Key).Take(36))neighbourCandidates.Add(name);
+      foreach(string name in neighbourCandidates.Where(name=>byName.ContainsKey(name)&&!initialStreamRoomNames.Contains(name))
+        .OrderBy(name=>{
+          Room r=byName[name];float boundsDistance=TryGetRoomStreamingBounds(r,out RoomStreamingBounds b)?StreamingBoundsDistanceSquared(b,position):float.MaxValue;
+          return Math.Min(boundsDistance,physicalRooms.TryGetValue(name,out float physicalDistance)?physicalDistance:float.MaxValue);
+        })){
+        if(initialStreamPrefetchRoomNames.Count>=maxPrefetchRooms)break;initialStreamPrefetchRoomNames.Add(name);
+      }
+      if(initialStreamPrefetchRoomNames.Count<maxPrefetchRooms){
+        foreach(Room room in rooms.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName)&&!initialStreamRoomNames.Contains(r.RoomName)&&!initialStreamPrefetchRoomNames.Contains(r.RoomName)&&TryGetRoomStreamingBounds(r,out _))
+          .OrderBy(r=>{TryGetRoomStreamingBounds(r,out RoomStreamingBounds b);return StreamingBoundsDistanceSquared(b,position);})){
+          if(initialStreamPrefetchRoomNames.Count>=maxPrefetchRooms)break;
+          TryGetRoomStreamingBounds(room,out RoomStreamingBounds bounds);if(StreamingBoundsDistanceSquared(bounds,position)>240f*240f)break;initialStreamPrefetchRoomNames.Add(room.RoomName);
+        }
+      }
+
+      // Only assets belonging to actual gate rooms decide first-frame readiness. This keeps the invariant useful:
+      // every barrier GR2 has a room whose render/floor placements are also required below. Arbitrary nearby assets
+      // remain speculative prefetch and can no longer make IsInitialStreamAssetDisplayReady() return true too early.
+      foreach(ulong assetId in initialStreamAssetIds){
+        float roomDistance=InitialStreamAssetDistanceUncached(assetId,position);
+        initialStreamAssetDistances[assetId]=roomDistance;
+      }
+    }
+
+    private static float PointAabbDistanceSquared(Vector3 p,Vector3 min,Vector3 max){
+      float dx=p.X<min.X?min.X-p.X:(p.X>max.X?p.X-max.X:0f),dy=p.Y<min.Y?min.Y-p.Y:(p.Y>max.Y?p.Y-max.Y:0f),dz=p.Z<min.Z?min.Z-p.Z:(p.Z>max.Z?p.Z-max.Z:0f);return dx*dx+dy*dy+dz*dz;
+    }
+
+    private float InitialStreamAssetDistanceUncached(ulong assetId,Vector3 position){
+      float best=float.MaxValue;
+      foreach(string roomName in initialStreamRoomNames){
+        if(!streamRoomAssetHints.TryGetValue(roomName,out Dictionary<ulong,StreamRoomAssetHint> roomHints)||!roomHints.TryGetValue(assetId,out StreamRoomAssetHint hint)||hint==null||!hint.Any)continue;
+        best=Math.Min(best,PointAabbDistanceSquared(position,hint.Min,hint.Max));
+      }
+      return best;
+    }
+
+    private float InitialStreamAssetDistance(ulong assetId)=>initialStreamAssetDistances.TryGetValue(assetId,out float distance)?distance:InitialStreamAssetDistanceUncached(assetId,camera.Position);
+
+    private void RequestInitialStreamWorkingSet(){
+      if(modelStreamer==null||initialStreamAssetIds.Count==0)return;
+      activeStreamRoomNames.UnionWith(initialStreamRoomNames);activeStreamAssetIds.UnionWith(initialStreamAssetIds);urgentStreamAssetIds.UnionWith(initialStreamAssetIds);
+      // Build collision/floor data for the same small spawn shell while the overlay is still up. This lets
+      // FindCameraRoom become authoritative before normal runtime demand starts instead of continuing from an
+      // outdoor/spaceport fallback underneath a not-yet-decoded hangar.
+      // Room-floor classification is deferred detail, not visible-shell work. Keep only the nearest few gate rooms in
+      // that CPU-heavy queue while the overlay is up; once the scene starts, normal anchor/phase demand continues it.
+      // Prefer the interior cells that actually contain the spawn. Distance alone is often tied at zero for several
+      // overlapping Corellia cells, and HashSet order could otherwise spend every expensive floor slot on the
+      // generic outdoor/base rooms underneath the hangar.
+      foreach(string roomName in initialStreamRoomNames.Select(name=>{
+        Room r=rooms.FirstOrDefault(x=>x!=null&&String.Equals(x.RoomName,name,StringComparison.OrdinalIgnoreCase));
+        RoomStreamingBounds b=null;bool have=r!=null&&TryGetRoomStreamingBounds(r,out b);
+        bool contains=have&&ContainsStreamingBounds(b,camera.Position,12f);
+        float distance=have?StreamingBoundsDistanceSquared(b,camera.Position):float.MaxValue;
+        return (Name:name,Room:r,Contains:contains,Distance:distance);
+      }).OrderBy(x=>x.Contains?0:1).ThenBy(x=>x.Room!=null&&x.Room.OutdoorsVisible?1:0).ThenBy(x=>x.Distance).ThenBy(x=>x.Name,StringComparer.OrdinalIgnoreCase).Take(4).Select(x=>x.Name))floorStreamRoomNames.Add(roomName);
+      // Schedule by distance across the whole startup shell instead of filling all 96 slots from the first room in
+      // dictionary order. This is the C# equivalent of Jedipedia's global priority queue/backpressure behaviour.
+      foreach(ulong assetId in initialStreamAssetIds.OrderBy(InitialStreamAssetDistance))
+        if(streamRequestsByAsset.TryGetValue(assetId,out WorldModelStreamRequest request))modelStreamer.Request(request,true);
+      // Adjacent rooms are useful immediately after the gate drops, but are not themselves a reason to hold the
+      // first frame. Keep a bounded normal-priority ring resident/queued behind the urgent spawn shell.
+      foreach(string roomName in initialStreamPrefetchRoomNames)RequestRoomModels(roomName,false,48,true);
+      // Full DDS resources are not part of structural first-frame readiness. Warm only the nearest slice so texture
+      // uploads cannot starve GR2/GPU work for the rest of the hangar shell.
+      // Do not let MAT/DDS archive traffic compete with the missing structural shell. Jedipedia's loader has separate
+      // bands/backpressure; in this local streamer the equivalent is to start texture refinement only once most of the
+      // startup GR2 set has already been installed. The first frame is allowed to show metadata-only fallback materials.
+      int installedGeometry=initialStreamAssetIds.Count(id=>models.ContainsKey(id));
+      // Keep GR2/TOR bandwidth exclusive until every visible first-frame asset is installed. The previous 75%
+      // threshold started two MAT workers while the last quarter of a hangar shell was still waiting on the same
+      // archives, extending exactly the missing-geometry phase the startup gate is meant to minimize.
+      int materialWarmThreshold=Math.Max(1,initialStreamAssetIds.Count);
+      if(installedGeometry>=materialWarmThreshold)foreach(ulong assetId in initialStreamAssetIds.OrderBy(InitialStreamAssetDistance).Take(24)){
+        materialStreamAssetIds.Add(assetId);
+        if(models.TryGetValue(assetId,out GR2 model)&&model!=null)QueueStreamedModelMaterials(model);
+      }
+    }
+
+    private void MarkRoomMaterialDemand(string roomName,int limit=-1){
+      if(String.IsNullOrWhiteSpace(roomName)||!streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> requests))return;
+      IEnumerable<WorldModelStreamRequest> ordered=requests.OrderBy(x=>StreamRequestDistance(roomName,x.AssetId));
+      if(limit>=0)ordered=ordered.Take(limit);
+      foreach(WorldModelStreamRequest request in ordered){
+        if(request==null)continue;materialStreamAssetIds.Add(request.AssetId);
+        if(models.TryGetValue(request.AssetId,out GR2 model)&&model!=null)QueueStreamedModelMaterials(model);
+      }
+    }
+
+    private float StreamRoomDistanceSquared(string roomName){
+      if(String.IsNullOrWhiteSpace(roomName))return float.MaxValue;
+      Room room=rooms.FirstOrDefault(r=>r!=null&&String.Equals(r.RoomName,roomName,StringComparison.OrdinalIgnoreCase));
+      if(room!=null&&TryGetRoomStreamingBounds(room,out RoomStreamingBounds bounds))return StreamingBoundsDistanceSquared(bounds,camera.Position);
+      if(streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> requests)&&requests!=null&&requests.Count>0)
+        return requests.Min(x=>x==null?float.MaxValue:StreamRequestDistance(roomName,x.AssetId));
+      return float.MaxValue;
+    }
+
+    private void RequestVisibleRoomMaterials(HashSet<string> visible,Room anchor,string activeSky){
+      if(initialStreamLoading)return;
+      MarkRoomMaterialDemand(anchor?.RoomName);
+      if(visible==null||visible.Count==0)return;
+
+      // Direct doorway neighbours need more than a tiny texture slice: otherwise their geometry is present but large
+      // sections remain white/flat until the room becomes the anchor. Prewarm the two nearest direct cells strongly,
+      // then use a wider bounded budget for the rest of the visible set.
+      var prewarmed=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      foreach(string roomName in DirectStreamingNeighborRoomNames(anchor?.RoomName??String.Empty).OrderBy(StreamRoomDistanceSquared).Take(2)){
+        if(String.IsNullOrWhiteSpace(roomName)||String.Equals(roomName,activeSky,StringComparison.OrdinalIgnoreCase))continue;
+        MarkRoomMaterialDemand(roomName,160);prewarmed.Add(roomName);
+      }
+      foreach(string roomName in ActiveStreamTransitionRoomNames()){MarkRoomMaterialDemand(roomName,128);prewarmed.Add(roomName);}
+      int budget=320;
+      foreach(string roomName in visible
+        .Where(name=>!String.IsNullOrWhiteSpace(name)
+          &&!String.Equals(name,anchor?.RoomName,StringComparison.OrdinalIgnoreCase)
+          &&!String.Equals(name,activeSky,StringComparison.OrdinalIgnoreCase)
+          &&!String.Equals(name,"_everywhere_",StringComparison.OrdinalIgnoreCase)
+          &&!prewarmed.Contains(name))
+        .OrderBy(StreamRoomDistanceSquared)
+        .ThenBy(name=>name,StringComparer.OrdinalIgnoreCase)){
+        if(budget<=0)break;
+        int slice=Math.Min(64,budget);
+        MarkRoomMaterialDemand(roomName,slice);
+        budget-=slice;
+      }
+    }
+
+    private void RequestActiveSkyModels(AreaEnvironmentScheme env,WorldRenderSettings s){
+      if(modelStreamer==null||s==null||!s.ShowSky||s.Mode==WorldRenderMode.Map||s.Mode==WorldRenderMode.Heightmap)return;
+      string activeSky=ResolveSkyRoomName(env);
+      if(String.IsNullOrWhiteSpace(activeSky)||String.Equals(activeSky,"_everywhere_",StringComparison.OrdinalIgnoreCase))return;
+
+      // Sky rendering is independent of the camera-room resolver. Previously the sky only received a tiny one-shot
+      // request during LoadModel(), so while FindCameraRoom was unresolved (or for sky assets beyond the hot slice)
+      // decoded GR2s were never eligible for GPU upload and their MAT/DDS resources were never demanded. Keep the
+      // active skyscene resident explicitly and let its textures refine behind structural room work.
+      PinRoomStreamAssets(activeSky,-1);
+      RequestRoomModels(activeSky,false,96,true);
+      if(!initialStreamLoading)MarkRoomMaterialDemand(activeSky,96);
+    }
+
+    private void QueueNewlyDemandedRoomIntegrations(){
+      foreach(string roomName in activeStreamRoomNames)if(!previousStreamRoomNames.Contains(roomName))QueueRoomStreamIntegrations(roomName);
+      previousStreamRoomNames.Clear();previousStreamRoomNames.UnionWith(activeStreamRoomNames);
+      foreach(string roomName in floorStreamRoomNames)if(!previousFloorStreamRoomNames.Contains(roomName))QueueRoomStreamFloorIntegrations(roomName);
+      previousFloorStreamRoomNames.Clear();previousFloorStreamRoomNames.UnionWith(floorStreamRoomNames);
+    }
+
+    private void QueueRoomStreamFloorIntegrations(string roomName){
+      if(String.IsNullOrWhiteSpace(roomName)||!streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> requests))return;
+      if(!streamPlacementsByRoomAsset.TryGetValue(roomName,out Dictionary<ulong,List<(Room Room,AssetInstance Instance)>> roomPlacements))return;
+      foreach(WorldModelStreamRequest request in requests){
+        if(request==null||!models.TryGetValue(request.AssetId,out GR2 model)||model==null||!roomPlacements.TryGetValue(request.AssetId,out List<(Room Room,AssetInstance Instance)> local))continue;
+        QueueStreamedFloorIntegration(request.AssetId,model,roomName,local);
+      }
+    }
+
+    private void QueueRoomStreamIntegrations(string roomName){
+      if(String.IsNullOrWhiteSpace(roomName)||!streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> requests))return;
+      foreach(WorldModelStreamRequest request in requests)if(request!=null&&models.TryGetValue(request.AssetId,out GR2 model)&&model!=null)QueueStreamedModelIntegration(request.AssetId,model,roomName);
+    }
+
+    private void RequestSkyModels() {
+      if(modelStreamer==null)return;
+      // Opportunistic startup prefetch only. Runtime residency is owned by RequestActiveSkyModels(), which also
+      // works before/without a stable camera-room result and requests the skyscene's material resources.
+      foreach(string roomName in skyRoomNames) RequestRoomModels(roomName,false,4);
+    }
+    private Dictionary<string,float> SpatialBootstrapRoomDistances(Vector3 position,float radius){
+      var distances=new Dictionary<string,float>(StringComparer.OrdinalIgnoreCase);if(streamBootstrapRoomsByCell.Count==0||radius<=0f)return distances;
+      float radiusSquared=radius*radius;int minX=StreamBootstrapCell(position.X-radius),maxX=StreamBootstrapCell(position.X+radius),minZ=StreamBootstrapCell(position.Z-radius),maxZ=StreamBootstrapCell(position.Z+radius);
+      for(int x=minX;x<=maxX;x++)for(int z=minZ;z<=maxZ;z++){
+        if(!streamBootstrapRoomsByCell.TryGetValue((x,z),out HashSet<string> cellRooms))continue;
+        float dx=(x+.5f)*StreamBootstrapCellSize-position.X,dz=(z+.5f)*StreamBootstrapCellSize-position.Z,distance=dx*dx+dz*dz;
+        if(distance>radiusSquared)continue;
+        foreach(string roomName in cellRooms)if(!String.IsNullOrWhiteSpace(roomName)&&(!distances.TryGetValue(roomName,out float oldDistance)||distance<oldDistance))distances[roomName]=distance;
+      }
+      return distances;
+    }
+    private void RequestSpatialBootstrapRooms(Vector3 position,Room anchor,float radius,int roomLimit){
+      if(modelStreamer==null||streamBootstrapRoomsByCell.Count==0||roomLimit<=0||radius<=0f)return;
+      Dictionary<string,float> distances=SpatialBootstrapRoomDistances(position,radius);if(distances.Count==0)return;
+      var byName=rooms.Where(r=>r!=null&&!String.IsNullOrWhiteSpace(r.RoomName))
+        .GroupBy(r=>r.RoomName,StringComparer.OrdinalIgnoreCase).ToDictionary(g=>g.Key,g=>g.First(),StringComparer.OrdinalIgnoreCase);
+      bool weakAnchor=anchor==null||IsEverywhereRoom(anchor);
+      if(!weakAnchor){if(!TryGetRoomStreamingBounds(anchor,out RoomStreamingBounds anchorBounds)||anchorBounds.Coarse)weakAnchor=true;}
+      var ranked=distances.Where(x=>byName.ContainsKey(x.Key))
+        .Select(x=>{
+          Room room=byName[x.Key];bool have=TryGetRoomStreamingBounds(room,out RoomStreamingBounds b);
+          bool contains=have&&ContainsStreamingBounds(b,position,12f);
+          return (Room:room,Distance:x.Value,Contains:contains,Coarse:!have||b.Coarse);
+        })
+        .Where(x=>x.Room!=null&&!IsEverywhereRoom(x.Room)&&!skyRoomNames.Contains(x.Room.RoomName))
+        // A nearby interior is especially valuable when the authoritative floor lookup still reports the outdoor cell
+        // underneath it. Exact/containing rooms outrank origin-only hints; everything else remains normal prefetch.
+        .OrderBy(x=>x.Contains?0:1).ThenBy(x=>weakAnchor&&!x.Room.OutdoorsVisible?0:1).ThenBy(x=>x.Coarse?1:0).ThenBy(x=>x.Distance)
+        .ThenBy(x=>x.Room.RoomName,StringComparer.OrdinalIgnoreCase).Take(roomLimit).ToList();
+      int urgentFallbacks=0;
+      foreach(var item in ranked){
+        bool urgent=weakAnchor&&item.Contains&&!item.Room.OutdoorsVisible&&urgentFallbacks<2;
+        if(urgent)urgentFallbacks++;
+        PinRoomStreamAssets(item.Room.RoomName,urgent?-1:160,urgent);
+        RequestRoomModels(item.Room.RoomName,urgent,urgent?128:64,true);
+      }
+    }
+    private Dictionary<ulong,float> SpatialBootstrapAssetDistances(Vector3 position,float radius){
+      var distances=new Dictionary<ulong,float>();if(streamBootstrapAssetsByCell.Count==0||radius<=0f)return distances;
+      float radiusSquared=radius*radius;int minX=StreamBootstrapCell(position.X-radius),maxX=StreamBootstrapCell(position.X+radius),minZ=StreamBootstrapCell(position.Z-radius),maxZ=StreamBootstrapCell(position.Z+radius);
+      for(int x=minX;x<=maxX;x++)for(int z=minZ;z<=maxZ;z++){
+        if(!streamBootstrapAssetsByCell.TryGetValue((x,z),out HashSet<ulong> cellAssets))continue;
+        float dx=(x+.5f)*StreamBootstrapCellSize-position.X,dz=(z+.5f)*StreamBootstrapCellSize-position.Z,distance=dx*dx+dz*dz;
+        if(distance>radiusSquared)continue;
+        foreach(ulong assetId in cellAssets)if(!distances.TryGetValue(assetId,out float oldDistance)||distance<oldDistance)distances[assetId]=distance;
+      }
+      return distances;
+    }
+
+    private void RequestSpatialBootstrapModels(Vector3 position,float radius,int requestedLimit,bool highPriority){
+      if(modelStreamer==null||streamBootstrapAssetsByCell.Count==0||requestedLimit<=0)return;
+      // Do not rescan every placement here: Corellia has hundreds of thousands. A cell-centre distance is enough
+      // to rank a 48-unit streaming cell and keeps this request path bounded to the nearby grid buckets.
+      Dictionary<ulong,float> distances=SpatialBootstrapAssetDistances(position,radius);
+      var ordered=distances.OrderBy(x=>x.Value).Select(x=>x.Key);
+      IEnumerable<ulong> candidates;
+      if(highPriority){
+        int promotionLimit=Math.Min(16,Math.Max(1,requestedLimit/4));
+        List<ulong> promotions=ordered.Where(id=>modelStreamer.IsNormalQueued(id)).Take(promotionLimit).ToList();
+        candidates=promotions.Concat(ordered.Where(id=>!modelStreamer.IsKnown(id)).Take(Math.Max(0,requestedLimit-promotions.Count)));
+      }else candidates=ordered.Where(id=>!modelStreamer.IsKnown(id)).Take(requestedLimit);
+      foreach(ulong assetId in candidates)if(streamRequestsByAsset.TryGetValue(assetId,out WorldModelStreamRequest request)){if(highPriority){activeStreamAssetIds.Add(assetId);urgentStreamAssetIds.Add(assetId);}modelStreamer.Request(request,highPriority);}
+    }
+    private void RequestCameraRoomModels(Room room,bool highPriority) {
+      if(room==null)return;RequestRoomModels(room.RoomName,highPriority);
+      // Direct neighbours are speculative but persistent demand. The old path queued them as low priority and then
+      // CancelQueuedExcept() removed them in the very same frame because only high-priority IDs entered activeStreamAssetIds.
+      foreach(string neighbour in StreamingNeighborRoomNames(room.RoomName,32))RequestRoomModels(neighbour,false,96,true);
+    }
+    private bool IsStreamAssetActivelyDemanded(ulong assetId) {
+      if(activeStreamAssetIds.Contains(assetId)||(initialStreamLoading&&initialStreamAssetIds.Contains(assetId)))return true;
+      if(!streamPlacementsByAsset.TryGetValue(assetId,out List<(Room Room,AssetInstance Instance)> placements)||placements==null)return false;
+      // activeStreamRoomNames is the semantic residency set (camera, visible neighbours, transition rooms and
+      // camera-ahead rooms).  A bounded hot asset slice controls queue priority only; it must not make another
+      // decoded asset from the same still-active room ineligible for GPU residency.
+      foreach(var placement in placements)
+        if(placement.Room!=null&&activeStreamRoomNames.Contains(placement.Room.RoomName))return true;
+      return false;
+    }
+
+    private void PinRoomStreamAssets(string roomName,int limit,bool urgent=false) {
+      if(String.IsNullOrWhiteSpace(roomName)||!streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> requests))return;
+      IEnumerable<WorldModelStreamRequest> ordered=requests.OrderBy(x=>StreamRequestDistance(roomName,x.AssetId));
+      if(limit>=0)ordered=ordered.Take(limit);
+      foreach(WorldModelStreamRequest request in ordered){
+        if(request==null)continue;
+        activeStreamAssetIds.Add(request.AssetId);if(urgent)urgentStreamAssetIds.Add(request.AssetId);
+        // A model may already be decoded because it belonged to a neighbour earlier, while its D3D upload was
+        // intentionally dropped after that room fell out of the hot set. Re-pinning the room must also re-arm the
+        // GPU upload; otherwise the GR2 stays "known" forever and the corresponding wall/floor never appears.
+        if(models.TryGetValue(request.AssetId,out GR2 decodedModel)&&decodedModel!=null&&!modelGeometryPrepared.Contains(decodedModel))
+          QueueModelGpuUpload(decodedModel);
+      }
+    }
+
+    private void PinVisibleRoomStreamAssets(string roomName,int hotLimit,int recoveryLimit=32){
+      PinRoomStreamAssets(roomName,hotLimit);
+      if(String.IsNullOrWhiteSpace(roomName)||recoveryLimit<=0||!streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> requests))return;
+
+      // A normal-priority neighbour can contain more assets than its bounded hot slice. Once asset 65+ had decoded,
+      // it became "known", stopped appearing in RequestRoomModels() candidates, and was therefore no longer in
+      // activeStreamAssetIds when its GPU upload was processed. The upload was dropped every frame until that room
+      // became the anchor. Keep a small rolling recovery set for decoded-but-not-yet-uploaded visible assets so a
+      // stationary doorway view converges instead of requiring the user to enter/leave the room to kick it again.
+      int recovered=0;
+      foreach(WorldModelStreamRequest request in requests.OrderBy(x=>StreamRequestDistance(roomName,x.AssetId))){
+        if(request==null||!models.TryGetValue(request.AssetId,out GR2 model)||model==null||modelGeometryPrepared.Contains(model))continue;
+        activeStreamAssetIds.Add(request.AssetId);
+        QueueModelGpuUpload(model);
+        if(++recovered>=recoveryLimit)break;
+      }
+    }
+    private void RequestRoomModels(string roomName,bool highPriority,int requestedLimit=-1,bool keepQueued=false) {
+      if(modelStreamer==null||String.IsNullOrWhiteSpace(roomName)||!streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> requests))return;
+      if(highPriority||keepQueued)activeStreamRoomNames.Add(roomName);
+      // A connected room needs its shell, floor and doorway pieces together.  The earlier 12/3
+      // slice could consume the complete in-flight budget with props and leave a hangar without
+      // a floor. This stays memory-safe: the streamer has a bounded work set and View_AREA
+      // evicts cold CPU/GPU residency independently.
+      int limit=requestedLimit>=0?requestedLimit:(highPriority?64:12);
+      IEnumerable<WorldModelStreamRequest> ordered=requests.OrderBy(x=>StreamRequestDistance(roomName,x.AssetId));
+      // Keep a small promotion slice, then fill the remaining budget exclusively with unknown assets.  The old
+      // `Take(limit)` over all high-priority entries kept returning the same already-decoded nearest 64 forever;
+      // the rest of a hangar therefore never entered the decoder at all.
+      IEnumerable<WorldModelStreamRequest> candidates;
+      if(highPriority){
+        int promotionLimit=Math.Min(12,Math.Max(1,limit/4));
+        // Promote requests that are actually waiting in the normal band. Using IsKnown() here selected already
+        // decoded/worker-owned nearest assets over and over, so the remainder of a neighbour that became current
+        // could stay low-priority for seconds.
+        List<WorldModelStreamRequest> promotions=ordered.Where(x=>modelStreamer.IsNormalQueued(x.AssetId)).Take(promotionLimit).ToList();
+        candidates=promotions.Concat(ordered.Where(x=>!modelStreamer.IsKnown(x.AssetId)).Take(Math.Max(0,limit-promotions.Count)));
+      }else candidates=ordered.Where(x=>!modelStreamer.IsKnown(x.AssetId)).Take(limit);
+      foreach(WorldModelStreamRequest request in candidates){if(highPriority||keepQueued)activeStreamAssetIds.Add(request.AssetId);if(highPriority)urgentStreamAssetIds.Add(request.AssetId);modelStreamer.Request(request,highPriority);}
+    }
+    private float StreamRequestDistance(string roomName,ulong assetId) {
+      if(String.IsNullOrWhiteSpace(roomName)||!streamRoomAssetHints.TryGetValue(roomName,out Dictionary<ulong,StreamRoomAssetHint> roomHints)||!roomHints.TryGetValue(assetId,out StreamRoomAssetHint hint)||hint==null||!hint.Any)return float.MaxValue;
+      return PointAabbDistanceSquared(camera.Position,hint.Min,hint.Max);
+    }
+    private void RequestVisibleRoomModels(HashSet<string> visible,Room cameraRoom,AreaEnvironmentScheme env,WorldRenderSettings s) {
+      if(modelStreamer==null||s?.Mode==WorldRenderMode.Map)return;
+      // GR2 floors/bounds arrive lazily. Use a separate conservative placement-bounds anchor until the authoritative
+      // room locator has enough geometry, rather than waiting for camera motion to discover the spawn/next room.
+      Room anchor=cameraRoom!=null&&!IsEverywhereRoom(cameraRoom)?cameraRoom:displayCameraRoom;
+      anchor=ResolveStreamingRoom(camera.Position,anchor);
+      activeStreamAssetIds.Clear();urgentStreamAssetIds.Clear();materialStreamAssetIds.Clear();activeStreamRoomNames.Clear();floorStreamRoomNames.Clear();
+      if(anchor!=null&&!IsEverywhereRoom(anchor)&&!skyRoomNames.Contains(anchor.RoomName))floorStreamRoomNames.Add(anchor.RoomName);
+      Room phaseRoom=FindPhaseTriggerRoom(camera.Position);
+      bool havePhaseRoom=phaseRoom!=null&&!IsEverywhereRoom(phaseRoom)&&!skyRoomNames.Contains(phaseRoom.RoomName);
+      if(havePhaseRoom)floorStreamRoomNames.Add(phaseRoom.RoomName);
+      // The authoritative floor room and the tightest streamed-bounds room are deliberately separate signals.
+      // A broad Corellia spaceport floor can keep winning FindCameraRoom() while the camera has already entered a
+      // nested hangar/corridor whose collision has not been streamed yet. If only the authoritative room is demanded,
+      // that inner room falls out of residency after the transition grace expires and can never contribute the floor
+      // that would make it authoritative: a streaming chicken-and-egg loop. Jedipedia builds dPVS/floor membership
+      // from all room detail up front; while PugTools streams it, keep the best spatial candidate alive in parallel.
+      Room spatialRoom=FindStreamingRoom(camera.Position,160f);
+      bool haveSpatialRoom=spatialRoom!=null&&!IsEverywhereRoom(spatialRoom)&&!skyRoomNames.Contains(spatialRoom.RoomName)
+        &&!String.Equals(spatialRoom.RoomName,anchor?.RoomName,StringComparison.OrdinalIgnoreCase);
+      if(haveSpatialRoom)floorStreamRoomNames.Add(spatialRoom.RoomName);
+      // A phase gateway can be the only semantic evidence that the camera is inside a class/story hangar while the
+      // generic spaceport floor underneath still wins FindCameraRoom(). The previous transition grace kept the hangar
+      // alive for ~6 seconds, then it disappeared exactly as reported. Treat the phase owner as persistent demand for
+      // as long as the camera remains inside the authored trigger, not as a temporary hand-off room.
+      if(havePhaseRoom){PinRoomStreamAssets(phaseRoom.RoomName,-1,true);RequestRoomModels(phaseRoom.RoomName,true,256,true);}
+      if(haveSpatialRoom){PinRoomStreamAssets(spatialRoom.RoomName,-1,true);RequestRoomModels(spatialRoom.RoomName,true,256,true);}
+      // The startup shell is an immutable demand set. Keep requesting it even if partially decoded floors cause the
+      // authoritative camera-room resolver to oscillate between an overlapping base room and the phase interior.
+      if(initialStreamLoading)RequestInitialStreamWorkingSet();
+      else if(UseInitialStreamVisibilityGrace())foreach(string roomName in initialStreamRoomNames)RequestRoomModels(roomName,false,64,true);
+      PinRoomStreamAssets(anchor?.RoomName,-1,true);
+      var directNeighbourSet=new HashSet<string>(DirectStreamingNeighborRoomNames(anchor?.RoomName??String.Empty),StringComparer.OrdinalIgnoreCase);
+      if(havePhaseRoom)foreach(string neighbour in DirectStreamingNeighborRoomNames(phaseRoom.RoomName))directNeighbourSet.Add(neighbour);
+      if(haveSpatialRoom)foreach(string neighbour in DirectStreamingNeighborRoomNames(spatialRoom.RoomName))directNeighbourSet.Add(neighbour);
+      List<string> directNeighbours=directNeighbourSet
+        .Where(name=>!String.Equals(name,"_everywhere_",StringComparison.OrdinalIgnoreCase)&&!skyRoomNames.Contains(name)
+          &&!String.Equals(name,anchor?.RoomName,StringComparison.OrdinalIgnoreCase)
+          &&(!havePhaseRoom||!String.Equals(name,phaseRoom.RoomName,StringComparison.OrdinalIgnoreCase))
+          &&(!haveSpatialRoom||!String.Equals(name,spatialRoom.RoomName,StringComparison.OrdinalIgnoreCase)))
+        .OrderBy(StreamRoomDistanceSquared).ThenBy(name=>name,StringComparer.OrdinalIgnoreCase).Take(6).ToList();
+      // Build collision for the nearest doorway cells before the camera crosses into them. Previously only the
+      // authoritative current room had floor indexing, so Walking Mode could enter a fully visible neighbour one
+      // frame before its collision triangles existed and start falling through the spaceport floor.
+      foreach(string floorNeighbour in directNeighbours.Take(2))floorStreamRoomNames.Add(floorNeighbour);
+      for(int i=0;i<directNeighbours.Count;i++)PinRoomStreamAssets(directNeighbours[i],i<2?-1:192);
+      foreach(string roomName in ActiveStreamTransitionRoomNames())PinRoomStreamAssets(roomName,-1);
+      if(visible!=null)foreach(string roomName in visible)if(!String.Equals(roomName,anchor?.RoomName,StringComparison.OrdinalIgnoreCase)&&!directNeighbours.Contains(roomName,StringComparer.OrdinalIgnoreCase))PinVisibleRoomStreamAssets(roomName,96,48);
+
+      // Semantic room demand must get queue admission before the physical bootstrap. During the first-frame geometry
+      // barrier MAT/DDS work stays deferred; after that visible neighbours receive a bounded refinement budget too.
+      RequestCameraRoomModels(anchor,true);
+      for(int i=0;i<directNeighbours.Count;i++)RequestRoomModels(directNeighbours[i],false,i<2?192:128,true);
+      foreach(string roomName in ActiveStreamTransitionRoomNames())RequestRoomModels(roomName,false,128,true);
+      if(visible!=null)foreach(string roomName in visible) {
+        bool isAnchor=String.Equals(roomName,anchor?.RoomName,StringComparison.OrdinalIgnoreCase)
+          ||(haveSpatialRoom&&String.Equals(roomName,spatialRoom.RoomName,StringComparison.OrdinalIgnoreCase))
+          ||(havePhaseRoom&&String.Equals(roomName,phaseRoom.RoomName,StringComparison.OrdinalIgnoreCase));
+        bool sharedBackground=String.Equals(roomName,"_everywhere_",StringComparison.OrdinalIgnoreCase);
+        bool direct=directNeighbours.Contains(roomName,StringComparer.OrdinalIgnoreCase);
+        // Current room owns the high band. Direct/visible neighbours stay persistent in the normal band so they
+        // prefetch continuously without taking decoder slots away from missing current-room shell pieces.
+        RequestRoomModels(roomName,isAnchor,sharedBackground?12:(isAnchor?192:(direct?128:96)),!isAnchor&&!sharedBackground);
+      }
+      string activeSky=ResolveSkyRoomName(env);
+      RequestVisibleRoomMaterials(visible,anchor,activeSky);
+      RequestCameraAheadModels(anchor);
+      RequestActiveSkyModels(env,s);
+      // The old bootstrap requested nearby asset IDs without demanding their owner rooms. Those GR2s could decode and
+      // upload successfully yet never receive render placements, while the same rolling asset slice also displaced
+      // semantic neighbour work from the high queue. Resolve physical proximity to room owners instead.
+      bool needWideBootstrap=anchor==null||IsEverywhereRoom(anchor);
+      if(!needWideBootstrap){if(!TryGetRoomStreamingBounds(anchor,out RoomStreamingBounds anchorStreamingBounds)||anchorStreamingBounds.Coarse)needWideBootstrap=true;}
+      RequestSpatialBootstrapRooms(camera.Position,anchor,needWideBootstrap?380f:300f,needWideBootstrap?16:12);
+      QueueNewlyDemandedRoomIntegrations();
+
+      if(initialStreamLoading)activeStreamAssetIds.UnionWith(initialStreamAssetIds);
+      // Cancellation is queue backpressure, not residency eviction. Preserve every already-admitted request whose room
+      // is still part of current/neighbour/prediction demand, even when that asset sits outside the bounded hot pin slice.
+      queuedStreamDemandAssetIds.Clear();queuedStreamDemandAssetIds.UnionWith(activeStreamAssetIds);
+      foreach(string roomName in activeStreamRoomNames)if(streamRequestsByRoom.TryGetValue(roomName,out List<WorldModelStreamRequest> demandedRequests))
+        foreach(WorldModelStreamRequest request in demandedRequests)if(request!=null)queuedStreamDemandAssetIds.Add(request.AssetId);
+      if(initialStreamLoading)queuedStreamDemandAssetIds.UnionWith(initialStreamAssetIds);
+      modelStreamer.CancelQueuedExcept(queuedStreamDemandAssetIds);
+    }
+    private void RequestCameraAheadModels(Room cameraRoom) {
+      // Keep a persistent multi-distance forward cone. A single 120-unit sample often jumped over Corellia's narrow
+      // transition cell or selected the outdoor room beneath an elevated hangar, so the real next room did not become
+      // urgent until after the camera crossed the threshold.
+      Vector3 look=-camera.Look;look.Y=0;if(look.LengthSquared()<.0001f)return;look.Normalize();
+      bool moved=(camera.Position-streamPrefetchAnchor).LengthSquared()>36f;
+      bool turned=streamPrefetchLook.LengthSquared()<.0001f||Vector3.Dot(look,streamPrefetchLook)<.96f;
+      bool roomChanged=!String.Equals(streamPrefetchRoom,cameraRoom?.RoomName,StringComparison.OrdinalIgnoreCase);
+      if(moved||turned||roomChanged||cameraAheadStreamRooms.Count==0){
+        streamPrefetchAnchor=camera.Position;streamPrefetchLook=look;streamPrefetchRoom=cameraRoom?.RoomName??String.Empty;
+        cameraAheadStreamRooms.Clear();urgentCameraAheadStreamRooms.Clear();
+        void AddAhead(string roomName,int limit,bool urgent=false){
+          if(String.IsNullOrWhiteSpace(roomName)||String.Equals(roomName,"_everywhere_",StringComparison.OrdinalIgnoreCase)||skyRoomNames.Contains(roomName))return;
+          if(cameraAheadStreamRooms.TryGetValue(roomName,out int oldLimit))cameraAheadStreamRooms[roomName]=Math.Max(oldLimit,limit);else cameraAheadStreamRooms[roomName]=limit;
+          if(urgent)urgentCameraAheadStreamRooms.Add(roomName);
+        }
+        Room savedCurrent=currentCameraRoom,savedDisplay=displayCameraRoom;
+        foreach(float distance in new[]{60f,120f,220f}){
+          Vector3 predicted=camera.Position+look*distance;Room predictedRoom=FindCameraRoom(predicted);currentCameraRoom=savedCurrent;displayCameraRoom=savedDisplay;predictedRoom=ResolveStreamingRoom(predicted,predictedRoom);
+          if(predictedRoom==null)continue;
+          bool nextRoom=!String.Equals(predictedRoom.RoomName,cameraRoom?.RoomName,StringComparison.OrdinalIgnoreCase);
+          AddAhead(predictedRoom.RoomName,distance<=120f?256:160,nextRoom&&distance<=120f);
+          foreach(string neighbour in DirectStreamingNeighborRoomNames(predictedRoom.RoomName).OrderBy(StreamRoomDistanceSquared).Take(4))AddAhead(neighbour,distance<=120f?96:64);
+        }
+        currentCameraRoom=savedCurrent;displayCameraRoom=savedDisplay;
+        var candidates=rooms.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName)&&TryGetRoomStreamingBounds(r,out _))
+          .Select(r=>{TryGetRoomStreamingBounds(r,out RoomStreamingBounds b);Vector3 delta=b.Center-camera.Position;float length=delta.Length();float distance=Math.Max(0f,length-Math.Max(0f,b.Radius));float forward=length<.0001f?1f:Vector3.Dot(delta/Math.Max(.0001f,length),look);return (Room:r,Distance:distance,Forward:forward);})
+          .Where(x=>x.Distance<360f&&x.Forward>.05f).OrderByDescending(x=>x.Forward).ThenBy(x=>x.Distance).Take(10);
+        foreach(var candidate in candidates)AddAhead(candidate.Room.RoomName,64);
+      }
+      foreach(KeyValuePair<string,int> pair in cameraAheadStreamRooms){
+        bool urgent=urgentCameraAheadStreamRooms.Contains(pair.Key);
+        if(urgent)floorStreamRoomNames.Add(pair.Key);
+        if(urgent)PinRoomStreamAssets(pair.Key,-1,true);else PinRoomStreamAssets(pair.Key,Math.Min(192,pair.Value));
+        RequestRoomModels(pair.Key,urgent,urgent?Math.Max(256,pair.Value):pair.Value,true);
+      }
+    }
+
+    private void PumpDecodedWorldModels() {
+      if(modelStreamer==null)return;
+      // While the loading overlay is up there is no benefit in stretching a completed spawn shell over dozens of
+      // presentation frames. Drain a larger local burst; normal runtime goes back to a tight frame-time budget.
+      bool decodeBacklog=!initialStreamLoading&&modelStreamer.OutstandingCount>64;
+      int maxModels=initialStreamLoading?80:(decodeBacklog?64:32);
+      double maxMilliseconds=initialStreamLoading?16.0:(decodeBacklog?11.0:6.5);
+      var budget=System.Diagnostics.Stopwatch.StartNew();int count=0;
+      while(count<maxModels&&(count==0||budget.Elapsed.TotalMilliseconds<maxMilliseconds)&&modelStreamer.TryDequeue(out WorldModelStreamResult result)) {
+        count++;
+        if(result==null)continue;
+        try{
+          if(result.Model==null) { if(result.Error!=null)System.Diagnostics.Debug.WriteLine("World stream decode failed: "+result.Error.Message); continue; }
+          if(models.ContainsKey(result.Request.AssetId))continue;
+          models[result.Request.AssetId]=result.Model;streamedWorldModels.Add(result.Model);streamedModelAssetIds[result.Model]=result.Request.AssetId;
+          RegisterStreamedModelMaterials(result.Model);
+          // A decoded shared model is integrated only into rooms that currently demand it. Corellia has ~345k model
+          // placements but only ~1.6k unique GR2s; integrating every planet-wide placement here was the reason rooms
+          // visibly assembled for tens of seconds even though their GR2 had already finished decoding.
+          QueueStreamedModelIntegrationsForDemand(result.Request.AssetId,result.Model);
+          if(IsStreamAssetActivelyDemanded(result.Request.AssetId))QueueModelGpuUpload(result.Model);
+          // InitialStreamAssetIds is a geometry barrier, not a blanket full-DDS barrier. Only the explicitly selected
+          // texture slice/current room enters the material queue; otherwise startup I/O competes with the missing shell.
+          if(materialStreamAssetIds.Contains(result.Request.AssetId))QueueStreamedModelMaterials(result.Model);
+          if(streamedWorldModels.Count>384)TrimStreamedModelCpuResidency();
+        } finally {
+          // State 3 means only "worker finished". Publish state 5 after the result has actually been installed so the
+          // first-frame gate can never mistake a completed-queue entry for a display-ready model.
+          modelStreamer.MarkResultConsumed(result.Request.AssetId);
+        }
+      }
+      FinalizeReadyStreamRoomVisibilityBounds();
+    }
+
+    private void RegisterStreamedModelMaterials(GR2 model){
+      var seen=new HashSet<GR2>();
+      void Add(GR2 current){
+        if(current==null||!seen.Add(current))return;
+        if(current.materials!=null)for(int i=0;i<current.materials.Count;i++){
+          GR2_Material material=current.materials[i];if(material==null||String.IsNullOrWhiteSpace(material.materialName))continue;
+          if(materials.TryGetValue(material.materialName,out GR2_Material shared)&&shared!=null){
+            if(!shared.parsed&&material.parsed)materials[material.materialName]=material;
+            else current.materials[i]=material=shared;
+          }else materials[material.materialName]=material;
+          streamedWorldMaterials.Add(material);
+        }
+        if(current.attachedModels!=null)foreach(GR2 attached in current.attachedModels)Add(attached);
+      }
+      Add(model);
+    }
+
+    private void QueueStreamedModelIntegrationsForDemand(ulong assetId,GR2 model){
+      if(model==null)return;
+      var demand=new HashSet<string>(activeStreamRoomNames,StringComparer.OrdinalIgnoreCase);if(initialStreamLoading)demand.UnionWith(initialStreamRoomNames);
+      foreach(string roomName in demand)if(streamPlacementsByRoomAsset.TryGetValue(roomName,out Dictionary<ulong,List<(Room Room,AssetInstance Instance)>> byAsset)&&byAsset.ContainsKey(assetId))QueueStreamedModelIntegration(assetId,model,roomName);
+    }
+
+    private void QueueStreamedModelIntegration(ulong assetId,GR2 model,string roomName){
+      if(model==null||String.IsNullOrWhiteSpace(roomName)||!streamPlacementsByRoomAsset.TryGetValue(roomName,out Dictionary<ulong,List<(Room Room,AssetInstance Instance)>> byAsset)||!byAsset.TryGetValue(assetId,out List<(Room Room,AssetInstance Instance)> roomPlacements)||roomPlacements.Count==0)return;
+      var key=(assetId,roomName);
+      // Visible world placements go first. Hidden/editor-only copies still enter the index for the optional utility
+      // view, but must never consume the bounded commit slice ahead of the shell the player is waiting to see.
+      List<(Room Room,AssetInstance Instance)> renderPlacements=roomPlacements.Where(x=>!streamIndexedInstances.Contains(x.Instance))
+        .OrderBy(x=>InstanceVisibleInWorld(x.Instance)?0:1).ToList();
+      if(renderPlacements.Count>0&&queuedStreamedModelIntegrations.Add(key))pendingStreamedModelIntegrations.Enqueue(new PendingStreamedModelIntegration{AssetId=assetId,RoomName=roomName,Model=model,Placements=renderPlacements});
+      if(floorStreamRoomNames.Contains(roomName))QueueStreamedFloorIntegration(assetId,model,roomName,roomPlacements);
+    }
+
+    private void QueueStreamedFloorIntegration(ulong assetId,GR2 model,string roomName,List<(Room Room,AssetInstance Instance)> placements){
+      if(model==null||placements==null||placements.Count==0||String.IsNullOrWhiteSpace(roomName))return;
+      List<(Room Room,AssetInstance Instance)> local=placements.Where(x=>x.Instance!=null&&!streamFloorIndexedInstances.Contains(x.Instance)).ToList();if(local.Count==0)return;
+      var key=(assetId,roomName);if(!queuedStreamedFloorIntegrations.Add(key))return;
+      pendingStreamedFloorIntegrations.Enqueue(new PendingStreamedFloorIntegration{AssetId=assetId,RoomName=roomName,Model=model,Placements=local});
+    }
+
+    private bool IsUrgentStreamRoom(string roomName){
+      return !String.IsNullOrWhiteSpace(roomName)&&(floorStreamRoomNames.Contains(roomName)||(initialStreamLoading&&initialStreamRoomNames.Contains(roomName)));
+    }
+
+    private PendingStreamedModelIntegration DequeueNextStreamedModelIntegration(){
+      int scan=pendingStreamedModelIntegrations.Count;
+      for(int i=0;i<scan;i++){
+        PendingStreamedModelIntegration pending=pendingStreamedModelIntegrations.Dequeue();
+        if(pending==null)continue;
+        if(IsUrgentStreamRoom(pending.RoomName))return pending;
+        pendingStreamedModelIntegrations.Enqueue(pending);
+      }
+      return pendingStreamedModelIntegrations.Count>0?pendingStreamedModelIntegrations.Dequeue():null;
+    }
+
+    private void ProcessStreamedModelIntegrations(){
+      bool integrationBacklog=!initialStreamLoading&&pendingStreamedModelIntegrations.Count>24;
+      int maxPlacements=initialStreamLoading?3072:(integrationBacklog?2048:768);double maxMilliseconds=initialStreamLoading?12.0:(integrationBacklog?8.0:5.0);
+      var budget=System.Diagnostics.Stopwatch.StartNew();int count=0;
+      while(count<maxPlacements&&pendingStreamedModelIntegrations.Count>0&&(count==0||budget.Elapsed.TotalMilliseconds<maxMilliseconds)){
+        PendingStreamedModelIntegration pending=DequeueNextStreamedModelIntegration();var key=(pending?.AssetId??0UL,pending?.RoomName??String.Empty);
+        if(pending?.Model==null||!streamedWorldModels.Contains(pending.Model)||pending.Placements==null){queuedStreamedModelIntegrations.Remove(key);continue;}
+        // Do not spend the bounded commit budget finishing a room that has already fallen out of the camera/prefetch
+        // working set. Its already-added entries are harmless; the remaining slice is rebuilt when that room returns.
+        bool demanded=activeStreamRoomNames.Contains(pending.RoomName)||(initialStreamLoading&&initialStreamRoomNames.Contains(pending.RoomName));
+        if(!demanded){queuedStreamedModelIntegrations.Remove(key);continue;}
+        if(pending.NextPlacement>=pending.Placements.Count){queuedStreamedModelIntegrations.Remove(key);continue;}
+        AddStreamedModelRenderPlacement(pending.Model,pending.Placements[pending.NextPlacement++]);count++;
+        if(pending.NextPlacement<pending.Placements.Count)pendingStreamedModelIntegrations.Enqueue(pending);else queuedStreamedModelIntegrations.Remove(key);
+      }
+    }
+
+    private bool PriorityFloorStreamRoom(string roomName){
+      if(String.IsNullOrWhiteSpace(roomName))return false;
+      // floorStreamRoomNames is rebuilt every frame from the camera, phase, spatial and immediate-doorway demand.
+      // Prioritizing that exact set prevents a newly entered nested cell from waiting behind cold background floors.
+      if(floorStreamRoomNames.Contains(roomName))return true;
+      if(String.Equals(roomName,currentCameraRoom?.RoomName,StringComparison.OrdinalIgnoreCase)||String.Equals(roomName,displayCameraRoom?.RoomName,StringComparison.OrdinalIgnoreCase))return true;
+      return urgentCameraAheadStreamRooms.Contains(roomName);
+    }
+
+    private PendingStreamedFloorIntegration DequeueNextStreamedFloorIntegration(){
+      int scan=pendingStreamedFloorIntegrations.Count;
+      for(int i=0;i<scan;i++){
+        PendingStreamedFloorIntegration pending=pendingStreamedFloorIntegrations.Dequeue();
+        if(pending==null)continue;
+        if(PriorityFloorStreamRoom(pending.RoomName))return pending;
+        pendingStreamedFloorIntegrations.Enqueue(pending);
+      }
+      return pendingStreamedFloorIntegrations.Count>0?pendingStreamedFloorIntegrations.Dequeue():null;
+    }
+
+    private void ProcessStreamedFloorIntegrations(){
+      bool floorBacklog=!initialStreamLoading&&pendingStreamedFloorIntegrations.Count>12;
+      int maxPlacements=initialStreamLoading?640:(floorBacklog?320:128);int maxNewFloorModels=initialStreamLoading?20:(floorBacklog?12:6);double maxMilliseconds=initialStreamLoading?15.0:(floorBacklog?9.0:5.5);
+      var budget=System.Diagnostics.Stopwatch.StartNew();int count=0,newFloorModels=0;
+      while(count<maxPlacements&&pendingStreamedFloorIntegrations.Count>0&&(count==0||budget.Elapsed.TotalMilliseconds<maxMilliseconds)){
+        PendingStreamedFloorIntegration pending=DequeueNextStreamedFloorIntegration();var key=(pending?.AssetId??0UL,pending?.RoomName??String.Empty);
+        if(pending?.Model==null||!streamedWorldModels.Contains(pending.Model)||pending.Placements==null){queuedStreamedFloorIntegrations.Remove(key);continue;}
+        bool demanded=floorStreamRoomNames.Contains(pending.RoomName);
+        if(!demanded){queuedStreamedFloorIntegrations.Remove(key);continue;}
+        if(pending.NextPlacement>=pending.Placements.Count){queuedStreamedFloorIntegrations.Remove(key);continue;}
+        bool needsFloorBuild=!modelFloorData.ContainsKey(pending.Model);
+        if(needsFloorBuild&&newFloorModels>=maxNewFloorModels){pendingStreamedFloorIntegrations.Enqueue(pending);break;}
+        AddStreamedModelFloorPlacement(pending.Model,pending.Placements[pending.NextPlacement++]);count++;
+        if(needsFloorBuild)newFloorModels++;
+        if(pending.NextPlacement<pending.Placements.Count)pendingStreamedFloorIntegrations.Enqueue(pending);else queuedStreamedFloorIntegrations.Remove(key);
+      }
+    }
+
+    private void AddStreamedModelRenderPlacement(GR2 model,(Room Room,AssetInstance Instance) placement){
+      Room room=placement.Room;AssetInstance inst=placement.Instance;
+      if(room==null||inst==null)return;
+      if(streamIndexedInstances.Add(inst)&&InstanceCanEnterRenderIndex(inst)){
+        Matrix world=InstanceWorld(inst,room);Vector3 center;float radius;
+        if(!TryModelSphere(model,world,out center,out radius)){center=new Vector3(world.M41,world.M42,world.M43);radius=0f;}
+        if(IsFinite(center)){
+          var entry=new RenderEntry{Room=room,Instance=inst,Model=model,World=world,Center=center,Radius=radius,Kind=RenderKindModel};
+          if(!renderEntriesByRoom.TryGetValue(room.RoomName,out List<RenderEntry> roomEntries))renderEntriesByRoom[room.RoomName]=roomEntries=new List<RenderEntry>();roomEntries.Add(entry);
+          if(inst.PathFollowerAnimated){renderGlobal.Add(entry);walkingPathFollowerRenderEntries.Add(entry);}
+          else if(entry.Radius>RenderIndexedRadiusLimit)renderGlobal.Add(entry);
+          else {var key=(RenderCell(entry.Center.X),RenderCell(entry.Center.Z));if(!renderGrid.TryGetValue(key,out List<RenderEntry> bucket))renderGrid[key]=bucket=new List<RenderEntry>();bucket.Add(entry);}
+        }
+      }
+    }
+
+    private void AddStreamedModelFloorPlacement(GR2 model,(Room Room,AssetInstance Instance) placement){
+      Room room=placement.Room;AssetInstance inst=placement.Instance;
+      if(room==null||inst==null||inst.PathFollowerBoundaryExcluded||inst.hasHeightMap||inst.hasWater||IsSpeedTreeInstance(inst)||!streamFloorIndexedInstances.Add(inst))return;
+      ModelFloorData floor=GetOrBuildModelFloorData(model,inst);if(floor==null||floor.Meshes.Count==0)return;
+      Matrix floorWorld=InstanceWorld(inst,room),inverse;try{inverse=Matrix.Invert(floorWorld);}catch{return;}
+      if(!TryModelWorldXZBounds(model,floorWorld,out float minX,out float maxX,out float minZ,out float maxZ))return;
+      var floorEntry=new ModelFloorPlacementEntry{Room=room,Model=floor,World=floorWorld,Inverse=inverse,WorldMinX=minX,WorldMaxX=maxX,WorldMinZ=minZ,WorldMaxZ=maxZ,LocalXZIndependentOfY=Math.Abs(inverse.M21)<.000001f&&Math.Abs(inverse.M23)<.000001f};
+      int cminX=ModelFloorPlacementCell(minX),cmaxX=ModelFloorPlacementCell(maxX),cminZ=ModelFloorPlacementCell(minZ),cmaxZ=ModelFloorPlacementCell(maxZ);long cells=(long)(cmaxX-cminX+1)*(cmaxZ-cminZ+1);
+      if(cells<=0||cells>MaxModelFloorPlacementCells){modelFloorPlacementGlobal.Add(floorEntry);return;}
+      for(int z=cminZ;z<=cmaxZ;z++)for(int x=cminX;x<=cmaxX;x++){var key=(x,z);if(!modelFloorPlacementGrid.TryGetValue(key,out List<ModelFloorPlacementEntry> bucket))modelFloorPlacementGrid[key]=bucket=new List<ModelFloorPlacementEntry>();bucket.Add(floorEntry);}
+    }
+
+    private void QueueModelGpuUpload(GR2 model) { if(model!=null&&queuedModelGpuUploads.Add(model))pendingModelGpuUploads.Enqueue(model); }
+    private void QueueStreamedModelMaterials(GR2 model) {
+      if(model==null||!queuedStreamedModelMaterials.Add(model))return;
+      var queuedMaterials=new Queue<GR2_Material>();var seenModels=new HashSet<GR2>();var seenMaterials=new HashSet<GR2_Material>();
+      void Add(GR2 current){
+        if(current==null||!seenModels.Add(current))return;
+        if(current.materials!=null)foreach(GR2_Material material in current.materials)if(material!=null&&seenMaterials.Add(material)&&!streamedMaterialResourcesPrepared.Contains(material)&&pendingStreamedMaterialPrepares.Add(material)){queuedMaterials.Enqueue(material);if(!material.parsed)materialMetadataStreamer?.Request(material);}
+        if(current.attachedModels!=null)foreach(GR2 attached in current.attachedModels)Add(attached);
+      }
+      Add(model);
+      if(queuedMaterials.Count==0){queuedStreamedModelMaterials.Remove(model);streamedModelMaterialsReady.Add(model);return;}
+      streamedModelMaterialsReady.Remove(model);
+      pendingStreamedModelMaterials.Enqueue(new PendingStreamedModelMaterials{Model=model,Materials=queuedMaterials});
+    }
+    private void ProcessStreamedModelMaterials() {
+      // MAT XML/archive parsing is a separate background queue now. This pass performs only D3D texture creation
+      // for metadata that is already stable, so a single cold MAT cannot block the render thread at a doorway.
+      bool materialBacklog=pendingStreamedModelMaterials.Count>8;
+      int maxMaterialPrepares=materialBacklog?24:8;
+      double maxMaterialMilliseconds=materialBacklog?10.0:5.0;
+      var budget=System.Diagnostics.Stopwatch.StartNew();int count=0,inspected=0,maxInspect=Math.Min(80,Math.Max(maxMaterialPrepares*4,pendingStreamedModelMaterials.Count));
+      while(count<maxMaterialPrepares&&pendingStreamedModelMaterials.Count>0&&inspected<maxInspect&&(count==0||budget.Elapsed.TotalMilliseconds<maxMaterialMilliseconds)){
+        PendingStreamedModelMaterials pending=pendingStreamedModelMaterials.Dequeue();inspected++;
+        if(pending?.Model==null||!streamedWorldModels.Contains(pending.Model)){if(pending?.Materials!=null)foreach(GR2_Material stale in pending.Materials)pendingStreamedMaterialPrepares.Remove(stale);continue;}
+        if(streamedModelAssetIds.TryGetValue(pending.Model,out ulong pendingAssetId)
+          &&!materialStreamAssetIds.Contains(pendingAssetId)
+          &&!(initialStreamLoading&&initialStreamAssetIds.Contains(pendingAssetId))){
+          if(pending.Materials!=null)foreach(GR2_Material stale in pending.Materials)pendingStreamedMaterialPrepares.Remove(stale);
+          queuedStreamedModelMaterials.Remove(pending.Model);
+          continue;
+        }
+        if(pending.Materials.Count>0){
+          GR2_Material material=pending.Materials.Peek();
+          if(material==null){pending.Materials.Dequeue();}
+          else if(!material.parsed){
+            materialMetadataStreamer?.Request(material);
+            if(materialMetadataStreamer!=null&&!materialMetadataStreamer.IsFailed(material)){pendingStreamedModelMaterials.Enqueue(pending);continue;}
+            pending.Materials.Dequeue();pendingStreamedMaterialPrepares.Remove(material);
+          }else{
+            pending.Materials.Dequeue();
+            try{material.EnsureTextureResources(Device,Math.Max(0,appliedTextureMipSkip));streamedMaterialResourcesPrepared.Add(material);}catch(Exception ex){System.Diagnostics.Debug.WriteLine("World material '"+material.materialName+"' failed: "+ex.Message);}finally{pendingStreamedMaterialPrepares.Remove(material);}
+            materialLastUseFrame[material]=worldRenderFrame;count++;if(materialLastUseFrame.Count>160)TrimMaterialTextureResidency();if(textureCache.Count>128)TrimSharedTextureResidency();
+          }
+        }
+        if(pending.Materials.Count>0)pendingStreamedModelMaterials.Enqueue(pending);else{queuedStreamedModelMaterials.Remove(pending.Model);streamedModelMaterialsReady.Add(pending.Model);}
+      }
+    }
+    private bool IsUrgentStreamModel(GR2 model){
+      return model!=null&&streamedModelAssetIds.TryGetValue(model,out ulong assetId)&&urgentStreamAssetIds.Contains(assetId);
+    }
+
+    private GR2 DequeueNextModelGpuUpload(){
+      int scan=pendingModelGpuUploads.Count;
+      for(int i=0;i<scan;i++){
+        GR2 model=pendingModelGpuUploads.Dequeue();
+        if(model==null||!queuedModelGpuUploads.Contains(model))continue;
+        if(IsUrgentStreamModel(model))return model;
+        pendingModelGpuUploads.Enqueue(model);
+      }
+      return pendingModelGpuUploads.Count>0?pendingModelGpuUploads.Dequeue():null;
+    }
+
+    private void ProcessModelGpuUploads() {
+      bool uploadBacklog=!initialStreamLoading&&pendingModelGpuUploads.Count>16;
+      int maxUploads=initialStreamLoading?24:(uploadBacklog?24:12);
+      double maxMilliseconds=initialStreamLoading?16.0:(uploadBacklog?10.0:6.5);
+      var budget=System.Diagnostics.Stopwatch.StartNew();int count=0;
+      while(count<maxUploads&&pendingModelGpuUploads.Count>0&&(count==0||budget.Elapsed.TotalMilliseconds<maxMilliseconds)) {
+        GR2 model=DequeueNextModelGpuUpload();if(model==null)continue;queuedModelGpuUploads.Remove(model);if(modelGeometryPrepared.Contains(model))continue;
+        // A decoded model can become cold while waiting behind the D3D budget. Do not upload obsolete room geometry
+        // just because it was once queued; a later room visit will enqueue it again. Moving followers stay global.
+        if(streamedModelAssetIds.TryGetValue(model,out ulong assetId)&&!IsStreamAssetActivelyDemanded(assetId)&&!walkingPathFollowerRenderEntries.Any(x=>ReferenceEquals(x?.Model,model)))continue;
+        var built=new HashSet<GR2>();BuildModelGeometry(model,built,false);foreach(GR2 prepared in built)modelGeometryPrepared.Add(prepared);MarkModelGeometryUsed(model);count++;if(modelGeometryPrepared.Count>192)TrimModelGeometryResidency();
+      }
+    }
+    private void ReportWorldStreamingProgress() {
+      if(!(Window is WorldBrowser browser)||modelStreamer==null||streamCatalogAssetCount<=0)return;
+      int activeTotal=activeStreamAssetIds.Count;
+      int activeDecoded=activeStreamAssetIds.Count(id=>models.ContainsKey(id));
+      int initialTotal=initialStreamAssetIds.Count;
+      int initialSettled=initialStreamAssetIds.Count(IsInitialStreamAssetDisplayReady);
+      int decoded=streamedWorldModels.Count;
+      browser.UpdateWorldStreamingLoading(decoded,streamCatalogAssetCount,activeDecoded,activeTotal,modelStreamer.OutstandingCount,pendingModelGpuUploads.Count,pendingStreamedModelMaterials.Count,initialStreamLoading);
+      // Jedipedia does not expose the scene while normal GR2/MAT/tiny-DDS work is still assembling. Our hybrid gate is
+      // local rather than planet-wide, but likewise waits until the arrival working set is decoded and display-ready.
+      if(initialStreamLoading&&initialTotal>0&&initialSettled>=initialTotal){
+        initialStreamLoading=false;
+        initialStreamVisibilityKeepUntilFrame=worldRenderFrame+180;
+        // Re-resolve from the now-complete local floor/bounds data on the next frame. Do not carry the outdoor/base
+        // room that was observed while the hangar shell was only partially present across the gate transition.
+        currentCameraRoom=null;displayCameraRoom=null;streamPrefetchRoom=String.Empty;cameraAheadStreamRooms.Clear();urgentCameraAheadStreamRooms.Clear();
+        streamPrefetchAnchor=new Vector3(float.NaN,float.NaN,float.NaN);streamPrefetchLook=new Vector3(float.NaN,float.NaN,float.NaN);
+      }
+    }
+    private bool IsInitialStreamAssetDisplayReady(ulong assetId){
+      if(modelStreamer==null)return false;
+      // A failed archive/model is a terminal condition, but a successful worker result is not ready until
+      // PumpDecodedWorldModels has consumed it (state 5) and installed its GR2 into this view.
+      if(modelStreamer.IsFailed(assetId))return true;
+      if(!modelStreamer.IsSettled(assetId))return false;
+      if(!models.TryGetValue(assetId,out GR2 model)||model==null)return false;
+      if(streamedWorldModels.Contains(model)&&(!modelGeometryPrepared.Contains(model)||!ModelGeometryBuffersReady(model)))return false;
+      foreach(string roomName in initialStreamRoomNames){
+        if(!streamPlacementsByRoomAsset.TryGetValue(roomName,out Dictionary<ulong,List<(Room Room,AssetInstance Instance)>> byAsset)||!byAsset.TryGetValue(assetId,out List<(Room Room,AssetInstance Instance)> placements))continue;
+        foreach(var placement in placements){
+          AssetInstance inst=placement.Instance;if(inst==null)continue;
+          if(InstanceVisibleInWorld(inst)&&!streamIndexedInstances.Contains(inst))return false;
+          // Floor/dPVS-style detail is intentionally not a first-frame barrier. Jedipedia presents the initial scene
+          // before its deferred room-detail visibility build; requiring every decorative GR2 to be classified for floor
+          // collision here made large hangars spend seconds behind a CPU triangle pass after their visible shell was ready.
+        }
+      }
+      return true;
+    }
     private static int RenderCell(float coordinate)=>(int)Math.Floor(coordinate/RenderCellSize);
 
     private void RebuildTeleportWarmupQueue(Vector3 target) {
@@ -2436,7 +3591,10 @@ namespace PugTools {
       // `_everywhere_` is never treated as a real floor/placement room.
       Room selected=FindBestFloorRoom(p,8f);
       if(selected==null){Room placementRoom=FindPlacementRoom(p);if(placementRoom!=null&&!IsEverywhereRoom(placementRoom))selected=placementRoom;}
-      if(selected==null&&currentCameraRoom!=null&&!IsEverywhereRoom(currentCameraRoom)&&!skyRoomNames.Contains(currentCameraRoom.RoomName)&&rooms.Contains(currentCameraRoom))selected=currentCameraRoom;
+      // Jedipedia only starts camera-room tracking after the complete initial GR2/dPVS input set exists. During our
+      // local first-frame gate, retaining a provisional outdoor floor hit can lock Corellia to the cell underneath
+      // the still-building hangar and prevent the freshly streamed interior from ever becoming authoritative.
+      if(selected==null&&!initialStreamLoading&&currentCameraRoom!=null&&!IsEverywhereRoom(currentCameraRoom)&&!skyRoomNames.Contains(currentCameraRoom.RoomName)&&rooms.Contains(currentCameraRoom))selected=currentCameraRoom;
       if(selected==null)selected=FindBoundsRoom(p);
       currentCameraRoom=selected;
 
@@ -2557,7 +3715,7 @@ namespace PugTools {
     }
 
     private void BuildRoomStreamingGraph(){
-      roomStreamingNeighbors.Clear();if(rooms==null||rooms.Count==0)return;
+      roomStreamingNeighbors.Clear();roomStreamingAuthoredVisible.Clear();if(rooms==null||rooms.Count==0)return;
       var byName=rooms.Where(r=>r!=null&&!String.IsNullOrWhiteSpace(r.RoomName))
         .GroupBy(r=>NormalizeRoom(r.RoomName),StringComparer.OrdinalIgnoreCase)
         .ToDictionary(g=>g.Key,g=>g.First(),StringComparer.OrdinalIgnoreCase);
@@ -2573,37 +3731,97 @@ namespace PugTools {
         if(portal?.Source==null||portal.Target==null)continue;Add(portal.Source,portal.Target);Add(portal.Target,portal.Source);
       }
 
-      // DAT VisibleRooms is a visibility list rather than a strict adjacency list and can be huge outdoors.
-      // Keep only the nearest authored entries per room so a Corellia cell does not pull the entire planet into
-      // the working set merely because the client marks many distant cells as mutually visible.
+      // DAT VisibleRooms is a visibility list rather than strict adjacency and can be huge outdoors. Do not freeze a
+      // nearest-N subset here: at this point many v6 rooms still have only placement-origin bounds, so the real next
+      // room can rank far away and be discarded permanently. Keep the authored candidates cheaply and choose a bounded
+      // nearest slice later, when streamed exact bounds and the live camera position are available.
       foreach(Room room in rooms){
         if(room==null||IsEverywhereRoom(room)||skyRoomNames.Contains(room.RoomName)||room.VisibleRooms==null||room.VisibleRooms.Count==0)continue;
-        var authored=new List<(Room Room,float Gap)>();
+        var authored=new List<Room>();var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach(string raw in room.VisibleRooms){
-          string key=NormalizeRoom(raw);if(String.IsNullOrWhiteSpace(key)||!byName.TryGetValue(key,out Room candidate)||candidate==null||ReferenceEquals(candidate,room))continue;
-          authored.Add((candidate,RoomBoundsGapSquared(room,candidate)));
+          string key=NormalizeRoom(raw);if(String.IsNullOrWhiteSpace(key)||!byName.TryGetValue(key,out Room candidate)||candidate==null||ReferenceEquals(candidate,room)||!seen.Add(candidate.RoomName))continue;
+          authored.Add(candidate);
         }
-        foreach(var item in authored.OrderBy(x=>x.Gap).Take(12))Add(room,item.Room);
+        if(authored.Count>0)roomStreamingAuthoredVisible[room.RoomName]=authored;
       }
 
       // Outdoor areas often have no explicit portal graph at all. Add a small number of physically touching/near
       // cells from room bounds. O(n²) here is a one-time load step (Corellia is still only hundreds of rooms) and
       // replaces far more expensive per-frame whole-room scans.
-      var usable=rooms.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName)&&HasUsableRoomBounds(r)).ToList();
-      const float maxGap=24f,maxVerticalGap=16f;float maxGapSq=maxGap*maxGap;
+      var usable=rooms.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName)&&TryGetRoomStreamingBounds(r,out _)).ToList();
+      const float maxGap=32f,maxVerticalGap=32f;float maxGapSq=maxGap*maxGap;
       foreach(Room room in usable){
-        if(!room.OutdoorsVisible)continue;
+        if(!room.OutdoorsVisible||!TryGetRoomStreamingBounds(room,out RoomStreamingBounds rb))continue;
         var nearby=new List<(Room Room,float Gap)>();
         foreach(Room candidate in usable){
-          if(ReferenceEquals(room,candidate)||!candidate.OutdoorsVisible)continue;
-          float dy=AxisGap(room.VisibilityMin.Y,room.VisibilityMax.Y,candidate.VisibilityMin.Y,candidate.VisibilityMax.Y);
+          if(ReferenceEquals(room,candidate)||!candidate.OutdoorsVisible||!TryGetRoomStreamingBounds(candidate,out RoomStreamingBounds cb))continue;
+          float dy=AxisGap(rb.Min.Y,rb.Max.Y,cb.Min.Y,cb.Max.Y);
           if(dy>maxVerticalGap)continue;
-          float dx=AxisGap(room.VisibilityMin.X,room.VisibilityMax.X,candidate.VisibilityMin.X,candidate.VisibilityMax.X);
-          float dz=AxisGap(room.VisibilityMin.Z,room.VisibilityMax.Z,candidate.VisibilityMin.Z,candidate.VisibilityMax.Z);
+          float dx=AxisGap(rb.Min.X,rb.Max.X,cb.Min.X,cb.Max.X);
+          float dz=AxisGap(rb.Min.Z,rb.Max.Z,cb.Min.Z,cb.Max.Z);
           float gap=dx*dx+dz*dz;if(gap<=maxGapSq)nearby.Add((candidate,gap));
         }
         foreach(var item in nearby.OrderBy(x=>x.Gap).Take(8)){Add(room,item.Room);Add(item.Room,room);}
       }
+    }
+
+    private IEnumerable<string> DirectStreamingNeighborRoomNames(string roomName){
+      if(String.IsNullOrWhiteSpace(roomName)||!roomStreamingNeighbors.TryGetValue(roomName,out HashSet<string> direct)||direct==null)yield break;
+      foreach(string name in direct)if(!String.IsNullOrWhiteSpace(name))yield return name;
+    }
+
+    private void UpdateStreamTransitionGrace(Room anchor){
+      if(modelStreamer==null){streamTransitionRoomGrace.Clear();lastStreamAnchorRoom=String.Empty;return;}
+      string next=anchor!=null&&!IsEverywhereRoom(anchor)&&!skyRoomNames.Contains(anchor.RoomName)?anchor.RoomName:String.Empty;
+      if(!String.Equals(next,lastStreamAnchorRoom,StringComparison.OrdinalIgnoreCase)){
+        if(!String.IsNullOrWhiteSpace(lastStreamAnchorRoom)){
+          streamTransitionRoomGrace[lastStreamAnchorRoom]=worldRenderFrame+StreamTransitionGraceFrames;
+          // Keep only the nearest old doorway neighbours as a shorter safety net. This covers room-locator oscillation
+          // without retaining an entire outdoor visibility ring after every transition.
+          foreach(string neighbour in DirectStreamingNeighborRoomNames(lastStreamAnchorRoom).OrderBy(StreamRoomDistanceSquared).Take(2))
+            streamTransitionRoomGrace[neighbour]=Math.Max(streamTransitionRoomGrace.TryGetValue(neighbour,out long old)?old:0,worldRenderFrame+90);
+
+          // Jedipedia's dPVS keeps geometry that is still visible through the crossed portal even after the
+          // camera-room identity changes. We do not have its native solver, so retain a small distance-ranked
+          // slice of the OLD room's authored VisibleRooms. ActiveStreamTransitionRoomNames() feeds both the
+          // draw set and model/material/floor residency, preventing those backdrop/sibling cells from being
+          // culled or evicted exactly while the player walks through the doorway.
+          if(roomStreamingAuthoredVisible.TryGetValue(lastStreamAnchorRoom,out List<Room> oldAuthored)&&oldAuthored!=null){
+            foreach(Room visibleRoom in oldAuthored.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName))
+              .OrderBy(r=>StreamRoomDistanceSquared(r.RoomName)).Take(StreamTransitionVisibleGraceLimit)){
+              string visibleName=visibleRoom.RoomName;if(String.IsNullOrWhiteSpace(visibleName))continue;
+              long expiry=worldRenderFrame+StreamTransitionVisibleGraceFrames;
+              streamTransitionRoomGrace[visibleName]=Math.Max(streamTransitionRoomGrace.TryGetValue(visibleName,out long oldExpiry)?oldExpiry:0,expiry);
+            }
+          }
+        }
+        lastStreamAnchorRoom=next;
+      }
+      foreach(string roomName in streamTransitionRoomGrace.Where(x=>x.Value<worldRenderFrame).Select(x=>x.Key).ToList())streamTransitionRoomGrace.Remove(roomName);
+    }
+
+    private IEnumerable<string> ActiveStreamTransitionRoomNames(){
+      foreach(var pair in streamTransitionRoomGrace)if(pair.Value>=worldRenderFrame)yield return pair.Key;
+    }
+
+    private IEnumerable<string> StreamingNeighborRoomNames(string roomName,int authoredLimit=16){
+      if(String.IsNullOrWhiteSpace(roomName))yield break;
+      var seen=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      if(roomStreamingNeighbors.TryGetValue(roomName,out HashSet<string> direct)){
+        foreach(string name in direct)if(!String.IsNullOrWhiteSpace(name)&&seen.Add(name))yield return name;
+      }
+      if(authoredLimit<=0||!roomStreamingAuthoredVisible.TryGetValue(roomName,out List<Room> authored)||authored==null||authored.Count==0)yield break;
+      Vector3 position=camera.Position;
+      var ranked=authored.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName)&&!seen.Contains(r.RoomName))
+        .Select(r=>{
+          bool have=TryGetRoomStreamingBounds(r,out RoomStreamingBounds b);
+          bool contains=have&&ContainsStreamingBounds(b,position,12f);
+          float distance=have?StreamingBoundsDistanceSquared(b,position):float.MaxValue;
+          return (Room:r,Contains:contains,Coarse:!have||b.Coarse,Distance:distance);
+        })
+        .OrderBy(x=>x.Contains?0:1).ThenBy(x=>x.Coarse?1:0).ThenBy(x=>x.Distance).ThenBy(x=>x.Room.RoomName,StringComparer.OrdinalIgnoreCase)
+        .Take(authoredLimit);
+      foreach(var item in ranked)if(seen.Add(item.Room.RoomName))yield return item.Room.RoomName;
     }
 
     private static float AxisGap(float amin,float amax,float bmin,float bmax){
@@ -2617,10 +3835,30 @@ namespace PugTools {
       return dx*dx+dy*dy+dz*dz;
     }
 
+    private bool UseInitialStreamVisibilityGrace()=>modelStreamer!=null&&(initialStreamLoading||(initialStreamVisibilityKeepUntilFrame>0&&worldRenderFrame<=initialStreamVisibilityKeepUntilFrame));
+
     private HashSet<string> BuildLocalRoomStreamingSet(Room current,WorldRenderSettings s){
       if(s==null||!s.EnableLocalRoomStreaming||s.Mode==WorldRenderMode.Map||current==null||IsEverywhereRoom(current))return null;
       var set=new HashSet<string>(StringComparer.OrdinalIgnoreCase){current.RoomName,"_everywhere_"};
-      if(roomStreamingNeighbors.TryGetValue(current.RoomName,out HashSet<string> neighbors))foreach(string roomName in neighbors)set.Add(roomName);
+      // The renderer's portal/VisibleRooms traversal can legitimately return more than sixteen Corellia cells. The
+      // previous local-stream intersection hard-capped the current room to 16 authored neighbours and then discarded
+      // every otherwise-visible room outside that set. Those rooms only reappeared after crossing into another cell,
+      // which looked exactly like late streaming. Keep a wider first hop and a bounded authored second hop (the same
+      // backdrop pattern Jedipedia follows for visibility-only rooms) while the spatial/frustum passes still decide
+      // what is actually drawn.
+      List<string> firstHop=StreamingNeighborRoomNames(current.RoomName,48).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+      foreach(string roomName in firstHop)set.Add(roomName);
+      int secondHopBudget=32;
+      foreach(string roomName in firstHop.OrderBy(StreamRoomDistanceSquared)){
+        if(secondHopBudget<=0)break;
+        if(!roomStreamingAuthoredVisible.TryGetValue(roomName,out List<Room> authored)||authored==null)continue;
+        foreach(Room linked in authored.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName))
+          .OrderBy(r=>StreamRoomDistanceSquared(r.RoomName)).Take(8)){
+          if(set.Add(linked.RoomName)&&--secondHopBudget<=0)break;
+        }
+      }
+      foreach(string roomName in ActiveStreamTransitionRoomNames())set.Add(roomName);
+      if(UseInitialStreamVisibilityGrace())foreach(string roomName in initialStreamRoomNames)set.Add(roomName);
       // Boundary continuity comes from the bidirectional portal links plus physically near outdoor cells built once
       // in BuildRoomStreamingGraph(); do not scan every room again on every frame.
       string sky=ResolveSkyRoomName(current.EnvironmentScheme);if(s.ShowSky&&!String.IsNullOrWhiteSpace(sky))set.Add(sky);
@@ -2628,8 +3866,10 @@ namespace PugTools {
     }
 
     private bool RoomBoundsVisibleInCameraFrustum(Room room){
-      if(room==null||!IsFinite(room.VisibilityMin)||!IsFinite(room.VisibilityMax)||room.VisibilityMax.X<room.VisibilityMin.X||room.VisibilityMax.Y<room.VisibilityMin.Y||room.VisibilityMax.Z<room.VisibilityMin.Z)return true;
-      Vector3 pad=new Vector3(FrustumCullPadding,FrustumCullPadding,FrustumCullPadding);return camera.Visible(new BoundingBox(room.VisibilityMin-pad,room.VisibilityMax+pad));
+      if(room==null)return true;Vector3 min=room.VisibilityMin,max=room.VisibilityMax;
+      if(!HasUsableRoomBounds(room)&&TryGetRoomStreamingBounds(room,out RoomStreamingBounds streaming)){min=streaming.Min;max=streaming.Max;}
+      if(!IsFinite(min)||!IsFinite(max)||max.X<min.X||max.Y<min.Y||max.Z<min.Z)return true;
+      Vector3 pad=new Vector3(FrustumCullPadding,FrustumCullPadding,FrustumCullPadding);return camera.Visible(new BoundingBox(min-pad,max+pad));
     }
 
     private bool PortalVisibleInCameraFrustum(PortalVisibilityEntry portal){
@@ -2650,34 +3890,63 @@ namespace PugTools {
       HashSet<string> streaming=BuildLocalRoomStreamingSet(current,s);
       if(!s.EnableRoomVisibility)return streaming;
 
-      // The legacy Room culling layer deliberately fails open outdoors because a portal-only traversal cannot
-      // reproduce SWTOR's native dPVS landscape occlusion. Local room streaming is the safe outdoor working-set
-      // layer: when enabled it still limits Corellia-like planets to current + directly adjacent cells.
-      if(current.OutdoorsVisible)return streaming;
+      // Jedipedia's fallback dPVS policy fails open from every room the camera can currently belong to, then expands
+      // each seed's authored VisibleRooms. PugTools streams room details lazily, so the floor-derived camera room can
+      // lag behind a tighter nested hangar/corridor. Seed visibility with BOTH the authoritative room and that spatial
+      // candidate (plus a phase-owner when present) instead of letting a temporary transition grace hide the mismatch.
+      var set=new HashSet<string>(StringComparer.OrdinalIgnoreCase){"_everywhere_"};
+      var byName=rooms.Where(r=>r!=null).GroupBy(r=>NormalizeRoom(r.RoomName),StringComparer.OrdinalIgnoreCase)
+        .ToDictionary(g=>g.Key,g=>g.First(),StringComparer.OrdinalIgnoreCase);
+      var seeds=new List<Room>();
+      var seedNames=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      void AddSeed(Room seed){
+        if(seed==null||IsEverywhereRoom(seed)||skyRoomNames.Contains(seed.RoomName)||!seedNames.Add(seed.RoomName))return;
+        seeds.Add(seed);set.Add(seed.RoomName);
+        foreach(string raw in seed.VisibleRooms){
+          string roomName=NormalizeRoom(raw);if(String.IsNullOrWhiteSpace(roomName))continue;
+          if(byName.TryGetValue(roomName,out Room candidate)&&candidate!=null)set.Add(candidate.RoomName);
+        }
+        // Keep the exact bidirectional portal/physical neighbours at a crossed doorway. This is deliberately NOT the
+        // wider prefetch ring: residency and draw visibility remain separate.
+        foreach(string neighbour in DirectStreamingNeighborRoomNames(seed.RoomName))
+          if(byName.TryGetValue(NormalizeRoom(neighbour),out Room direct)&&direct!=null)set.Add(direct.RoomName);
+      }
 
-      var set=new HashSet<string>(StringComparer.OrdinalIgnoreCase){current.RoomName,"_everywhere_"};
-      var queue=new Queue<(Room Room,int Depth)>();queue.Enqueue((current,0));const int maxPortalDepth=16;
+      AddSeed(current);
+      Room spatialRoom=FindStreamingRoom(camera.Position,160f);
+      if(spatialRoom!=null&&!String.Equals(spatialRoom.RoomName,current.RoomName,StringComparison.OrdinalIgnoreCase))AddSeed(spatialRoom);
+      AddSeed(FindPhaseTriggerRoom(camera.Position));
+
+      // Conservative streamed bounds can overlap while exact floor/room data catches up. Keep only a few tight cells
+      // that really contain the camera; this prevents the room from vanishing while avoiding the old mistake of drawing
+      // the complete streaming/prefetch ring.
+      foreach(Room overlap in rooms.Where(r=>r!=null&&!IsEverywhereRoom(r)&&!skyRoomNames.Contains(r.RoomName))
+        .Select(r=>{bool have=TryGetRoomStreamingBounds(r,out RoomStreamingBounds b);return (Room:r,Bounds:b,Have:have);})
+        .Where(x=>x.Have&&ContainsStreamingBounds(x.Bounds,camera.Position,2f))
+        .OrderBy(x=>x.Bounds.Coarse?1:0).ThenBy(x=>x.Bounds.Radius).Take(8).Select(x=>x.Room))AddSeed(overlap);
+
+      // Portal traversal starts from every active seed just like Jedipedia expands all active dPVS camera rooms. Portal
+      // geometry may ADD rooms, but it never subtracts the authored fallback rooms collected above.
+      var queue=new Queue<(Room Room,int Depth)>();
+      var queued=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      foreach(Room seed in seeds)if(queued.Add(seed.RoomName))queue.Enqueue((seed,0));
+      const int maxPortalDepth=16;
       while(queue.Count>0){
         var node=queue.Dequeue();if(node.Room==null||node.Depth>=maxPortalDepth)continue;
-        if(roomPortals.TryGetValue(node.Room.RoomName,out List<PortalVisibilityEntry> links)){
-          foreach(PortalVisibilityEntry portal in links){
-            if(portal?.Target==null||!PortalVisibleInCameraFrustum(portal))continue;
-            if(set.Add(portal.Target.RoomName))queue.Enqueue((portal.Target,node.Depth+1));
-          }
-        }
-        // Room DAT VisibleRooms remains a conservative fallback for client builds whose portal placements are
-        // missing/incomplete. Apply it at every room reached by the traversal, not only at the camera room.
-        foreach(string n in node.Room.VisibleRooms){
-          string roomName=NormalizeRoom(n);if(String.IsNullOrEmpty(roomName))continue;
-          Room candidate=rooms.FirstOrDefault(r=>r!=null&&String.Equals(NormalizeRoom(r.RoomName),roomName,StringComparison.OrdinalIgnoreCase));
-          if(candidate==null||!RoomBoundsVisibleInCameraFrustum(candidate))continue;
-          if(set.Add(candidate.RoomName))queue.Enqueue((candidate,node.Depth+1));
+        if(!roomPortals.TryGetValue(node.Room.RoomName,out List<PortalVisibilityEntry> links)||links==null)continue;
+        foreach(PortalVisibilityEntry portal in links){
+          if(portal?.Target==null||!PortalVisibleInCameraFrustum(portal))continue;
+          set.Add(portal.Target.RoomName);
+          if(queued.Add(portal.Target.RoomName))queue.Enqueue((portal.Target,node.Depth+1));
         }
       }
-      string sky=ResolveSkyRoomName(current.EnvironmentScheme);if(s.ShowSky&&!string.IsNullOrEmpty(sky))set.Add(sky);
-      if(streaming!=null)set.IntersectWith(streaming);
+
+      string sky=ResolveSkyRoomName(current.EnvironmentScheme);if(s.ShowSky&&!String.IsNullOrEmpty(sky))set.Add(sky);
+      foreach(string roomName in ActiveStreamTransitionRoomNames())set.Add(roomName);
+      if(UseInitialStreamVisibilityGrace())foreach(string roomName in initialStreamRoomNames)set.Add(roomName);
       return set;
     }
+
     private static string NormalizeRoom(string s)=>(s??"").Replace('\\','/').TrimStart('/').Replace(".dat","",StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
 
     private GR2_Material EnsureMaterialParsed(GR2_Material material) {
@@ -2685,6 +3954,13 @@ namespace PugTools {
       materialLastUseFrame[material]=worldRenderFrame;
       int mip=Math.Max(0,appliedTextureMipSkip);
       try{
+        // Streamed world materials are allowed to render from MAT metadata before their DDS resources are ready.
+        // Never turn a doorway/first-visible draw into synchronous archive I/O; the bounded prewarm queue owns those
+        // uploads. Non-streamed population/utility materials keep the legacy immediate behaviour.
+        if(streamedWorldMaterials.Contains(material)&&!streamedMaterialResourcesPrepared.Contains(material)){
+          if(!material.parsed){materialMetadataStreamer?.Request(material);return null;}
+          return material;
+        }
         // ModelBrowserViewMaterial and a few metadata paths intentionally call ParseMAT(null,...). Such a material is
         // "parsed" but has no D3D resources. Rehydrate its already-resolved paths instead of rendering the NPC/model
         // flat grey. This is also safe after the world texture LRU has evicted a cold material.
@@ -2698,17 +3974,23 @@ namespace PugTools {
       // Jedipedia streams/cache-evicts cold detail instead of keeping the entire planet resident. Do the equivalent
       // for MAT-owned SRVs. Keep a generous hot set and never evict character-only complexion/facepaint overrides,
       // which are authored outside the MAT and cannot be reconstructed by ParseMAT alone.
-      const int highWater=384,target=288;const long idleFrames=360;
+      const int highWater=160,target=120;const long idleFrames=180;
       var parsed=WorldMaterialResidencySet().Where(m=>m!=null&&m.parsed).ToList();
       if(parsed.Count<=highWater)return;
       long cutoff=worldRenderFrame-idleFrames;
+      // Current-room/direct-neighbour materials are streaming residency, not merely render-frame residency. They can
+      // be fully prewarmed while still off-screen, so a pure last-drawn LRU would evict them before the doorway.
+      var protectedMaterials=new HashSet<GR2_Material>();var protectedModels=new HashSet<GR2>();var protectedStack=new Stack<GR2>();
+      foreach(ulong assetId in activeStreamAssetIds)if(models.TryGetValue(assetId,out GR2 activeModel)&&activeModel!=null)protectedStack.Push(activeModel);
+      while(protectedStack.Count>0){GR2 model=protectedStack.Pop();if(model==null||!protectedModels.Add(model))continue;if(model.materials!=null)foreach(GR2_Material m in model.materials)if(m!=null)protectedMaterials.Add(m);if(model.attachedModels!=null)foreach(GR2 attached in model.attachedModels)if(attached!=null)protectedStack.Push(attached);}
       foreach(GR2_Material material in parsed
         .Where(m=>String.IsNullOrWhiteSpace(m.complexionDDS)&&String.IsNullOrWhiteSpace(m.facepaintDDS))
         .OrderBy(m=>materialLastUseFrame.TryGetValue(m,out long frame)?frame:long.MinValue).ToList()){
         if(parsed.Count<=target)break;
+        if(protectedMaterials.Contains(material))continue;
         long last=materialLastUseFrame.TryGetValue(material,out long frame)?frame:long.MinValue;
         if(last>cutoff)continue;
-        ReleaseOwnedMaterial(material);material.parsed=false;materialLastUseFrame.Remove(material);parsed.Remove(material);
+        ReleaseOwnedMaterial(material);material.parsed=false;streamedMaterialResourcesPrepared.Remove(material);materialLastUseFrame.Remove(material);parsed.Remove(material);
       }
     }
 
@@ -3212,7 +4494,7 @@ namespace PugTools {
     }
 
     private void DrawModelOccluderDepth(GR2 model,Matrix world,bool placementOccluderOnly){
-      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=SelectModelLodLevel(model,world,false);
+      if(model==null||!EnsureModelGeometryPrepared(model))return;int selectedLod=SelectModelLodLevel(model,world,false);
       foreach(GR2_Mesh mesh in model.meshes){
         if(mesh==null||mesh.vertBuffer==null||mesh.idxBuffer==null)continue;
         // Dedicated dPVS occlusion geometry is Granny LOD -3. An OCCLUDER_ONLY placement makes its ordinary
@@ -3399,7 +4681,7 @@ namespace PugTools {
     }
 
     private void DrawDecorationHookModel(GR2 model,Matrix world,Matrix vp,WorldRenderSettings s,Vector4 fallbackTint,int forcedLod=-1){
-      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,false);fx.SetWorld(world);fx.SetViewProj(vp);
+      if(model==null||!EnsureModelGeometryPrepared(model))return;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,false);fx.SetWorld(world);fx.SetViewProj(vp);
       foreach(var mesh in model.meshes){if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
         foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat))continue;fx.SetMaterial(mat);
           // The hook VFX use authored diffuseFlatColorProp where available. Older/client-specific hook MATs sometimes
@@ -3563,7 +4845,7 @@ namespace PugTools {
       catch(Exception ex){System.Diagnostics.Debug.WriteLine("Regular world instancing upload failed: "+ex.Message);return null;}
     }
     private void DrawModel(GR2 model,Matrix world,Matrix vp,WorldRenderSettings s,bool sky,AreaEnvironmentMaterial envMat,int forcedLod=-1,bool blueGlow=false,bool allowLocalLightOverflow=true){
-      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,sky||s.Mode==WorldRenderMode.Map);fx.SetWorld(world);fx.SetViewProj(vp);fx.SetPlaceableBlueGlow(blueGlow&&!sky&&s.Mode!=WorldRenderMode.Map);
+      if(model==null||!EnsureModelGeometryPrepared(model))return;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,sky||s.Mode==WorldRenderMode.Map);fx.SetWorld(world);fx.SetViewProj(vp);fx.SetPlaceableBlueGlow(blueGlow&&!sky&&s.Mode!=WorldRenderMode.Map);
       foreach(var mesh in model.meshes){if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
         foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat,s))continue;fx.SetMaterial(mat);
           if(!sky&&mat!=null&&string.Equals(mat.derived,"UberEnvBlend",StringComparison.OrdinalIgnoreCase)&&envMat!=null)fx.SetEnvironmentBlend(envMat,mat,LoadTexture(envMat.BlendDiffuse),LoadTexture(envMat.BlendNormal));
@@ -3586,7 +4868,7 @@ namespace PugTools {
     }
 
     private void DrawModelLocalLightPassRecursive(GR2 model,Matrix world,Matrix vp,WorldRenderSettings s,AreaEnvironmentMaterial envMat,int forcedLod=-1){
-      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,false);fx.SetWorld(world);fx.SetViewProj(vp);
+      if(model==null||!EnsureModelGeometryPrepared(model))return;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,world,false);fx.SetWorld(world);fx.SetViewProj(vp);
       foreach(var mesh in model.meshes){if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
         foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat,s)||!MaterialReceivesAdditiveLocalLight(mat))continue;fx.SetMaterial(mat);
           if(mat!=null&&string.Equals(mat.derived,"UberEnvBlend",StringComparison.OrdinalIgnoreCase)&&envMat!=null)fx.SetEnvironmentBlend(envMat,mat,LoadTexture(envMat.BlendDiffuse),LoadTexture(envMat.BlendNormal));
@@ -3627,7 +4909,7 @@ namespace PugTools {
     }
 
     private void DrawInstancedModel(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,Matrix vp,WorldRenderSettings s,int forcedLod=-1,Matrix? lodReferenceWorld=null,bool allowLocalLightOverflow=true,int startInstance=0){
-      if(model==null||instanceBuffer==null||instanceCount<=0)return;EnsureModelGeometryPrepared(model);Matrix reference=lodReferenceWorld??parentWorld;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,s.Mode==WorldRenderMode.Map);fx.SetWorld(parentWorld);fx.SetViewProj(vp);
+      if(model==null||instanceBuffer==null||instanceCount<=0||!EnsureModelGeometryPrepared(model))return;Matrix reference=lodReferenceWorld??parentWorld;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,s.Mode==WorldRenderMode.Map);fx.SetWorld(parentWorld);fx.SetViewProj(vp);
       foreach(var mesh in model.meshes){
         if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;
         ImmediateContext.InputAssembler.SetVertexBuffers(0,new[]{new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0),new VertexBufferBinding(instanceBuffer,64,0)});ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
@@ -3645,7 +4927,7 @@ namespace PugTools {
     }
 
     private void DrawInstancedModelLocalLightPassRecursive(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,Matrix vp,WorldRenderSettings s,int forcedLod,Matrix reference,int startInstance){
-      if(model==null)return;EnsureModelGeometryPrepared(model);int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);fx.SetWorld(parentWorld);fx.SetViewProj(vp);
+      if(model==null||!EnsureModelGeometryPrepared(model))return;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);fx.SetWorld(parentWorld);fx.SetViewProj(vp);
       foreach(var mesh in model.meshes){if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;
         ImmediateContext.InputAssembler.SetVertexBuffers(0,new[]{new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0),new VertexBufferBinding(instanceBuffer,64,0)});ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
         foreach(var piece in mesh.meshPieces){GR2_Material mat=ResolvePieceMaterial(model,piece);if(IsMaterialHiddenFromWorld(mat,s)||!MaterialReceivesAdditiveLocalLight(mat))continue;fx.SetMaterial(mat);fx.InstancedLocalLightAdd.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexedInstanced((int)piece.numPieceFaces*3,instanceCount,(int)piece.startIndex*3,0,startInstance);}}
@@ -3653,7 +4935,7 @@ namespace PugTools {
     }
 
     private void DrawInstancedModelShadow(GR2 model,Buffer instanceBuffer,int instanceCount,Matrix parentWorld,int forcedLod=-1,Matrix? lodReferenceWorld=null,int startInstance=0){
-      if(model==null||instanceBuffer==null||instanceCount<=0)return;EnsureModelGeometryPrepared(model);Matrix reference=lodReferenceWorld??parentWorld;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);fx.SetWorld(parentWorld);
+      if(model==null||instanceBuffer==null||instanceCount<=0||!EnsureModelGeometryPrepared(model))return;Matrix reference=lodReferenceWorld??parentWorld;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);fx.SetWorld(parentWorld);
       foreach(var mesh in model.meshes){
         if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;
         ImmediateContext.InputAssembler.SetVertexBuffers(0,new[]{new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0),new VertexBufferBinding(instanceBuffer,64,0)});ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
@@ -4029,7 +5311,7 @@ namespace PugTools {
       ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
     }
     private void DrawModelShadow(GR2 model,int forcedLod=-1,Matrix? lodReferenceWorld=null){
-      if(model==null)return;EnsureModelGeometryPrepared(model);Matrix reference=lodReferenceWorld??Matrix.Identity;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);
+      if(model==null||!EnsureModelGeometryPrepared(model))return;Matrix reference=lodReferenceWorld??Matrix.Identity;int selectedLod=forcedLod>=0?forcedLod:SelectModelLodLevel(model,reference,false);
       foreach(var mesh in model.meshes){
         if(mesh.vertBuffer==null||mesh.idxBuffer==null||!MeshVisibleForLod(model,mesh,selectedLod))continue;
         ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mesh.vertBuffer,PosNormalTexTan.Stride,0));ImmediateContext.InputAssembler.SetIndexBuffer(mesh.idxBuffer,Format.R16_UInt,0);
@@ -4055,11 +5337,22 @@ namespace PugTools {
       foreach(GR2 attached in model.attachedModels)if(attached!=null&&!ModelGeometryBuffersReady(attached))return false;
       return true;
     }
-    private void EnsureModelGeometryPrepared(GR2 model){
-      if(model==null)return;
+    private bool EnsureModelGeometryPrepared(GR2 model){
+      if(model==null)return false;
       MarkModelGeometryUsed(model);
-      if(modelGeometryPrepared.Contains(model)&&ModelGeometryBuffersReady(model))return;
+      // Streamed world assets may only be uploaded by ProcessModelGpuUploads(). Do not let an unexpected draw,
+      // shadow pass or warmup turn into an unbounded synchronous upload hitch.
+      if(streamedWorldModels.Contains(model)){
+        QueueModelGpuUpload(model);
+        if(streamedModelAssetIds.TryGetValue(model,out ulong assetId)&&materialStreamAssetIds.Contains(assetId))QueueStreamedModelMaterials(model);
+        // Geometry is the room-continuity barrier; textures are deliberately independent. ResolvePieceMaterial() uses
+        // metadata-only streamed materials until the bounded DDS queue catches up, so missing textures become a brief
+        // flat fallback rather than a missing wall/floor or a synchronous hitch.
+        return modelGeometryPrepared.Contains(model)&&ModelGeometryBuffersReady(model);
+      }
+      if(modelGeometryPrepared.Contains(model)&&ModelGeometryBuffersReady(model))return true;
       var built=new HashSet<GR2>();BuildModelGeometry(model,built,false);foreach(GR2 prepared in built)modelGeometryPrepared.Add(prepared);
+      return true;
     }
     private void MarkModelGeometryUsed(GR2 model){
       if(model==null)return;
@@ -4111,17 +5404,53 @@ namespace PugTools {
       // load permanently resident. Include population/SPN/helper models as well as static room assets: NPC-heavy
       // sessions were otherwise still able to accumulate their entire visited population in VRAM. CPU GR2 data is
       // retained so exact picking and a later re-upload remain lossless.
-      const int highWater=384,target=256;const long idleFrames=600;
+      const int highWater=192,target=144;const long idleFrames=240;
       List<GR2> resident=WorldModelResidencyRoots().Where(ModelHasAnyGpuBuffers).Distinct().ToList();
       if(resident.Count<=highWater)return;
       GR2 selected=selectedWorldRenderEntry?.Model;long cutoff=worldRenderFrame-idleFrames;
       foreach(GR2 model in resident.OrderBy(m=>modelGeometryLastUseFrame.TryGetValue(m,out long frame)?frame:long.MinValue).ToList()){
         if(resident.Count<=target)break;
         if(selected!=null&&ModelTreeContains(model,selected))continue;
+        if(streamedModelAssetIds.TryGetValue(model,out ulong streamAssetId)&&IsStreamAssetActivelyDemanded(streamAssetId))continue;
         long last=modelGeometryLastUseFrame.TryGetValue(model,out long frame)?frame:long.MinValue;
         if(last>cutoff)continue;
         ReleaseModelBuffers(model);ForgetPreparedModelGeometry(model);resident.Remove(model);
       }
+    }
+    private void TrimStreamedModelCpuResidency(){
+      // The former v5 LRU released only D3D buffers; the parsed Granny object graph remained in RAM forever.
+      // Drop cold streamed roots completely and make their room request eligible again. Render entries are removed
+      // alongside the model so a later room visit is a normal background decode/re-upload, never a dangling draw.
+      // A Corellia room routinely has more than 64 distinct GR2 roots.  64/40 made a just decoded room evict
+      // its own structural pieces before the renderer could upload them.  The active set is always protected;
+      // only truly cold rooms are reduced to the 256-root CPU working set.
+      const int highWater=384,target=256;const long idleFrames=300;
+      if(streamedWorldModels.Count<=highWater)return;
+      long cutoff=worldRenderFrame-idleFrames;GR2 selected=selectedWorldRenderEntry?.Model;
+      foreach(GR2 model in streamedWorldModels.OrderBy(m=>modelGeometryLastUseFrame.TryGetValue(m,out long frame)?frame:long.MinValue).ToList()){
+        if(streamedWorldModels.Count<=target)break;
+        if(model==null||ReferenceEquals(model,selected)||!streamedModelAssetIds.TryGetValue(model,out ulong assetId)||IsStreamAssetActivelyDemanded(assetId))continue;
+        long last=modelGeometryLastUseFrame.TryGetValue(model,out long frame)?frame:long.MinValue;if(last>cutoff)continue;
+        RemoveStreamedModel(assetId,model);
+      }
+    }
+    private void RemoveStreamedModel(ulong assetId,GR2 model){
+      ReleaseModelBuffers(model);ForgetPreparedModelGeometry(model);models.Remove(assetId);streamedWorldModels.Remove(model);streamedModelAssetIds.Remove(model);queuedModelGpuUploads.Remove(model);queuedStreamedModelMaterials.Remove(model);streamedModelMaterialsReady.Remove(model);
+      foreach(var key in queuedStreamedModelIntegrations.Where(x=>x.AssetId==assetId).ToList())queuedStreamedModelIntegrations.Remove(key);
+      foreach(var key in queuedStreamedFloorIntegrations.Where(x=>x.AssetId==assetId).ToList())queuedStreamedFloorIntegrations.Remove(key);
+      // Keep canonical MAT metadata in the area dictionary. Streamed models deliberately share those objects; removing
+      // an entry just because one GR2 is evicted can invalidate another still-resident model that references it.
+      GR2[] retainedUploads=pendingModelGpuUploads.Where(x=>!ReferenceEquals(x,model)).ToArray();pendingModelGpuUploads.Clear();foreach(GR2 queued in retainedUploads)pendingModelGpuUploads.Enqueue(queued);
+      PendingStreamedModelIntegration[] retainedIntegrations=pendingStreamedModelIntegrations.Where(x=>x!=null&&!ReferenceEquals(x.Model,model)).ToArray();pendingStreamedModelIntegrations.Clear();foreach(PendingStreamedModelIntegration queued in retainedIntegrations)pendingStreamedModelIntegrations.Enqueue(queued);
+      PendingStreamedFloorIntegration[] retainedFloors=pendingStreamedFloorIntegrations.Where(x=>x!=null&&!ReferenceEquals(x.Model,model)).ToArray();pendingStreamedFloorIntegrations.Clear();foreach(PendingStreamedFloorIntegration queued in retainedFloors)pendingStreamedFloorIntegrations.Enqueue(queued);
+      PendingStreamedModelMaterials[] retainedMaterials=pendingStreamedModelMaterials.Where(x=>x!=null&&!ReferenceEquals(x.Model,model)).ToArray();pendingStreamedModelMaterials.Clear();foreach(PendingStreamedModelMaterials queued in retainedMaterials)pendingStreamedModelMaterials.Enqueue(queued);
+      pendingStreamedMaterialPrepares.Clear();foreach(PendingStreamedModelMaterials pending in pendingStreamedModelMaterials)if(pending?.Materials!=null)foreach(GR2_Material material in pending.Materials)if(material!=null)pendingStreamedMaterialPrepares.Add(material);
+      if(modelFloorData.TryGetValue(model,out ModelFloorData floor)){modelFloorData.Remove(model);modelFloorPlacementGlobal.RemoveAll(x=>ReferenceEquals(x.Model,floor));foreach(List<ModelFloorPlacementEntry> bucket in modelFloorPlacementGrid.Values)bucket.RemoveAll(x=>ReferenceEquals(x.Model,floor));modelFloorPlacementGrid.Where(x=>x.Value.Count==0).Select(x=>x.Key).ToList().ForEach(key=>modelFloorPlacementGrid.Remove(key));}
+      if(streamPlacementsByAsset.TryGetValue(assetId,out List<(Room Room,AssetInstance Instance)> placements))foreach(var placement in placements){streamIndexedInstances.Remove(placement.Instance);streamFloorIndexedInstances.Remove(placement.Instance);}
+      foreach(List<RenderEntry> bucket in renderGrid.Values)bucket.RemoveAll(x=>ReferenceEquals(x.Model,model));renderGrid.Where(x=>x.Value.Count==0).Select(x=>x.Key).ToList().ForEach(key=>renderGrid.Remove(key));
+      renderGlobal.RemoveAll(x=>ReferenceEquals(x.Model,model));walkingPathFollowerRenderEntries.RemoveAll(x=>ReferenceEquals(x.Model,model));occluderRenderEntries.RemoveAll(x=>ReferenceEquals(x.Model,model));
+      foreach(List<RenderEntry> bucket in renderEntriesByRoom.Values)bucket.RemoveAll(x=>ReferenceEquals(x.Model,model));renderEntriesByRoom.Where(x=>x.Value.Count==0).Select(x=>x.Key).ToList().ForEach(key=>renderEntriesByRoom.Remove(key));
+      modelStreamer?.Forget(assetId);
     }
     private void BuildModelGeometry(GR2 model,HashSet<GR2> built,bool attachment){
       if(model==null||!built.Add(model))return;
@@ -4224,7 +5553,7 @@ namespace PugTools {
       }
     }
     private void TrimWaterTextureResidency(WorldRenderSettings s){
-      const int highWater=48,target=32;const long idleFrames=360;
+      const int highWater=32,target=20;const long idleFrames=180;
       List<WaterGpu> resident=waterGpu.Values.Where(g=>g!=null&&g.TexturesPrepared).Distinct().ToList();if(resident.Count<=highWater)return;
       bool map=s?.Mode==WorldRenderMode.Map;long cutoff=worldRenderFrame-idleFrames;
       foreach(WaterGpu gpu in resident.OrderBy(g=>g.LastUseFrame).ToList()){
@@ -4284,7 +5613,7 @@ namespace PugTools {
       // Environment, scrolling and blend maps are fetched from the shared cache and can vary by room. Evict only
       // cold transient entries; persistent records explicitly pin their SRVs so this never leaves a dangling water,
       // static-light or map-art reference behind.
-      const int highWater=192,target=128;const long idleFrames=360;
+      const int highWater=128,target=96;const long idleFrames=180;
       if(textureCache.Count<=highWater)return;long cutoff=worldRenderFrame-idleFrames;
       foreach(string path in textureCache.Keys
         .Where(p=>!pinnedTexturePaths.Contains(p)&&!boundLocalLightTexturePaths.Contains(p))
@@ -4313,7 +5642,7 @@ namespace PugTools {
         // Preserve parsed MAT state and appearance overrides. EnsureTextureResources recreates all owned SRVs at the
         // new mip level from their resolved paths, including NPC complexion/facepaint textures, without reparsing the
         // base MAT and accidentally discarding the appearance-specific values.
-        ReleaseOwnedMaterial(material);materialLastUseFrame.Remove(material);
+        ReleaseOwnedMaterial(material);streamedMaterialResourcesPrepared.Remove(material);materialLastUseFrame.Remove(material);
       }
       foreach(var gpu in waterGpu.Values)gpu.Dispose();waterGpu.Clear();Release(ref defaultWaterNormal);Release(ref defaultWaterDepth);BuildWaterResources();
       foreach(var art in mapArtGpu)art.Dispose();mapArtGpu.Clear();mapArtPrepared=false;if(rebuildMapArt)BuildMapArt();

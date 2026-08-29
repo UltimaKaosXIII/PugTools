@@ -459,6 +459,16 @@ namespace PugTools {
       _globalBoxMin = new Vector3(Single.MaxValue, Single.MaxValue, Single.MaxValue);
 
       if (type == "ipp") {
+        // A historical IPP can legitimately miss its appearance index when the matching
+        // archive is not selected. Never let an empty model dictionary terminate the UI.
+        if (models == null || models.Count == 0) {
+          _focus = null;
+          _globalBoxMin = new Vector3(-1f, -1f, -1f);
+          _globalBoxMax = new Vector3(1f, 1f, 1f);
+          _globalBoxCenter = Vector3.Zero;
+          _cameraPos = new Vector3(2f, 1.3f, 2f);
+          return;
+        }
         _focus = models.First().Value;
 
         Vector4 max = Vector3.Transform(

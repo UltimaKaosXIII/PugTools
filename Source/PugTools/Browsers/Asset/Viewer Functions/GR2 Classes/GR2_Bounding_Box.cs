@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 
 namespace FileFormats {
@@ -11,6 +11,8 @@ namespace FileFormats {
     public Single minY;
     public Single minZ;
     public Single minW;
+
+    public GR2_Bounding_Box() { }
 
     public GR2_Bounding_Box(BinaryReader br) {
       minX = br.ReadSingle();

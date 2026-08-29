@@ -41,7 +41,9 @@
 		<Content Include="Shaders\GR2.fx" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Shaders\World.fx" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Resources\WorldMapIcons\*.png" CopyToOutputDirectory="PreserveNewest" />
+		<Content Include="Tools\packed_codebooks.bin" Condition="Exists('Tools\packed_codebooks.bin')" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\packed_codebooks_aoTuV_603.bin" CopyToOutputDirectory="PreserveNewest" />
+		<Content Include="Tools\spn-legacy-v1.bin" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\revorb.exe" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\ww2ogg.exe" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="WorldAreaNames.xml" CopyToOutputDirectory="PreserveNewest" />

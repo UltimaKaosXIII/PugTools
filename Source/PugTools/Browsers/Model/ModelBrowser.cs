@@ -1014,10 +1014,10 @@ namespace PugTools {
     private void LoadIPP(ItemAppearance itemData) {
       _models ??= new Dictionary<String, GR2>();
       _resources ??= new Dictionary<String, Object>();
-      String model = itemData.IPP.Model;
+      if (itemData?.IPP == null) return;
+      String model = _currentDom.AppearanceLoader.ApplyPartsMacros(itemData.IPP.Model, _bodyType).Replace('\\', '/');
 
-      if (model.Contains(".gr2")) {
-        model = model.Replace("[bt]", _bodyType);
+      if (!String.IsNullOrWhiteSpace(model) && model.Contains(".gr2", StringComparison.OrdinalIgnoreCase)) {
         File modelFile = _currentAssets.FindFile("/resources" + model);
 
         if (modelFile != null) {
@@ -1038,10 +1038,8 @@ namespace PugTools {
             if (!String.IsNullOrEmpty(itemData.IPP.SecondaryHue))
               palette2XML = "/resources" + itemData.IPP.SecondaryHue.Split(';').First();
 
-            mat0 =
-              mat0.Replace("[gen]", _bodyType.Substring(1, 1)).Replace("[bt]", _bodyType);
-            matMirror =
-              matMirror.Replace("[gen]", _bodyType.Substring(1, 1)).Replace("[bt]", _bodyType);
+            mat0 = _currentDom.AppearanceLoader.ApplyPartsMacros(mat0, _bodyType);
+            matMirror = _currentDom.AppearanceLoader.ApplyPartsMacros(matMirror, _bodyType);
 
             if (gr2Model.numMaterials == 0) {
               gr2Model.numMaterials = 1;
@@ -1082,7 +1080,7 @@ namespace PugTools {
 
           if (itemData.IPP.AttachedModels.Count > 0) {
             foreach (String attach in itemData.IPP.AttachedModels) {
-              String attachFileName = attach.Replace("[bt]", _bodyType);
+              String attachFileName = _currentDom.AppearanceLoader.ApplyPartsMacros(attach, _bodyType).Replace('\\', '/');
               File attachFile = _currentAssets.FindFile("/resources" + attachFileName);
 
               if (attachFile != null) {
@@ -1137,12 +1135,15 @@ namespace PugTools {
         }
       }
 
-      if (model.Contains(".dds")) {
-        using Stream inputStream =
-            _currentAssets.FindFile("/resources" + model).OpenCopyInMemory();
-
-        if (inputStream != null)
-          _resources.Add(model[(model.LastIndexOf('/') + 1)..], inputStream);
+      if (model.Contains(".dds", StringComparison.OrdinalIgnoreCase)) {
+        File textureFile = _currentAssets.FindFile("/resources" + model);
+        if (textureFile != null) {
+          using (textureFile) {
+            using Stream inputStream = textureFile.OpenCopyInMemory();
+            if (inputStream != null)
+              _resources[model[(model.LastIndexOf('/') + 1)..]] = inputStream;
+          }
+        }
       }
     }
     #endregion
@@ -1621,171 +1622,111 @@ namespace PugTools {
     }
 
     private void ParseNpcData(NpcAppearance npcData) {
-      // Load NPC Skeleton
-      if (npcData.BodyType != null) {
-        String skeletonModel;
+      if (npcData == null) return;
+      _models ??= new Dictionary<String, GR2>();
+      _resources ??= new Dictionary<String, Object>();
 
-        if (npcData.BodyType.StartsWith("bf") || npcData.BodyType.StartsWith("bm"))
-          skeletonModel = "/resources/art/dynamic/spec/" + npcData.BodyType + "new_skeleton.gr2";
-        else
-          skeletonModel = "/resources/art/dynamic/spec/" + npcData.BodyType + "_skeleton.gr2";
-
+      // Load the rig named by the character spec. The art-slot [bt] macro is intentionally NOT
+      // used for the skeleton: creature specs can wear bmn/bfn art while retaining their own rig.
+      String npcBodyType = npcData.BodyType ?? String.Empty;
+      if (!String.IsNullOrWhiteSpace(npcBodyType)) {
+        String skeletonModel = (npcBodyType.StartsWith("bf", StringComparison.OrdinalIgnoreCase)
+                                || npcBodyType.StartsWith("bm", StringComparison.OrdinalIgnoreCase))
+          ? "/resources/art/dynamic/spec/" + npcBodyType + "new_skeleton.gr2"
+          : "/resources/art/dynamic/spec/" + npcBodyType + "_skeleton.gr2";
         File file = _currentAssets.FindFile(skeletonModel);
-
         if (file != null) {
           using BinaryReader br = new BinaryReader(file.OpenCopyInMemory());
           String name = skeletonModel.Split('/').Last();
-          GR2 gr2_model = new GR2(br, name);
-
-          _models.Add(name, gr2_model);
+          _models[name] = new GR2(br, name);
         }
       }
 
-      // Load NPC Slots
+      if (npcData.AppearanceSlotMap == null) return;
+      AppSlot headSlot = npcData.AppearanceSlotMap.TryGetValue("appSlotHead", out List<AppSlot> headSlots)
+        ? headSlots?.FirstOrDefault(x => x != null)
+        : null;
+
+      // Jedipedia renders one deterministic variant per static NPP preview. Older appearances can
+      // contain several weighted alternatives; the previous `Count == 1 ... else break` discarded
+      // this slot and every slot following it, which made many RED NPPs completely model-less.
       foreach (KeyValuePair<String, List<AppSlot>> appSlot in npcData.AppearanceSlotMap) {
-        if (appSlot.Value.Count == 1) {
-          String Bodytype = appSlot.Value[0].BodyType;
-          String model = appSlot.Value[0].Model.Replace("[bt]", Bodytype);
+        AppSlot slot = appSlot.Value?.FirstOrDefault(x => x != null);
+        if (slot == null) continue;
+        String bodyType = !String.IsNullOrWhiteSpace(slot.BodyType) ? slot.BodyType : npcBodyType;
+        String model = _currentDom.AppearanceLoader.ApplyPartsMacros(slot.Model, bodyType);
 
-          if (appSlot.Key.Contains("FaceHair") && model == "")
-            model = "/art/defaultassets/blank.gr2";
+        if (appSlot.Key.IndexOf("FaceHair", StringComparison.OrdinalIgnoreCase) >= 0
+            && String.IsNullOrWhiteSpace(model))
+          model = "/art/defaultassets/blank.gr2";
 
-          // Load Model & Materials for this Slot
-          if (model.Contains(".gr2")) {
-            File modelFile = _currentAssets.FindFile("/resources" + model);
+        if (!String.IsNullOrWhiteSpace(model) && model.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) {
+          File modelFile = _currentAssets.FindFile("/resources" + model.Replace('\\', '/'));
+          if (modelFile != null) {
+            using BinaryReader br = new BinaryReader(modelFile.OpenCopyInMemory());
+            String name = model.Split('/', '\\').Last();
+            GR2 gr2Model = new GR2(br, name);
 
-            if (modelFile != null) {
-              using BinaryReader br = new BinaryReader(modelFile.OpenCopyInMemory());
-              String name = model.Split('/').Last();
-              GR2 gr2_model = new GR2(br, name);
+            String material0 = _currentDom.AppearanceLoader.ApplyPartsMacros(slot.Material0, bodyType);
+            String materialMirror = _currentDom.AppearanceLoader.ApplyPartsMacros(slot.MaterialMirror, bodyType);
 
-              String material0 = appSlot.Value[0].Material0.Replace("[bt]", Bodytype);
-              String materialMirror = appSlot.Value[0].MaterialMirror.Replace("[bt]", Bodytype);
-
-              String palette1XML = "";
-              String palette2XML = "";
-
-              gr2_model.materials = new List<GR2_Material>();
-
-              // Naked Skin Material Substitution
-              if (npcData.AppearanceSlotMap.ContainsKey("appSlotHead")) {
-                List<AppSlot> appSlotHead = npcData.AppearanceSlotMap["appSlotHead"];
-
-                if (material0.Contains("_naked_")) {
-                  if (appSlotHead[0].AMI.ChildSkinMaterials != null)
-                    material0 =
-                      appSlotHead[0].AMI.ChildSkinMaterials[appSlot.Key].Replace("[bt]", Bodytype);
-                }
-
-                if (gr2_model.numMaterials > 1 && materialMirror == "") {
-                  if (appSlotHead[0].AMI.ChildSkinMaterials != null)
-                    materialMirror =
-                      appSlotHead[0].AMI.ChildSkinMaterials[appSlot.Key].Replace("[bt]", Bodytype);
-                }
-              }
-
-              // default Material
-              if (material0 != null) {
-                if (appSlot.Value[0].PrimaryHue != "")
-                  palette1XML = "/resources" + appSlot.Value[0].PrimaryHue.Split(';').First();
-
-                if (appSlot.Value[0].SecondaryHue != "")
-                  palette2XML = "/resources" + appSlot.Value[0].SecondaryHue.Split(';').First();
-
-                if (Bodytype.Contains("bf"))
-                  material0 = material0.Replace("[gen]", "f");
-
-                if (Bodytype.Contains("bm"))
-                  material0 = material0.Replace("[gen]", "m");
-
-                gr2_model.materials.Add(new GR2_Material(material0));
-
-                if (palette1XML != null)
-                  gr2_model.materials[0].palette1XML = palette1XML;
-
-                if (palette2XML != null)
-                  gr2_model.materials[0].palette2XML = palette2XML;
-              }
-
-              // defaultMirror Material
-              if (materialMirror != "") {
-                if (Bodytype.Contains("bf"))
-                  materialMirror = materialMirror.Replace("[gen]", "f");
-
-                if (Bodytype.Contains("bm"))
-                  materialMirror = materialMirror.Replace("[gen]", "m");
-
-                gr2_model.materials.Add(new GR2_Material(materialMirror));
-              }
-
-              // Attachments
-              if (appSlot.Value[0].AttachedModels.Count > 0) {
-                foreach (var attach in appSlot.Value[0].AttachedModels) {
-                  string attachFile = attach.Replace("[bt]", Bodytype);
-                  var file = _currentAssets.FindFile("/resources" + attachFile);
-
-                  if (file != null) {
-                    Stream attachStream = file.OpenCopyInMemory();
-                    BinaryReader br2 = new BinaryReader(attachStream);
-
-                    string attachName = attachFile.Split('/').Last();
-                    GR2 attachModel = new GR2(br2, attachName) {
-                      materials = gr2_model.materials
-                    };
-
-                    if (attachModel.numMaterials == 0) {
-                      attachModel.numMaterials = 1;
-                      attachModel.materials.Add(new GR2_Material(material0));
-
-                      if (palette1XML != null)
-                        attachModel.materials[0].palette1XML = palette1XML;
-
-                      if (palette2XML != null)
-                        attachModel.materials[0].palette1XML = palette1XML;
-                    } else if (attachModel.numMaterials == 1) {
-                      attachModel.materials[0] = new GR2_Material(material0);
-                      if (palette1XML != null)
-                        attachModel.materials[0].palette1XML = palette1XML;
-                      if (palette2XML != null)
-                        attachModel.materials[0].palette2XML = palette2XML;
-                    } else if (attachModel.numMaterials == 2) {
-                      attachModel.materials.Add(new GR2_Material(material0));
-                      attachModel.materials.Add(new GR2_Material(materialMirror));
-
-                      if (palette1XML != null) {
-                        attachModel.materials[0].palette1XML = palette1XML;
-                        attachModel.materials[1].palette1XML = palette1XML;
-                      }
-
-                      if (palette2XML != null) {
-                        attachModel.materials[0].palette2XML = palette2XML;
-                        attachModel.materials[1].palette2XML = palette2XML;
-                      }
-                    }
-
-                    attachModel.transformMatrix = Matrix.Scaling(new Vector3(1.0F, 1.0F, 1.0F));
-                    gr2_model.attachedModels.Add(attachModel);
-                  }
-                }
-              }
-
-              gr2_model.transformMatrix = Matrix.Scaling(new Vector3(1.0F, 1.0F, 1.0F));
-              _models.Add(appSlot.Key.ToString(), gr2_model);
+            // The head owns the skin material used by the bare-skin submesh of the other parts.
+            if (headSlot?.AMI?.ChildSkinMaterials != null) {
+              Dictionary<String, String> skin = headSlot.AMI.ChildSkinMaterials;
+              if (!String.IsNullOrWhiteSpace(material0)
+                  && material0.IndexOf("_naked_", StringComparison.OrdinalIgnoreCase) >= 0
+                  && skin.TryGetValue(appSlot.Key, out String skin0))
+                material0 = _currentDom.AppearanceLoader.ApplyPartsMacros(skin0, bodyType);
+              if (gr2Model.numMaterials > 1 && String.IsNullOrWhiteSpace(materialMirror)
+                  && skin.TryGetValue(appSlot.Key, out String skin1))
+                materialMirror = _currentDom.AppearanceLoader.ApplyPartsMacros(skin1, bodyType);
             }
+
+            String palette1XML = !String.IsNullOrWhiteSpace(slot.PrimaryHue)
+              ? "/resources" + slot.PrimaryHue.Split(';').First().Replace('\\', '/')
+              : String.Empty;
+            String palette2XML = !String.IsNullOrWhiteSpace(slot.SecondaryHue)
+              ? "/resources" + slot.SecondaryHue.Split(';').First().Replace('\\', '/')
+              : String.Empty;
+
+            gr2Model.materials = new List<GR2_Material>();
+            if (!String.IsNullOrWhiteSpace(material0)) {
+              var material = new GR2_Material(material0) { palette1XML = palette1XML, palette2XML = palette2XML };
+              gr2Model.materials.Add(material);
+            }
+            if (!String.IsNullOrWhiteSpace(materialMirror)) {
+              var material = new GR2_Material(materialMirror) { palette1XML = palette1XML, palette2XML = palette2XML };
+              gr2Model.materials.Add(material);
+            }
+
+            if (slot.AttachedModels != null) {
+              foreach (String attach in slot.AttachedModels.Where(x => !String.IsNullOrWhiteSpace(x))) {
+                String attachFile = _currentDom.AppearanceLoader.ApplyPartsMacros(attach, bodyType).Replace('\\', '/');
+                File attachmentFile = _currentAssets.FindFile("/resources" + attachFile);
+                if (attachmentFile == null) continue;
+                using BinaryReader abr = new BinaryReader(attachmentFile.OpenCopyInMemory());
+                String attachName = attachFile.Split('/').Last();
+                GR2 attachModel = new GR2(abr, attachName) {
+                  materials = new List<GR2_Material>(gr2Model.materials),
+                  transformMatrix = Matrix.Scaling(new Vector3(1.0F, 1.0F, 1.0F))
+                };
+                gr2Model.attachedModels.Add(attachModel);
+              }
+            }
+
+            gr2Model.transformMatrix = Matrix.Scaling(new Vector3(1.0F, 1.0F, 1.0F));
+            _models[appSlot.Key] = gr2Model;
           }
+        }
 
-          if (model.Contains(".dds"))
-            _resources.Add(appSlot.Key.ToString(), appSlot.Value.First().Model);
+        if (!String.IsNullOrWhiteSpace(model) && model.EndsWith(".dds", StringComparison.OrdinalIgnoreCase))
+          _resources[appSlot.Key] = model;
 
-          if (model.Contains(".xml")) {
-            // BW lies! They're not XML files but instead are nodes!
-            String dynFqn = model.Replace("/art/", "").Replace(".xml", "").Replace("/", ".");
-            GomObject dynObj = _currentDom.GetObject(dynFqn);
-
-            if (dynObj != null) _resources.Add(appSlot.Key, dynObj);
-          }
-        } else {
-          break;
+        if (!String.IsNullOrWhiteSpace(model) && model.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) {
+          // A number of modern appearance XML references are actually GOM dynamic-data nodes.
+          String dynFqn = model.Replace('\\', '/').Replace("/art/", "").Replace(".xml", "").Replace("/", ".");
+          GomObject dynObj = _currentDom.GetObject(dynFqn);
+          if (dynObj != null) _resources[appSlot.Key] = dynObj;
         }
       }
     }
@@ -1793,84 +1734,84 @@ namespace PugTools {
     private void ParseTestRules() {
       File file = _currentAssets.FindFile("/resources/art/dynamic/testrules.rul");
 
-      if (file != null) {
-        XmlDocument xmlDoc = new XmlDocument();
-        xmlDoc.Load(file.OpenCopyInMemory());
+      if (file == null) return;
 
-        XmlNodeList ruleList = xmlDoc.SelectNodes("/Rules/Rule");
-        XmlNodeList exclusionList = xmlDoc.SelectNodes("/Rules/TagExclusion");
-        XmlNodeList groupList = xmlDoc.SelectNodes("/Rules/Group");
+      XmlDocument xmlDoc = new XmlDocument();
+      xmlDoc.Load(file.OpenCopyInMemory());
 
-        _testRules ??= new List<TestRule>();
+      XmlNodeList ruleList = xmlDoc.SelectNodes("/Rules/Rule");
+      XmlNodeList exclusionList = xmlDoc.SelectNodes("/Rules/TagExclusion");
+      XmlNodeList groupList = xmlDoc.SelectNodes("/Rules/Group");
 
-        foreach (XmlNode rule in ruleList) {
-          String slot = rule.Attributes.GetNamedItem("Slot").InnerText;
-          slot = slot == "facehair" ? "FaceHair" : char.ToUpper(slot[0]) + slot[1..];
+      static String Attr(XmlNode node, String name) =>
+        node?.Attributes?.GetNamedItem(name)?.InnerText?.Trim() ?? String.Empty;
 
-          String archetype = "";
-          String attachmentName = "";
+      static List<String> Tags(XmlNode node) {
+        String raw = Attr(node, "Tags");
+        return raw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+          .Select(tag => tag.Trim())
+          .Where(tag => tag.Length > 0)
+          .Distinct(StringComparer.OrdinalIgnoreCase)
+          .ToList();
+      }
 
-          if (rule.Attributes.GetNamedItem("Archetype") != null)
-            archetype = rule.Attributes.GetNamedItem("Archetype").InnerText;
-          if (rule.Attributes.GetNamedItem("AttachmentName") != null)
-            attachmentName = rule.Attributes.GetNamedItem("AttachmentName").InnerText;
+      _testRules ??= new List<TestRule>();
 
-          List<String> tags = new List<String>();
+      if (ruleList != null) foreach (XmlNode rule in ruleList) {
+        // Early/beta rule files omit attributes that later clients always emit.
+        // Jedipedia treats every RUL attribute as optional and defaults it to empty.
+        String slot = Attr(rule, "Slot");
+        if (slot.Length > 0)
+          slot = String.Equals(slot, "facehair", StringComparison.OrdinalIgnoreCase)
+            ? "FaceHair"
+            : Char.ToUpperInvariant(slot[0]) + slot.Substring(1);
 
-          foreach (String tag in
-            rule.Attributes.GetNamedItem("Tags").InnerText.Replace(" ", "").Split(','))
-            tags.Add(tag);
+        TestRule testRule = new TestRule {
+          slot = slot,
+          archetype = Attr(rule, "Archetype"),
+          attachmentName = Attr(rule, "AttachmentName"),
+          tags = Tags(rule)
+        };
 
-          TestRule testRule = new TestRule {
-            slot = slot,
-            archetype = archetype,
-            attachmentName = attachmentName,
-            tags = tags
-          };
+        _testRules.Add(testRule);
+      }
 
-          _testRules.Add(testRule);
+      _tagExclusions ??= new Dictionary<String, List<String>>();
+
+      if (exclusionList != null) foreach (XmlNode tagExclusion in exclusionList) {
+        String excludedTag = Attr(tagExclusion, "ExcludedTag");
+        if (excludedTag.Length == 0) continue;
+
+        List<String> tags = new List<String>();
+
+        foreach (String tagEx in Tags(tagExclusion)) {
+          XmlNode group = groupList?.Cast<XmlNode>().FirstOrDefault(
+            candidate => String.Equals(Attr(candidate, "Name"), tagEx, StringComparison.OrdinalIgnoreCase)
+          );
+
+          if (group != null)
+            tags.AddRange(Tags(group));
+          else
+            tags.Add(tagEx);
         }
 
-        _tagExclusions ??= new Dictionary<String, List<String>>();
+        _tagExclusions[excludedTag] = tags.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+      }
 
-        foreach (XmlNode tagExclusion in exclusionList) {
-          String excludedTag = tagExclusion.Attributes.GetNamedItem("ExcludedTag").InnerText;
+      _testGroups ??= new Dictionary<String, List<String>>();
 
-          List<String> tags = new List<String>();
+      if (groupList != null) foreach (XmlNode group in groupList) {
+        String name = Attr(group, "Name");
+        if (name.Length == 0) continue;
 
-          foreach (String tagEx in
-            tagExclusion.Attributes.GetNamedItem("Tags").InnerText.Replace(" ", "").Split(',')) {
-            XmlNode group = xmlDoc.SelectSingleNode("/Rules/Group[@Name='" + tagEx + "']");
+        List<String> tags = Tags(group);
 
-            if (group != null)
-              foreach (String tag in
-                group.Attributes.GetNamedItem("Tags").InnerText.Replace(" ", "").Split(','))
-                tags.Add(tag);
-            else
-              tags.Add(tagEx);
-          }
+        // Historical client compatibility retained from the original viewer.
+        if (String.Equals(name, "rubberheadshands", StringComparison.OrdinalIgnoreCase) &&
+            !tags.Contains("rakata", StringComparer.OrdinalIgnoreCase))
+          tags.Add("rakata");
 
-          tags = tags.Distinct().ToList();
-
-          _tagExclusions.Add(excludedTag, tags);
-        }
-
-        _testGroups ??= new Dictionary<String, List<String>>();
-
-        foreach (XmlNode group in groupList) {
-          String name = group.Attributes.GetNamedItem("Name").InnerText;
-
-          List<String> tags = new List<String>();
-
-          foreach (String tag in
-            group.Attributes.GetNamedItem("Tags").InnerText.Replace(" ", "").Split(','))
-            tags.Add(tag);
-
-          // Because BW are incompetent or whatev.
-          if (name == "rubberheadshands") tags.Add("rakata");
-
-          _testGroups.Add(name, tags);
-        }
+        _testGroups[name] = tags;
       }
     }
 
@@ -2135,11 +2076,13 @@ namespace PugTools {
 
     private void PreviewIPP(ItemAppearance itemData) {
       LoadIPP(itemData);
+      if (_models == null || _models.Count == 0) {
+        StatusBarText("IPP contains no resolvable model for " + (_bodyType ?? "<unknown body type>"));
+        return;
+      }
 
       _panelRender.LoadModel(_models, _resources, itemData.Fqn, "ipp");
-
       _render = new Thread(_panelRender.StartRender) { IsBackground = true };
-
       _render.Start();
     }
 
@@ -2153,12 +2096,12 @@ namespace PugTools {
         ProgressBarValue(itemsDone * 100 / itemsTotal);
       }
 
-      if (itemsData.Count > 0) {
+      if (itemsData.Count > 0 && _models != null && _models.Count > 0) {
         _panelRender.LoadModel(_models, _resources, itemsData.First().Fqn, "ipp");
-
         _render = new Thread(_panelRender.StartRender) { IsBackground = true };
-
         _render.Start();
+      } else if (itemsData.Count > 0) {
+        StatusBarText("IPP set contains no resolvable models for " + (_bodyType ?? "<unknown body type>"));
       }
     }
 

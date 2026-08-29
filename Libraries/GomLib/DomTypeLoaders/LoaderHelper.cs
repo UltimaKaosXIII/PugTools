@@ -8,17 +8,23 @@ namespace GomLib.DomTypeLoaders
         {
             Int64 offset = reader.BaseStream.Position;
 
-            //reader.BaseStream.Position = 0x8;
-            //dom.Id = reader.ReadUInt64();
-            reader.BaseStream.Position = 0x14;
-            Int16 nameOffset = reader.ReadInt16();
-            Int16 descOffset = reader.ReadInt16();
+            // DBLB v1 (beta): length, flags, dataOffset, id, nameOffset, descOffset
+            // DBLB v2 (live): length, nameHash, id, flags, dataOffset, nameOffset, descOffset
+            reader.BaseStream.Position = reader.DblbVersion == 1 ? 0x10 : 0x14;
+            UInt16 nameOffset = reader.ReadUInt16();
+            UInt16 descOffset = reader.ReadUInt16();
 
-            reader.BaseStream.Position = nameOffset;
-            dom.Name = reader.ReadNullTerminatedString();
+            if (nameOffset > 0 && nameOffset < reader.BaseStream.Length)
+            {
+                reader.BaseStream.Position = nameOffset;
+                dom.Name = reader.ReadNullTerminatedString();
+            }
 
-            reader.BaseStream.Position = descOffset;
-            dom.Description = reader.ReadNullTerminatedString();
+            if (descOffset > 0 && descOffset < reader.BaseStream.Length)
+            {
+                reader.BaseStream.Position = descOffset;
+                dom.Description = reader.ReadNullTerminatedString();
+            }
 
             reader.BaseStream.Position = offset;
         }

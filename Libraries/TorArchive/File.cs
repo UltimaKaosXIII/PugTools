@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 
 using ICSharpCode.SharpZipLib.Zip.Compression.Streams;
@@ -9,10 +9,9 @@ namespace TorArchive {
   /// </summary>
   public class File : IDisposable {
 
-    // Zstandard frames always start with this 4-byte magic number (little-endian: 28 B5 2F FD).
-    // Old (32-bit client) .tor archives compress entries with plain zlib/deflate instead, which
-    // never starts with these bytes. We sniff the first 4 bytes of each compressed entry to pick
-    // the right decompressor, so both old and new .tor files work side by side.
+    // Zstandard frames normally start with this 4-byte magic number (28 B5 2F FD). TOR v6 is
+    // defined as Zstandard and v4/v5 as zlib/DEFLATE; the magic sniff remains as a compatibility
+    // fallback for hybrid/dev archives whose header version does not match the stored payload.
     private static readonly Byte[] ZstdMagic = { 0x28, 0xB5, 0x2F, 0xFD };
 
     #region Constructors
@@ -57,24 +56,31 @@ namespace TorArchive {
     public Stream Open() {
       FileStream archiveStream =
         Archive.OpenStreamAt((Int64)FileInfo.Offset + FileInfo.HeaderSize);
+      Int64 storedLength = FileInfo.IsCompressed
+        ? FileInfo.CompressedSize
+        : FileInfo.UncompressedSize;
+      Stream entryStream = new BoundedReadStream(archiveStream, storedLength);
 
       if (!FileInfo.IsCompressed) {
-        return archiveStream;
+        return entryStream;
       }
 
       // Peek the first few bytes to figure out which codec this entry uses,
       // then rewind before handing off to the actual decompressor.
       Byte[] peek = new Byte[4];
-      Int32 peekRead = archiveStream.Read(peek, 0, peek.Length);
-      archiveStream.Seek(-peekRead, SeekOrigin.Current);
+      Int32 peekRead = entryStream.Read(peek, 0, peek.Length);
+      entryStream.Seek(-peekRead, SeekOrigin.Current);
 
-      Boolean isZstd = peekRead == ZstdMagic.Length && MatchesMagic(peek, ZstdMagic);
+      Boolean hasZstdMagic = peekRead == ZstdMagic.Length && MatchesMagic(peek, ZstdMagic);
+      Boolean isZstd = Archive.Version == 6 || hasZstdMagic;
 
       if (isZstd) {
-        return OpenZstd(archiveStream);
+        return OpenZstd(entryStream);
       } else {
-        // Old-format (32-bit client) entries: classic zlib/deflate via SharpZipLib, as before.
-        InflaterInputStream inflaterStream = new InflaterInputStream(archiveStream);
+        // Old-format (32-bit client) entries: classic zlib/deflate. The bounded
+        // stream is important here: old beta archives often place entries back to
+        // back and InflaterInputStream is allowed to read ahead.
+        InflaterInputStream inflaterStream = new InflaterInputStream(entryStream);
         return inflaterStream;
       }
     }
@@ -83,7 +89,7 @@ namespace TorArchive {
     /// Decompresses a Zstandard-compressed entry (new 64-bit client .tor format).
     /// Requires the "ZstdSharp.Port" NuGet package (pure managed, no native DLL needed).
     /// </summary>
-    private Stream OpenZstd(FileStream archiveStream) {
+    private Stream OpenZstd(Stream archiveStream) {
       try {
         Byte[] compressed = new Byte[FileInfo.CompressedSize];
         Int32 totalRead = 0;
@@ -156,16 +162,18 @@ namespace TorArchive {
     }
 
     public Byte[] PeakBytes(Int32 bytes) {
-      Stream fs = Open();
-      Byte[] buffer = new Byte[bytes];
-
-      // This will screw up if we have a single file greater than 2.1 GB.. probably not an issue.
-      if (FileInfo.UncompressedSize < bytes) {
-        fs.Read(buffer, 0, (Int32)FileInfo.UncompressedSize);
-      } else {
-        fs.Read(buffer, 0, bytes);
+      if (bytes < 0) throw new ArgumentOutOfRangeException(nameof(bytes));
+      Int32 count = (Int32)Math.Min((UInt32)bytes, FileInfo.UncompressedSize);
+      Byte[] buffer = new Byte[count];
+      using Stream fs = Open();
+      Int32 total = 0;
+      while (total < count) {
+        Int32 read = fs.Read(buffer, total, count - total);
+        if (read <= 0) break;
+        total += read;
       }
-
+      if (total == count) return buffer;
+      Array.Resize(ref buffer, total);
       return buffer;
     }
 

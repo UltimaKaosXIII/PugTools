@@ -12,6 +12,8 @@ namespace FileFormats {
     public Single minZ = 0;
     public UInt64 offsetName = 0;
 
+    public GR2_Mesh_Bone() { }
+
     public GR2_Mesh_Bone(BinaryReader br, Boolean is64Bit) {
       offsetName = is64Bit ? br.ReadUInt64() : br.ReadUInt32();
       minX = br.ReadSingle();

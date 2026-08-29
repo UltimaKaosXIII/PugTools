@@ -15,7 +15,7 @@ namespace GomLib.GomTypes {
     public override Object ReadData(DataObjectModel dom, GomBinaryReader reader) {
       if (_dom == null) _dom = dom;
 
-      return _dom.Get<GomObject>(reader.ReadUInt64());
+      return _dom.Get<GomObject>(reader.ReadIdNumber());
     }
     public override System.String ToString() => System.String.Format("Script {0}", DomClass);
   }

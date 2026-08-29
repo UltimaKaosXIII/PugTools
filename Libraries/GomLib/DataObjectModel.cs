@@ -45,6 +45,7 @@ namespace GomLib {
     private List<String> m_bucketFiles;
     private Boolean m_crossLinked;
     private Boolean m_loaded;
+    private Boolean m_legacyGom;
     private readonly Dictionary<String, HashSet<String>> m_namedMap;
     private DomTypeLoaders.FileInstanceLoader m_prototypeLoader;
     private Dictionary<UInt64, String> m_storedIdMap;
@@ -324,7 +325,11 @@ namespace GomLib {
     private void InitializeModelLoaders() {
       // THESE MUST BE IN THIS ORDER!
       ScriptObjectReader = new ScriptObjectReader(this);
-      Data = new Data(this);
+      // DBLB v1 (the RED/BLUE beta client) uses older table schemas. The DOM itself is valid, but
+      // several modern helper tables eagerly cast live-era keys/values in their constructors. Keep
+      // those helpers best-effort in legacy mode so Node/Model/World Browser can use the correctly
+      // parsed GOM instead of aborting on the first incompatible convenience table.
+      Data = new Data(this, m_legacyGom);
       StringTable = new StringTable(this);
       Ami = new AMI(this);
 
@@ -419,35 +424,101 @@ namespace GomLib {
         String path = $"/resources/systemgenerated/buckets/{bucketFileName}";
         File bucketFile = Assets.FindFile(path);
 
-        using (Stream fs = bucketFile.Open())
-        using (GomBinaryReader br = new GomBinaryReader(fs, Encoding.UTF8, this)) {
-          br.ReadBytes(0x24); // Skip 24 header bytes
+        if (bucketFile == null) {
+          Debug.WriteLine("Unable to find GOM bucket {0}", path);
+          continue;
+        }
 
-          ReadAllItems(br, 0x24);
+        // DBLB/PBUK parsing requires Length/seek to hop between contained sections. A compressed
+        // TOR entry exposes an InflaterInputStream whose Length is intentionally unsupported, so
+        // materialize the (small) bucket into a seekable MemoryStream first.
+        using (Stream fs = bucketFile.OpenCopyInMemory())
+        using (GomBinaryReader br = new GomBinaryReader(fs, Encoding.UTF8, this)) {
+          Int32 magic = br.ReadInt32();
+          UInt16 majorVersion = br.ReadUInt16();
+          UInt16 minorVersion = br.ReadUInt16();
+
+          if (magic != 0x4B554250) {
+            throw new InvalidOperationException($"{path} does not begin with PBUK.");
+          }
+
+          if (majorVersion != 2 || (minorVersion != 4 && minorVersion != 5)) {
+            throw new InvalidOperationException($"Unsupported PBUK version {majorVersion}.{minorVersion} in {path}.");
+          }
+
+          // PBUK is a wrapper containing DBLB sections. Beta buckets carry
+          // DBLB v1 entries, while live buckets use DBLB v2. The old reader
+          // skipped a fixed 0x24-byte header and therefore interpreted v1
+          // entries with v2 offsets.
+          while (br.BaseStream.Position + 4 <= br.BaseStream.Length) {
+            UInt32 sectionLength = br.ReadUInt32();
+            if (sectionLength == 0) break;
+
+            Int64 sectionStart = br.BaseStream.Position;
+            Int64 sectionEnd = sectionStart + sectionLength;
+            if (sectionLength < 12 || sectionEnd > br.BaseStream.Length) {
+              throw new InvalidDataException($"Invalid DBLB section length {sectionLength} in {path}.");
+            }
+
+            Int32 dblbMagic = br.ReadInt32();
+            Int32 dblbVersion = br.ReadInt32();
+            if (dblbMagic != 0x424C4244) {
+              throw new InvalidOperationException($"DBLB section in {path} has an invalid magic value.");
+            }
+            if (dblbVersion != 1 && dblbVersion != 2) {
+              throw new InvalidOperationException($"Unsupported DBLB version {dblbVersion} in {path}.");
+            }
+            if (dblbVersion == 1) m_legacyGom = true;
+
+            ReadAllItems(br, br.BaseStream.Position, dblbVersion);
+            br.BaseStream.Position = sectionEnd;
+          }
         }
       }
     }
 
     private void LoadBucketList() {
       File gomFile = Assets.FindFile("/resources/systemgenerated/buckets.info");
+      if (gomFile == null)
+        throw new FileNotFoundException("Unable to find /resources/systemgenerated/buckets.info.");
 
-      using (Stream fs = gomFile.Open())
+      // PBCK is small, and reading it through a seekable copy lets us validate the final marker/EOF
+      // exactly like Jedipedia does for both beta (1.4 / 500 buckets) and live (1.5 / 997 buckets).
+      using (Stream fs = gomFile.OpenCopyInMemory())
       using (GomBinaryReader br = new GomBinaryReader(fs, Encoding.UTF8, this)) {
-        br.ReadBytes(8); // Skip 8 header bytes
+        Byte[] magic = br.ReadBytes(4);
+        if (magic.Length != 4 || magic[0] != (Byte)'P' || magic[1] != (Byte)'B' ||
+            magic[2] != (Byte)'C' || magic[3] != (Byte)'K')
+          throw new InvalidDataException("buckets.info does not begin with PBCK.");
 
-        Byte c9 = br.ReadByte();
+        UInt16 majorVersion = br.ReadUInt16();
+        UInt16 minorVersion = br.ReadUInt16();
+        if (majorVersion != 1 || (minorVersion != 4 && minorVersion != 5))
+          throw new InvalidDataException(
+            $"Unsupported PBCK version {majorVersion}.{minorVersion}; expected 1.4 or 1.5.");
 
-        if (c9 != 0xC9) {
-          throw new InvalidOperationException(
-            $"Unexpected character in buckets.info @ offset 0x8 - expected 0xC9 found {c9:X2}");
-        }
+        Int32 numEntries = br.ReadCount32("bucket count");
+        if (numEntries != 500 && numEntries != 997)
+          throw new InvalidDataException(
+            $"Unexpected buckets.info bucket count {numEntries}; expected 500 (32-bit/beta) or 997 (64-bit/live).");
 
-        Int16 numEntries = br.ReadInt16(Endianness.BigEndian);
-
+        m_bucketFiles.Clear();
         for (Int32 i = 0; i < numEntries; i++) {
-          String fileName = br.ReadLengthPrefixString();
+          // PBCK stores bucket-name lengths as a literal byte, not a generic GOM string varint.
+          Int32 length = br.ReadByte();
+          if (length > br.BaseStream.Length - br.BaseStream.Position)
+            throw new EndOfStreamException($"Truncated bucket name at index {i}.");
+          String fileName = br.ReadFixedLengthString(length);
           m_bucketFiles.Add(fileName);
         }
+
+        Byte finalMarker = br.ReadByte();
+        if (finalMarker != 0xD3)
+          throw new InvalidDataException(
+            $"Invalid buckets.info final marker 0x{finalMarker:X2}; expected 0xD3.");
+        if (br.BaseStream.Position != br.BaseStream.Length)
+          throw new InvalidDataException(
+            $"Unexpected trailing data in buckets.info ({br.BaseStream.Length - br.BaseStream.Position} bytes).");
       }
     }
 
@@ -459,7 +530,9 @@ namespace GomLib {
     private void LoadClientGom() {
       File gomFile = Assets.FindFile("/resources/systemgenerated/client.gom");
 
-      using (Stream fs = gomFile.Open())
+      // client.gom is commonly zlib-compressed in beta TOR archives. InflaterInputStream does not
+      // implement Length, while DBLB validation needs a bounded/seekable stream.
+      using (Stream fs = gomFile.OpenCopyInMemory())
       using (GomBinaryReader br = new GomBinaryReader(fs, Encoding.UTF8, this)) {
         Int32 magic = br.ReadInt32(); // Check DBLB
 
@@ -467,9 +540,13 @@ namespace GomLib {
           throw new InvalidOperationException("client.gom does not begin with DBLB.");
         }
 
-        _ = br.ReadInt32(); // Skip 4 bytes
+        Int32 dblbVersion = br.ReadInt32();
+        if (dblbVersion != 1 && dblbVersion != 2) {
+          throw new InvalidOperationException($"Unsupported client.gom DBLB version {dblbVersion}.");
+        }
+        if (dblbVersion == 1) m_legacyGom = true;
 
-        ReadAllItems(br, 8);
+        ReadAllItems(br, 8, dblbVersion);
       }
     }
 
@@ -479,9 +556,10 @@ namespace GomLib {
 
       if (protoFile == null) {
         Debug.WriteLine("Unable to find {0}", path);
+        return;
       }
 
-      using (Stream fs = protoFile.Open())
+      using (Stream fs = protoFile.OpenCopyInMemory())
       using (GomBinaryReader br = new GomBinaryReader(fs, Encoding.UTF8, this)) {
         Int32 magicNum = br.ReadInt32(); // Check PROT
 
@@ -489,7 +567,10 @@ namespace GomLib {
           throw new InvalidOperationException($"{path} does not begin with PROT");
         }
 
-        br.ReadInt32(); // Skip 4 bytes
+        UInt16 versionMajor = br.ReadUInt16();
+        UInt16 versionMinor = br.ReadUInt16();
+        if (versionMajor != 2 || (versionMinor != 4 && versionMinor != 5))
+          throw new InvalidDataException($"Unsupported PROT version {versionMajor}.{versionMinor} in {path}.");
 
         GomObject proto = m_prototypeLoader.Load(br) as GomObject;
         proto.Dom_ = this;
@@ -513,20 +594,31 @@ namespace GomLib {
           throw new InvalidOperationException("prototypes.info does not begin with PINF");
         }
 
-        br.ReadInt32(); // Skip 4 bytes
+        UInt16 versionMajor = br.ReadUInt16();
+        UInt16 versionMinor = br.ReadUInt16();
+        if (versionMajor != 1 || (versionMinor != 4 && versionMinor != 5))
+          throw new InvalidDataException($"Unsupported PINF version {versionMajor}.{versionMinor}; expected 1.4 or 1.5.");
 
-        Int32 numPrototypes = (Int32)br.ReadNumber();
+        Int32 numPrototypes = br.ReadCount32("prototype count");
         Int32 protoLoaded = 0;
 
         for (Int32 i = 0; i < numPrototypes; i++) {
-          UInt64 protId = br.ReadNumber();
+          UInt64 protId = br.ReadIdNumber();
           Byte flag = br.ReadByte();
+          if (flag < 1 || flag > 3)
+            throw new InvalidDataException($"Invalid prototypes.info node type {flag} at index {i}.");
 
           if (flag == 1) {
             LoadPrototype(protId);
             protoLoaded++;
           }
         }
+
+        Byte finalMarker = br.ReadByte();
+        if (finalMarker != 0xD3)
+          throw new InvalidDataException($"Invalid prototypes.info final marker 0x{finalMarker:X2}; expected 0xD3.");
+        if (br.BaseStream.CanSeek && br.BaseStream.Position != br.BaseStream.Length)
+          throw new InvalidDataException($"Unexpected trailing data in prototypes.info ({br.BaseStream.Length - br.BaseStream.Position} bytes).");
 
         Debug.WriteLine("Loaded {0} prototype files", protoLoaded);
       }
@@ -597,44 +689,66 @@ namespace GomLib {
       }
     }
 
-    public void ReadAllItems(GomBinaryReader br, Int64 offset) {
+    public void ReadAllItems(GomBinaryReader br, Int64 offset, Int32 dblbVersion = 2) {
+      if (dblbVersion != 1 && dblbVersion != 2) {
+        throw new ArgumentOutOfRangeException(nameof(dblbVersion), "DBLB version must be 1 or 2.");
+      }
 
       while (true) {
-        // Begin Reading Gom Definitions
-        Int32 defLength = br.ReadInt32();
+        Int64 entryStart;
+        try {
+          entryStart = br.BaseStream.Position;
+        } catch (NotSupportedException) {
+          // Some decompression streams expose neither Position nor Length. The loaders below do
+          // not need an absolute file offset; keep diagnostics usable without making stream
+          // capabilities part of the DBLB format contract.
+          entryStart = offset;
+        }
 
-        // Length == 0 means we've read them all!
+        Int32 defLength;
+        try {
+          defLength = br.ReadInt32();
+        } catch (EndOfStreamException) {
+          break;
+        }
+
+        // Length == 0 means we've read them all.
         if (defLength == 0) {
           break;
         }
 
+        Int32 minimumLength = dblbVersion == 1 ? 20 : 24;
+        if (defLength < minimumLength) {
+          throw new InvalidDataException(
+            $"Invalid DBLB v{dblbVersion} definition length {defLength} at offset 0x{entryStart:X}.");
+        }
+
+        // Keep the complete raw entry. DomType loaders use version-aware offsets
+        // so beta/v1 and live/v2 definitions can share the same model classes.
         Byte[] defBuffer = new Byte[defLength];
+        Buffer.BlockCopy(BitConverter.GetBytes(defLength), 0, defBuffer, 0, 4);
+        Int32 remaining = defLength - 4;
+        Byte[] entryRemainder = br.ReadBytes(remaining);
+        if (entryRemainder.Length != remaining) {
+          throw new EndOfStreamException(
+            $"Unexpected end of DBLB definition at offset 0x{entryStart:X}.");
+        }
+        Buffer.BlockCopy(entryRemainder, 0, defBuffer, 4, remaining);
 
-        _ = br.ReadInt32();              // Skip 4 bytes
+        UInt64 defId = BitConverter.ToUInt64(defBuffer, 8);
+        Int32 flagsOffset = dblbVersion == 1 ? 4 : 16;
+        UInt16 defFlags = BitConverter.ToUInt16(defBuffer, flagsOffset);
+        Int32 defType = (defFlags >> 3) & 0xF;
 
-        UInt64 defId = br.ReadUInt64();  // UInt64 type ID
-        Int16 defFlags = br.ReadInt16(); // Int16  flag field
-        Int32 defType = (defFlags >> 3) & 0x7;
-
-        //Byte[] defData = br.ReadBytes(defLength - 6);
-        Byte[] defData = br.ReadBytes(defLength - 18);
-        Buffer.BlockCopy(defData, 0, defBuffer, 18, defData.Length);
-
-        using (MemoryStream memStream = new MemoryStream(defBuffer))
-        using (GomBinaryReader defReader = new GomBinaryReader(memStream, Encoding.UTF8, this)) {
+        using (MemoryStream memStream = new MemoryStream(defBuffer, false))
+        using (GomBinaryReader defReader = new GomBinaryReader(memStream, Encoding.UTF8, this, dblbVersion)) {
           if (m_typeLoaderMap.TryGetValue(defType, out DomTypeLoaders.IDomTypeLoader loader)) {
             DomType domType = loader.Load(defReader);
             domType.Dom_ = this;
             domType.Id = defId;
 
-            // if (defId == 16141050636868461855) {
-            //   String sfiino = "";
-            // }
-
             if (!DomTypeMap.ContainsKey(domType.Id)) {
               DomTypeMap.Add(domType.Id, domType);
-
-              String type = domType.GetType().ToString();
 
               if (String.IsNullOrEmpty(domType.Name)) {
                 if (m_storedIdMap.TryGetValue(domType.Id, out String storedTypeName)) {
@@ -642,29 +756,23 @@ namespace GomLib {
                 }
               }
 
-              // if (type != "GomLib.DomEnum" 
-              //     && type != "GomLib.DomAssociation" 
-              //     && type != "GomLib.DomField" 
-              //     && type != "GomLib.DomClass") {
-              //   GomObjectData dat = ((GomObject)domType).Data;
-              //   String pausehere = "";
-              // }
-
               AddToNameLookup(domType);
             }
           } else {
             throw new InvalidOperationException(
-              $"No loader for DomType 0x{defType:X} as offset 0x{offset:X}");
+              $"No loader for DomType 0x{defType:X} at offset 0x{offset:X} (DBLB v{dblbVersion}).");
           }
         }
 
-        // Read the required number of padding bytes
+        // Definitions are aligned to 8-byte boundaries outside the length field.
         Int32 padding = (8 - (defLength & 0x7)) & 0x7;
-        if (padding > 0) {
-          br.ReadBytes(padding);
+        Int64 nextOffset = entryStart + defLength + padding;
+        if (nextOffset > br.BaseStream.Length) {
+          throw new EndOfStreamException(
+            $"DBLB padding exceeds the stream at offset 0x{entryStart:X}.");
         }
-
-        offset = offset + defLength + padding;
+        br.BaseStream.Position = nextOffset;
+        offset = nextOffset;
       }
     }
 
@@ -803,6 +911,7 @@ namespace GomLib {
     #region Properties
     public AMI Ami { get; private set; }
     public Assets Assets { get; }
+    public Boolean IsLegacyGom { get { return m_legacyGom; } }
     public Data Data { get; private set; }
     public Dictionary<UInt64, DomType> DomTypeMap { get; private set; }
     public GomTypeLoader GomTypeLoader { get; private set; }

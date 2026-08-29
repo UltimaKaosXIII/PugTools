@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 
 namespace FileFormats {
@@ -6,6 +6,8 @@ namespace FileFormats {
     public Int32 matId = -1;
     public UInt32 numPieceFaces;
     public UInt32 startIndex;
+
+    public GR2_Mesh_Piece() { }
 
     public GR2_Mesh_Piece(BinaryReader br/*, GR2_Mesh parent*/) {
       startIndex = br.ReadUInt32();

@@ -27,6 +27,8 @@ namespace FileFormats {
     public Single Y;
     public Single Z;
 
+    public GR2_Mesh_Vertex() { }
+
     public GR2_Mesh_Vertex(BinaryReader br, UInt32 bitFlag2) {
       if ((bitFlag2 & 0x1) != 0x1) {
         throw new GR2_Vertex_Size_Exception("Invalid Vertex Size");

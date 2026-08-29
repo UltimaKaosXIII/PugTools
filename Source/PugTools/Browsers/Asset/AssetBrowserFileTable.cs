@@ -94,7 +94,7 @@ namespace PugTools {
             ArchTreeListItem assetArch = new ArchTreeListItem(
               "/root/" + name, "/root", name, arch.Value
             );
-            _assetDict.Add("/root/" + lib.Name, assetArch);
+            _assetDict["/root/" + name] = assetArch;
           }
         }
       }

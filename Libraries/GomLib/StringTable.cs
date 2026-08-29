@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Xml.Linq;
 // using System.Diagnostics;
 
 namespace GomLib {
@@ -109,158 +111,163 @@ namespace GomLib {
     }
 
     public bool StbFileExists() {
-      List<string> localizations = new List<string> {
-                "en-us",
-                "fr-fr",
-                "de-de"
-            };
-
-      foreach (string localization in localizations) {
-        var path = string.Format("/resources/" + localization + "/{0}.stb", Fqn.Replace('.', '/'));
-        if (Dom_.Assets.HasFile(path)) {
+      foreach (string localization in StringTableLocalizations()) {
+        string basePath = "/resources/" + localization + "/" + Fqn.Replace('.', '/');
+        if (Dom_.Assets.HasFile(basePath + ".stb") || Dom_.Assets.HasFile(basePath + ".str"))
           return true;
-        }
       }
 
       return false;
     }
 
+    private static IEnumerable<string> StringTableLocalizations() {
+      yield return "en-us";
+      yield return "fr-fr";
+      yield return "de-de";
+    }
+
+    private static Dictionary<string, string> EmptyLocalizedText() {
+      return new Dictionary<string, string> {
+        { "enMale", "" },
+        { "enFemale", "" },
+        { "frMale", "" },
+        { "frFemale", "" },
+        { "deMale", "" },
+        { "deFemale", "" },
+      };
+    }
+
+    private StringTableEntry EnsureEntry(long entryId) {
+      if (!data.TryGetValue(entryId, out StringTableEntry entry)) {
+        entry = new StringTableEntry {
+          Id = entryId,
+          LocalizedText = EmptyLocalizedText(),
+          OptionText = EmptyLocalizedText()
+        };
+        data[entryId] = entry;
+      }
+      return entry;
+    }
+
     private void Load() {
-      // Version with String Tables as XML files
-      //var path = String.Format("/resources/en-us/{0}.str", this.Fqn.Replace('.','/'));
-      //var file = Assets.FindFile(path);
-      //if (file == null) { throw new Exception("File not found"); }
-
-      //using (var fs = file.Open())
-      //{
-      //    var xmlReader = XmlReader.Create(fs);
-      //    var xdoc = XDocument.Load(xmlReader);
-      //    var xroot = xdoc.Root;
-
-      //    this.Version = xroot.Attribute("version").AsInt();
-      //    this.OwnerFqn = (string)xroot.Attribute("owner");
-      //    this.OwnerId = xroot.Attribute("ownerID").AsLong();
-      //    this.Guid = xroot.Attribute("GUID").AsLong();
-      //    this.Fqn = (string)xroot.Attribute("fqn");
-      //    var results = from row in xdoc.Descendants("string") select LoadString(row);
-      //    data = results.ToDictionary(k => k.Id, v => v);
-      //}
-
-      // Version with String Tables as nodes
-      //var enUsPath = "en-us." + this.Fqn;
-      //var file = DataObjectModel.GetObject(enUsPath);
-      //if (file == null) { throw new Exception("StringTable not found"); }
-
-      //var strings = file.Data.strTableVariantStrings as IDictionary<object, object>; // Map<enum, Map<int, string>>
-      //var entries = (IDictionary<object,object>)strings.First(kvp => ((ScriptEnum)kvp.Key).ToString() == "MaleMale").Value;
-      //data = new Dictionary<long, StringTableEntry>();
-      //foreach (var kvp in entries)
-      //{
-      //    var entry = new StringTableEntry()
-      //    {
-      //        Id = (long)kvp.Key,
-      //        Text = (string)kvp.Value
-      //    };
-      //    data[entry.Id] = entry;
-      //}
-      List<string> localizations = new List<string> {
-                "en-us",
-                "fr-fr",
-                "de-de"
-            };
       bool foundAtLeastOneTable = false;
-
       data = new Dictionary<long, StringTableEntry>();
 
-      foreach (var localization in localizations) {
-        // Version with String Tables as unique file format contained in swtor_en-us_global_1.tor
-        var path = string.Format("/resources/" + localization + "/{0}.stb", Fqn.Replace('.', '/'));
-        var file = Dom_.Assets.FindFile(path);
-        if (file == null) { continue; } //throw new Exception("File not found"); }
-        foundAtLeastOneTable = true;
+      foreach (string localization in StringTableLocalizations()) {
+        string basePath = "/resources/" + localization + "/" + Fqn.Replace('.', '/');
 
-        using var fs = file.OpenCopyInMemory();
-        var br = new GomBinaryReader(fs, Dom_);
-        br.ReadBytes(3);
-        int numStrings = br.ReadInt32();
+        var stbFile = Dom_.Assets.FindFile(basePath + ".stb");
+        if (stbFile != null) {
+          foundAtLeastOneTable = true;
+          LoadBinaryStb(localization, stbFile);
+          continue;
+        }
 
-        long streamPos = 0;
-
-        for (var i = 0; i < numStrings; i++) {
-          var entryId = br.ReadInt64();
-          var entry_t1 = br.ReadByte();
-          _ = br.ReadByte();
-          _ = br.ReadSingle();
-          var entryLength = br.ReadInt32();
-          var entryOffset = br.ReadInt32();
-          _ = br.ReadInt32();
-
-          var entry = new StringTableEntry()
-                        {
-            Id = entryId,
-            LocalizedText = new Dictionary<string, string> {
-                                { "enMale", "" },
-                                //{ "enFemale", "" },
-                                { "frMale", "" },
-                                { "frFemale", "" },
-                                { "deMale", "" },
-                                { "deFemale", "" },
-                            },
-            OptionText = new Dictionary<string, string> {
-                                { "enMale", "" },
-                                //{ "enFemale", "" },
-                                { "frMale", "" },
-                                { "frFemale", "" },
-                                { "deMale", "" },
-                                { "deFemale", "" },
-                            }
-
-            //enMaleText = String.Empty
-          };
-
-          string text = "";
-          if (entryLength > 0) {
-            streamPos = fs.Position;
-            fs.Position = entryOffset;
-            text = br.ReadFixedLengthString(entryLength);
-            fs.Position = streamPos;
-          }
-
-          if (!data.ContainsKey(entryId)) {
-            data[entryId] = entry;
-          }
-
-          if (text.Length > 0) {
-            string textTag = "unknown";
-            switch (localization) {
-              case "en-us":
-                if (entry_t1 == 65 || entry_t1 == 80)
-                  textTag = "enMale";
-                break;
-              case "de-de":
-                if (entry_t1 == 65 || entry_t1 == 80)
-                  textTag = "deMale";
-                else
-                  textTag = "deFemale";
-                break;
-              case "fr-fr":
-                if (entry_t1 == 65 || entry_t1 == 80)
-                  textTag = "frMale";
-                else
-                  textTag = "frFemale";
-                break;
-            }
-
-            if (entry_t1 == 65 || entry_t1 == 70) {
-              data[entryId].LocalizedText[textTag] = text;
-            } else if (entry_t1 == 80 || entry_t1 == 81) {
-              data[entryId].HasOptionText = true;
-              data[entryId].OptionText[textTag] = text;
-            }
-          }
+        // Early BLUE beta string tables are XML .str resources. They predate both
+        // stb.manifest and the binary STB format used by RED/later clients.
+        var strFile = Dom_.Assets.FindFile(basePath + ".str");
+        if (strFile != null) {
+          foundAtLeastOneTable = true;
+          LoadLegacyStr(localization, strFile);
         }
       }
-      if (!foundAtLeastOneTable) { throw new Exception("File not found"); }
+
+      if (!foundAtLeastOneTable) throw new Exception("File not found");
+    }
+
+    private void LoadBinaryStb(string localization, TorArchive.File file) {
+      using var fs = file.OpenCopyInMemory();
+      var br = new GomBinaryReader(fs, Dom_);
+      br.ReadBytes(3);
+      int numStrings = br.ReadInt32();
+
+      for (var i = 0; i < numStrings; i++) {
+        long entryId = br.ReadInt64();
+        byte entryType = br.ReadByte();
+        _ = br.ReadByte();
+        _ = br.ReadSingle();
+        int entryLength = br.ReadInt32();
+        int entryOffset = br.ReadInt32();
+        _ = br.ReadInt32();
+
+        string text = "";
+        if (entryLength > 0) {
+          long streamPos = fs.Position;
+          fs.Position = entryOffset;
+          text = br.ReadFixedLengthString(entryLength);
+          fs.Position = streamPos;
+        }
+
+        StringTableEntry entry = EnsureEntry(entryId);
+        if (text.Length == 0) continue;
+
+        string textTag = localization switch {
+          "en-us" => (entryType == 65 || entryType == 80) ? "enMale" : "enFemale",
+          "de-de" => (entryType == 65 || entryType == 80) ? "deMale" : "deFemale",
+          "fr-fr" => (entryType == 65 || entryType == 80) ? "frMale" : "frFemale",
+          _ => null
+        };
+        if (textTag == null) continue;
+
+        if (entryType == 65 || entryType == 70) {
+          entry.LocalizedText[textTag] = text;
+        } else if (entryType == 80 || entryType == 81) {
+          entry.HasOptionText = true;
+          entry.OptionText[textTag] = text;
+        }
+      }
+    }
+
+    private void LoadLegacyStr(string localization, TorArchive.File file) {
+      using var fs = file.OpenCopyInMemory();
+      XDocument doc = XDocument.Load(fs, LoadOptions.None);
+      XElement root = doc.Root;
+      if (root == null) return;
+
+      if (Version == 0 && Int32.TryParse(root.Attribute("version")?.Value, NumberStyles.Integer,
+        CultureInfo.InvariantCulture, out int parsedVersion)) Version = parsedVersion;
+      if (String.IsNullOrWhiteSpace(OwnerFqn)) OwnerFqn = root.Attribute("owner")?.Value;
+      if (OwnerId == 0) OwnerId = ParseLegacyInt64(root.Attribute("ownerID")?.Value);
+      if (Guid == 0) Guid = ParseLegacyInt64(root.Attribute("GUID")?.Value);
+
+      foreach (XElement row in root.Descendants("string")) {
+        XAttribute idAttribute = row.Attribute("id");
+        if (idAttribute == null || String.IsNullOrWhiteSpace(idAttribute.Value)) continue;
+        long entryId = ParseLegacyInt64(idAttribute.Value);
+        StringTableEntry entry = EnsureEntry(entryId);
+
+        string male = row.Element("text")?.Value ?? String.Empty;
+        string female = row.Element("textFemale")?.Value;
+        if (String.IsNullOrEmpty(female)) female = male;
+
+        switch (localization) {
+          case "en-us":
+            entry.LocalizedText["enMale"] = male;
+            entry.LocalizedText["enFemale"] = female;
+            break;
+          case "fr-fr":
+            entry.LocalizedText["frMale"] = male;
+            entry.LocalizedText["frFemale"] = female;
+            break;
+          case "de-de":
+            entry.LocalizedText["deMale"] = male;
+            entry.LocalizedText["deFemale"] = female;
+            break;
+        }
+      }
+    }
+
+    private static long ParseLegacyInt64(string text) {
+      if (String.IsNullOrWhiteSpace(text)) return 0;
+      text = text.Trim();
+      if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+          UInt64.TryParse(text.Substring(2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out ulong hex))
+        return unchecked((long)hex);
+      if (Int64.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out long signed))
+        return signed;
+      if (UInt64.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong unsigned))
+        return unchecked((long)unsigned);
+      return 0;
     }
 
     //private StringTableEntry LoadString(XElement row)

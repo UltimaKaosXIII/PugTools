@@ -1,18 +1,81 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.IO;
 using GomLib.Models;
+using File = TorArchive.File;
 
 namespace GomLib.ModelLoader {
   public class AppearanceLoader {
     private readonly DataObjectModel _dom;
     internal Dictionary<String, WeaponAppearance> itmAppearanceDatatable;
+    private readonly Dictionary<String, (String Bt, String Gen)> partsMacroCache =
+      new Dictionary<String, (String Bt, String Gen)>(StringComparer.OrdinalIgnoreCase);
 
     public AppearanceLoader(DataObjectModel dom) {
       _dom = dom;
     }
     public void Flush() {
       itmAppearanceDatatable = null;
+      partsMacroCache.Clear();
+    }
+
+    /// <summary>
+    /// Resolve the [bt]/[gen] macros from a character spec. These are not aliases for the
+    /// character-spec name: old creature rigs frequently reuse another body's dynamic art.
+    /// Jedipedia reads the [PARTSMACROS] section from art/dynamic/spec/&lt;bodyType&gt;.dyc.
+    /// </summary>
+    public (String Bt, String Gen) ResolvePartsMacros(String bodyType) {
+      String name = (bodyType ?? String.Empty).Trim().ToLowerInvariant();
+      if (partsMacroCache.TryGetValue(name, out var cached)) return cached;
+
+      String bt = name;
+      String gen = name.StartsWith("bf", StringComparison.OrdinalIgnoreCase) ? "f" : "m";
+      if (String.IsNullOrWhiteSpace(name) || _dom?.Assets == null) return (bt, gen);
+
+      String path = "/resources/art/dynamic/spec/" + name + ".dyc";
+      File file = _dom.Assets.FindFile(path);
+      // Jedipedia deliberately does not cache a missing spec: another TOR can be added later in
+      // the same application session. Return the historical fallback now and retry on the next use.
+      if (file == null) return (bt, gen);
+
+      try {
+        using (file)
+        using (Stream stream = file.OpenCopyInMemory())
+        using (var reader = new StreamReader(stream, System.Text.Encoding.UTF8, true)) {
+          bool inMacros = false;
+          while (!reader.EndOfStream) {
+            String line = (reader.ReadLine() ?? String.Empty).Trim();
+            if (line.Length == 0 || line.StartsWith("!", StringComparison.Ordinal)) continue;
+            if (line.StartsWith("[", StringComparison.Ordinal)) {
+              inMacros = line.Equals("[PARTSMACROS]", StringComparison.OrdinalIgnoreCase);
+              continue;
+            }
+            if (!inMacros) continue;
+            Int32 equals = line.IndexOf('=');
+            if (equals <= 0) continue;
+            String key = line.Substring(0, equals).Trim();
+            String value = line.Substring(equals + 1).Trim().ToLowerInvariant();
+            if (String.Equals(key, "bt", StringComparison.OrdinalIgnoreCase) && value.Length > 0) bt = value;
+            else if (String.Equals(key, "gen", StringComparison.OrdinalIgnoreCase) && value.Length > 0) gen = value;
+          }
+        }
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Character appearance macros failed " + path + ": " + ex.Message);
+        // A malformed/unavailable file should be retryable for the same reason as a missing archive.
+        return (bt, gen);
+      }
+
+      var result = (Bt: bt, Gen: gen);
+      partsMacroCache[name] = result;
+      return result;
+    }
+
+    public String ApplyPartsMacros(String value, String bodyType) {
+      if (String.IsNullOrEmpty(value)) return value ?? String.Empty;
+      var macros = ResolvePartsMacros(bodyType);
+      return value.Replace("[bt]", macros.Bt, StringComparison.OrdinalIgnoreCase)
+        .Replace("[gen]", macros.Gen, StringComparison.OrdinalIgnoreCase);
     }
     public GameObject Load(GameObject obj, GomObject gom) {
       if (obj == null) throw new ArgumentNullException(nameof(obj));
@@ -37,33 +100,48 @@ namespace GomLib.ModelLoader {
 
     public GameObject Load(UInt64 nodeId) => Load(_dom.GetObject(nodeId));
 
-    public AppSlot LoadAppSlot(GomObjectData obj, String btOverride) {
-      if (obj == null) return new AppSlot(_dom);
+    private static String AppSlotName(Object raw) {
+      if (raw is ScriptEnum scriptEnum) {
+        String resolved = scriptEnum.ToString();
+        if (!String.IsNullOrWhiteSpace(resolved) && !resolved.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+          return resolved;
+        raw = scriptEnum.Value;
+      }
+
+      Int64 value;
+      try { value = Convert.ToInt64(raw); }
+      catch { return raw?.ToString(); }
+
+      return value switch {
+        1 => "appSlotAge", 2 => "appSlotBoot", 3 => "appSlotBracer", 4 => "appSlotChest",
+        5 => "appSlotComplexion", 6 => "appSlotCreature", 7 => "appSlotEyeColor", 8 => "appSlotFace",
+        9 => "appSlotFaceHair", 10 => "appSlotFacePaint", 11 => "appSlotHair", 12 => "appSlotHairColor",
+        13 => "appSlotHand", 14 => "appSlotHead", 15 => "appSlotLeg", 16 => "appSlotSkinColor",
+        17 => "appSlotWaist", 19 => "appSlotGarmentHue", 20 => "appSlotColorScheme",
+        _ => null
+      };
+    }
+
+    public AppSlot LoadAppSlot(GomObjectData obj, String btOverride, String slotTypeOverride = null) {
+      if (obj == null) return new AppSlot(_dom) { BodyType = btOverride, Type = slotTypeOverride ?? "appSlotAge" };
 
       AppSlot app = new AppSlot(_dom) {
         Dom = _dom,
         BodyType = btOverride
       };
-      ScriptEnum typ = (ScriptEnum)obj.ValueOrDefault<Object>("appAppearanceSlotType", null);
+      String slotType = !String.IsNullOrWhiteSpace(slotTypeOverride)
+        ? slotTypeOverride
+        : AppSlotName(obj.ValueOrDefault<Object>("appAppearanceSlotType", null));
+      app.Type = String.IsNullOrWhiteSpace(slotType) ? "appSlotAge" : slotType;
 
-      if (typ == null) app.Type = "appSlotAge";
-      else app.Type = typ.ToString();
-
-      app.ModelID =
-        obj.ValueOrDefault<Int64>("appAppearanceSlotModelID", 0);
-      app.MaterialIndex =
-        obj.ValueOrDefault<Int64>("appAppearanceSlotMaterialIndex", 0);
-      app.Attachments =
-        obj.ValueOrDefault(
-          "appAppearanceSlotAttachments",
-          new List<Object>()
-        ).ConvertAll(x => (Int64)x);
-      app.RandomWeight =
-        obj.Get<Int64>("appAppearanceSlotRandomWeight");
-      app.PrimaryHueId =
-        obj.ValueOrDefault<Int64>("appAppearanceSlotHuePrimary", 0);
-      app.SecondaryHueId =
-        obj.ValueOrDefault<Int64>("appAppearanceSlotHueSecondary", 0);
+      app.ModelID = obj.ValueOrDefault<Int64>("appAppearanceSlotModelID", 0);
+      app.MaterialIndex = obj.ValueOrDefault<Int64>("appAppearanceSlotMaterialIndex", 0);
+      app.Attachments = obj.ValueOrDefault("appAppearanceSlotAttachments", new List<Object>())
+        .ConvertAll(x => Convert.ToInt64(x));
+      // Historical appearance slots omit defaults far more aggressively than the live schema.
+      app.RandomWeight = obj.ValueOrDefault<Int64>("appAppearanceSlotRandomWeight", 0);
+      app.PrimaryHueId = obj.ValueOrDefault<Int64>("appAppearanceSlotHuePrimary", 0);
+      app.SecondaryHueId = obj.ValueOrDefault<Int64>("appAppearanceSlotHueSecondary", 0);
 
       return app;
     }
@@ -88,7 +166,7 @@ namespace GomLib.ModelLoader {
         Id = obj.Id,
         Dom_ = _dom,
         References = obj.References,
-        BodyType = obj.Data.ValueOrDefault<String>("nppBodyType")
+        BodyType = obj.Data.ValueOrDefault<String>("nppBodyType", "bfn")
       };
 
       Dictionary<Object, Object> slotMap =
@@ -101,17 +179,23 @@ namespace GomLib.ModelLoader {
 
       if (slotMap != null) {
         foreach (var kvp in slotMap) {
-          String key = ((ScriptEnum)kvp.Key).ToString();
+          // The map key is the authoritative appValidSlot. In pre-2.1 NPP data the embedded
+          // appAppearanceSlotType is commonly omitted because it is redundant; defaulting that
+          // missing field to Age made every RED slot look in ami.age/index.xml and yielded only a rig.
+          String key = AppSlotName(kvp.Key);
+          if (String.IsNullOrWhiteSpace(key)) continue;
           List<AppSlot> appList = new List<AppSlot>();
 
-          for (Int32 i = 0; i < ((List<Object>)kvp.Value).Count; i++) {
-            // if (((List<Object>)kvp.Value).Count > 1) throw new IndexOutOfRangeException();
-            AppSlot value =
-              LoadAppSlot((GomObjectData)((List<Object>)kvp.Value)[0], pkg.BodyType);
-            appList.Add(value);
+          if (kvp.Value is List<Object> values) {
+            for (Int32 i = 0; i < values.Count; i++) {
+              if (values[i] is not GomObjectData slotData) continue;
+              appList.Add(LoadAppSlot(slotData, pkg.BodyType, key));
+            }
+          } else if (kvp.Value is GomObjectData oneSlot) {
+            appList.Add(LoadAppSlot(oneSlot, pkg.BodyType, key));
           }
 
-          pkg.AppearanceSlotMap.Add(key, appList);
+          if (appList.Count > 0) pkg.AppearanceSlotMap[key] = appList;
         }
       }
 
