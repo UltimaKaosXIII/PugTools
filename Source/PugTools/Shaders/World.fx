@@ -21,6 +21,8 @@
     float4 OverlayColor;
     float4 MaterialFlatColor;
     float4 MaterialBloomParams;
+    // x=min distance, y=min opacity, z=max distance, w=max opacity.
+    float4 OpacityFadeParams;
     float4 ScrollingOffsetParams;
     float4 ScrollingVisualParams;
     float4 EnvBlendParams1;
@@ -33,6 +35,7 @@
     int LocalLightCount;
     int AlphaMode;
     int MaterialUsesEmissive;
+    int MaterialIsOpacityFade;
     float HookOpacity;
     float AlphaTestValue;
     float DiffuseTextureAlphaMax;
@@ -593,7 +596,15 @@ void EvaluateMaterial(VSOut i, out float4 c, out float3 N, out float4 glossSampl
         glossSample.a=lerp(glossSample.a,EnvBlendParams1.x,blend);
     }
     c=float4(d.rgb,min(DiffuseTextureAlphaMax,alphaValue));
-    if (AlphaMode == 1 && c.a < AlphaTestValue) discard;
+    if (MaterialIsOpacityFade != 0) {
+        // SWTOR OpacityFade ignores texture alpha and replaces it with the authored distance ramp.
+        float fadeRange=max(OpacityFadeParams.z-OpacityFadeParams.x,0.0001);
+        float normalizedDistance=saturate((i.ViewDistance-OpacityFadeParams.x)/fadeRange);
+        float fadeAlpha=normalizedDistance*saturate(OpacityFadeParams.w-OpacityFadeParams.y)+OpacityFadeParams.y;
+        c.a=saturate(fadeAlpha);
+        // None/Test + cutoff is the hard-cutout style. Full is blended and keeps the ramp as real alpha.
+        if (AlphaMode < 2 && AlphaTestValue > 0 && c.a < AlphaTestValue) discard;
+    } else if (AlphaMode == 1 && c.a < AlphaTestValue) discard;
 }
 
 float3 ApplyViewerBlueGlow(float3 rgb, float alphaValue) {

@@ -96,6 +96,7 @@ namespace PugTools {
     private MouseButtons worldSelectionClickButton;
     private bool worldTaxiClickPending;
     private Point worldTaxiClickStart;
+    private MouseButtons worldTaxiClickButton;
     private Form worldSelectionInfoForm;
     private Label worldSelectionInfoTitle;
     private RichTextBox worldSelectionInfoText;
@@ -789,6 +790,7 @@ namespace PugTools {
       };
       btnWorldNavigationMenu.DropDownItems.Add(btnWorldWalkingMode);
       InitializeTaxiRoutesMenu();
+      InitializeSpaceFlypathMenu();
       var fit = new ToolStripMenuItem("Fit area");
       fit.Click += (_, __) => panelRender?.FitArea();
       btnWorldNavigationMenu.DropDownItems.Add(fit);
@@ -838,6 +840,8 @@ namespace PugTools {
         if (String.IsNullOrWhiteSpace(details)) return;
         try { Clipboard.SetText(details); SetStatusLabel("Selected object details copied to clipboard."); } catch (Exception ex) { SetStatusLabel("Could not copy selection: " + ex.Message); }
       };
+      btnWorldSelectedConversation = new ToolStripMenuItem("Open conversation…") { Visible = false };
+      btnWorldSelectedConversation.Click += (_, __) => OpenSelectedWorldConversationPreview();
       var clearSelection = new ToolStripMenuItem("Clear selection");
       clearSelection.Click += (_, __) => { panelRender?.ClearWorldModelSelection(); HideWorldSelectionInfo(); UpdateWorldSelectedObjectMenu(); SetStatusLabel("World selection cleared."); };
       var showSelectionBounds = new ToolStripMenuItem("Show selection bounds (yellow)") { CheckOnClick = true, Checked = worldSettings.ShowSelectionBounds,
@@ -845,6 +849,7 @@ namespace PugTools {
       showSelectionBounds.CheckedChanged += (_, __) => { if (updatingWorldToolbar) return; worldSettings.ShowSelectionBounds = showSelectionBounds.Checked; ApplyWorldSettings(); };
       btnWorldSelectedObject.DropDownItems.Add(showSelectionDetails);
       btnWorldSelectedObject.DropDownItems.Add(copySelectionDetails);
+      btnWorldSelectedObject.DropDownItems.Add(btnWorldSelectedConversation);
       btnWorldSelectedObject.DropDownItems.Add(showSelectionBounds);
       btnWorldSelectedObject.DropDownItems.Add(new ToolStripSeparator());
       btnWorldSelectedObject.DropDownItems.Add(clearSelection);
@@ -1423,7 +1428,7 @@ namespace PugTools {
       AddWorldDropDownToggle(btnWorldUtilities, "Map roads with paths", worldSettings.ShowUtilityMapRoadPaths, v => worldSettings.ShowUtilityMapRoadPaths = v);
       AddWorldDropDownToggle(btnWorldUtilities, "Parent / child connections", worldSettings.ShowUtilityConnections, v => worldSettings.ShowUtilityConnections = v);
       AddWorldDropDownToggle(btnWorldUtilities, "Region / trigger volumes", worldSettings.ShowUtilityVolumes, v => worldSettings.ShowUtilityVolumes = v);
-      AddWorldDropDownToggle(btnWorldUtilities, "Phase gateways", worldSettings.ShowPhaseGateways, v => worldSettings.ShowPhaseGateways = v, "Show INSTANCE_GATEWAY door planes between phased copies of the world");
+      AddWorldDropDownToggle(btnWorldUtilities, "Phase gateways (green gate)", worldSettings.ShowPhaseGateways, v => worldSettings.ShowPhaseGateways = v, "Show INSTANCE_GATEWAY boundaries as the translucent green phase gate used by SWTOR/Jedipedia; enabled by default");
       AddWorldDropDownToggle(btnWorldUtilities, "Other helpers", worldSettings.ShowUtilityOther, v => worldSettings.ShowUtilityOther = v);
       btnWorldUtilities.DropDownItems.Add(new ToolStripSeparator());
       AddWorldDropDownToggle(btnWorldUtilities, "Show hidden occluders && colliders", worldSettings.ShowHiddenGeometry, v => worldSettings.ShowHiddenGeometry = v, "Reveal Hidden/EditorOnly collision, occlusion and helper geometry");
@@ -1441,6 +1446,7 @@ namespace PugTools {
       AddWorldDropDownToggle(btnWorldNpcs, "SPN placeable objects", worldSettings.ShowSpnObjects, v => worldSettings.ShowSpnObjects = v, "Render plc.* objects referenced by SPN spawners");
       AddWorldDropDownToggle(btnWorldNpcs, "SPN animations", worldSettings.AnimateSpnObjects, v => worldSettings.AnimateSpnObjects = v, "Animate MAG/Morpheme-driven SPN placeables when an idle clip can be resolved");
       AddWorldDropDownToggle(btnWorldNpcs, "Interactable blue glow", worldSettings.ShowPlaceableGlow, v => worldSettings.ShowPlaceableGlow = v, "Jedipedia/SWTOR blue interaction tint for usable SPN placeables and usable DYN-state parts");
+      AddWorldDropDownToggle(btnWorldNpcs, "Overhead service / quest symbols", worldSettings.ShowInteractionIcons, v => worldSettings.ShowInteractionIcons = v, "Quest/conversation, mail, vendor, taxi, quick-travel, bank, codex and other resolved interaction markers over NPC/SPN objects");
       btnWorldLayersMenu?.DropDownItems.Add(btnWorldNpcs);
     }
 
@@ -1456,9 +1462,11 @@ namespace PugTools {
         SetStatusLabel("World selection cleared.");
         return;
       }
-      if (e.Button != MouseButtons.Left) return;
+      if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right) return;
 
-      if (worldModelInspectPending) {
+      // The one-shot model inspector stays a left-click tool. A plain right-click is reserved for
+      // service interaction when it is a click; a right-drag still rotates the camera.
+      if (e.Button == MouseButtons.Left && worldModelInspectPending) {
         worldModelInspectPending = false;
         if (btnWorldInspectModel != null) btnWorldInspectModel.Checked = false;
         string details = panelRender?.InspectModelAtScreen(e.X, e.Y) ?? "World renderer is not ready.";
@@ -1467,15 +1475,19 @@ namespace PugTools {
         return;
       }
 
-      // Ctrl+left-click mirrors Jedipedia's object inspector. A short plain click is also tracked, but is consumed only
-      // when it hits an actual NPC/SPN taxi terminal; drags remain camera input and never trigger terminal interaction.
-      if ((Control.ModifierKeys & Keys.Control) != 0 && panelRender?.IsFullMapOpen != true) {
+      // Ctrl+left-click is *only* the object/info inspector. Plain left OR plain right click is
+      // service interaction (Wonkavator, taxi, quick travel, ...). Drags remain camera input and
+      // never trigger either action. Ctrl+right-click keeps the existing "clear selection" shortcut.
+      bool ctrl = (Control.ModifierKeys & Keys.Control) != 0;
+      if (ctrl && e.Button == MouseButtons.Left && panelRender?.IsFullMapOpen != true) {
         worldSelectionClickPending = true;
         worldSelectionClickButton = e.Button;
         worldSelectionClickStart = e.Location;
         worldTaxiClickPending = false;
-      } else if (panelRender?.IsFullMapOpen != true) {
+      } else if (!ctrl && panelRender?.IsFullMapOpen != true) {
+        worldSelectionClickPending = false;
         worldTaxiClickPending = true;
+        worldTaxiClickButton = e.Button;
         worldTaxiClickStart = e.Location;
       }
     }
@@ -1486,7 +1498,7 @@ namespace PugTools {
         int dy = e.Y - worldSelectionClickStart.Y;
         if (dx * dx + dy * dy >= 16) worldSelectionClickPending = false;
       }
-      if (worldTaxiClickPending) {
+      if (worldTaxiClickPending && (e.Button & worldTaxiClickButton) != 0) {
         int dx = e.X - worldTaxiClickStart.X;
         int dy = e.Y - worldTaxiClickStart.Y;
         if (dx * dx + dy * dy >= 16) worldTaxiClickPending = false;
@@ -1494,11 +1506,17 @@ namespace PugTools {
     }
 
     private void RenderPanel_MouseUp(object sender, MouseEventArgs e) {
-      if (e.Button != MouseButtons.Left) return;
-      if (worldSelectionClickPending && worldSelectionClickButton == MouseButtons.Left) {
+      if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right) return;
+      if (e.Button == MouseButtons.Left && worldSelectionClickPending && worldSelectionClickButton == MouseButtons.Left) {
         worldSelectionClickPending = false;
         worldTaxiClickPending = false;
         string details = panelRender?.SelectWorldObjectAtScreen(e.X, e.Y, false, true) ?? "World renderer is not ready.";
+        WorldInteractionInfo selectedInteraction = panelRender?.SelectedWorldInteraction;
+        if (selectedInteraction?.Kind == WorldInteractionKind.MissionBoard) {
+          PopulateWorldMissionBoard(selectedInteraction);
+          panelRender?.RefreshSelectedWorldInteractionDetails();
+          details = panelRender?.SelectedWorldModelDetails ?? details;
+        }
         UpdateWorldSelectedObjectMenu();
         string summary = panelRender?.SelectedWorldModelSummary ?? String.Empty;
         if (!String.IsNullOrWhiteSpace(summary)) {
@@ -1511,13 +1529,70 @@ namespace PugTools {
         return;
       }
 
-      if (!worldTaxiClickPending) return;
+      if (!worldTaxiClickPending || e.Button != worldTaxiClickButton) return;
       worldTaxiClickPending = false;
-      panelRender?.SelectWorldSpawnAtScreen(e.X, e.Y);
-      if (TryOpenWonkavatorForSelectedObject()) { HideWorldSelectionInfo(); return; }
-      if (TryOpenTaxiMapForSelectedObject()) { HideWorldSelectionInfo(); return; }
-      panelRender?.ClearWorldModelSelection();
-      UpdateWorldSelectedObjectMenu();
+      string interactionPick = panelRender?.SelectWorldSpawnAtScreen(e.X, e.Y) ?? "World renderer is not ready.";
+      if (TryOpenWonkavatorForSelectedObject()) { HideWorldSelectionInfo(); panelRender?.ClearWorldInteractionTarget(); return; }
+      if (TryOpenTaxiMapForSelectedObject()) { HideWorldSelectionInfo(); panelRender?.ClearWorldInteractionTarget(); return; }
+      if (panelRender?.TryOpenQuickTravelMapForSelectedSpawn() == true) { HideWorldSelectionInfo(); panelRender.ClearWorldInteractionTarget(); return; }
+
+      WorldInteractionInfo interaction = panelRender?.InteractionTargetWorldInteraction;
+      // Tutorial/knowledge PLCs are identified structurally, not by their localized high-level Placeable model. In
+      // de-de some legacy objects are classified as another generic service before PlaceableLoader reaches the codex
+      // field. Give a lore-looking selected PLC its language-independent raw/FQN resolution before generic services.
+      // The resolver itself refuses non-lore objects unless it finds an explicit plcCodexSpec, so normal terminals are
+      // unaffected by this precedence.
+      if (TryOpenWorldLoreCodexForInteractionTarget()) {
+        HideWorldSelectionInfo();
+        panelRender?.ClearWorldInteractionTarget();
+        return;
+      }
+      if (interaction?.Kind == WorldInteractionKind.Conversation) {
+        HideWorldSelectionInfo();
+        StartWorldConversationPlayback(interaction);
+        panelRender?.ClearWorldInteractionTarget();
+        return;
+      }
+      if (interaction?.Kind == WorldInteractionKind.MissionBoard) {
+        HideWorldSelectionInfo();
+        PopulateWorldMissionBoard(interaction);
+        OpenWorldConversationPreview(interaction);
+        panelRender?.ClearWorldInteractionTarget();
+        return;
+      }
+      if (interaction?.Kind == WorldInteractionKind.Codex) {
+        HideWorldSelectionInfo();
+        OpenWorldCodexPreview(interaction);
+        panelRender?.ClearWorldInteractionTarget();
+        return;
+      }
+      // Services whose game UI is not emulated yet still participate in the interaction pick, so the click semantics
+      // stay consistent without opening the read-only Ctrl inspector. This also makes it obvious which service type
+      // has already been identified and is the next candidate for a dedicated preview.
+      if (interaction != null) SetStatusLabel("Interaction recognized: " + WorldInteractionKindLabel(interaction.Kind) + ".");
+      else SetStatusLabel(interactionPick.Replace("\r", " ").Replace("\n", " "));
+      panelRender?.ClearWorldInteractionTarget();
+    }
+
+    private static string WorldInteractionKindLabel(WorldInteractionKind kind) {
+      return kind switch {
+        WorldInteractionKind.Wonkavator => "Wonkavator",
+        WorldInteractionKind.Taxi => "taxi terminal",
+        WorldInteractionKind.QuickTravel => "quick-travel bindpoint",
+        WorldInteractionKind.Bank => "cargo hold / bank",
+        WorldInteractionKind.GuildBank => "guild bank",
+        WorldInteractionKind.Mailbox => "mailbox",
+        WorldInteractionKind.Vendor => "vendor",
+        WorldInteractionKind.ProfessionTrainer => "crafting trainer",
+        WorldInteractionKind.ClassTrainer => "class trainer",
+        WorldInteractionKind.Harvest => "harvesting node",
+        WorldInteractionKind.MissionBoard => "mission board",
+        WorldInteractionKind.Conversation => "conversation",
+        WorldInteractionKind.Codex => "codex / knowledge object",
+        WorldInteractionKind.AuctionHouse => "auction house",
+        WorldInteractionKind.EnhancementStation => "enhancement station",
+        _ => "service"
+      };
     }
 
     private static ulong WonkUInt64(object value) {
@@ -1884,8 +1959,7 @@ namespace PugTools {
         SetStatusLabel((de ? "Wonkavator: " : fr ? "Ascenseur : " : "Elevator: ") + selectedDestination.Name);
       }
       if (selectedDestination?.Note == null) panelRender.CancelTeleportWarmup();
-      panelRender.ClearWorldModelSelection();
-      UpdateWorldSelectedObjectMenu();
+      panelRender.ClearWorldInteractionTarget();
       ActivateWorldRenderInput();
       return true;
     }
@@ -1923,12 +1997,32 @@ namespace PugTools {
           DetectUrls = false,
           ScrollBars = RichTextBoxScrollBars.Vertical
         };
+        worldSelectionInfoActions = new Panel {
+          Dock = DockStyle.Bottom,
+          Height = 42,
+          Padding = new Padding(8, 6, 8, 5),
+          BackColor = Color.FromArgb(8, 19, 23),
+          Visible = false
+        };
+        worldSelectionConversationButton = WorldDarkActionButton("Open conversation tree…", 170);
+        worldSelectionConversationButton.AutoSize = true; worldSelectionConversationButton.Dock = DockStyle.Left;
+        worldSelectionConversationButton.Click += (_, __) => OpenSelectedWorldConversationPreview();
+        worldSelectionCodexButton = WorldDarkActionButton("Open codex entry…", 140);
+        worldSelectionCodexButton.AutoSize = true; worldSelectionCodexButton.Dock = DockStyle.Left; worldSelectionCodexButton.Margin = new Padding(6, 0, 0, 0);
+        worldSelectionCodexButton.Click += (_, __) => OpenSelectedWorldCodexPreview();
+        worldSelectionInfoActions.Controls.Add(worldSelectionCodexButton);
+        worldSelectionInfoActions.Controls.Add(worldSelectionConversationButton);
         worldSelectionInfoForm.Controls.Add(worldSelectionInfoText);
+        worldSelectionInfoForm.Controls.Add(worldSelectionInfoActions);
         worldSelectionInfoForm.Controls.Add(worldSelectionInfoTitle);
-        worldSelectionInfoForm.FormClosed += (_, __) => { worldSelectionInfoForm = null; worldSelectionInfoTitle = null; worldSelectionInfoText = null; };
+        worldSelectionInfoForm.FormClosed += (_, __) => {
+          worldSelectionInfoForm = null; worldSelectionInfoTitle = null; worldSelectionInfoText = null;
+          worldSelectionInfoActions = null; worldSelectionConversationButton = null; worldSelectionCodexButton = null;
+        };
       }
       worldSelectionInfoTitle.Text = summary;
       worldSelectionInfoText.Text = details;
+      UpdateWorldSelectionInfoActions();
       Point screen = renderPanel.PointToScreen(renderPoint);
       Rectangle work = Screen.FromPoint(screen).WorkingArea;
       int x = Math.Min(work.Right - worldSelectionInfoForm.Width, Math.Max(work.Left, screen.X + 16));
@@ -1949,6 +2043,14 @@ namespace PugTools {
       btnWorldSelectedObject.Enabled = !String.IsNullOrWhiteSpace(summary);
       btnWorldSelectedObject.Text = String.IsNullOrWhiteSpace(summary) ? "Selected object" : "Selected: " + EllipsizeWorldMenuText(summary, 52);
       btnWorldSelectedObject.ToolTipText = summary;
+      if (btnWorldSelectedConversation != null) {
+        WorldInteractionInfo interaction = panelRender?.SelectedWorldInteraction;
+        bool canOpenConversation = CanOpenSelectedWorldConversation();
+        btnWorldSelectedConversation.Visible = canOpenConversation;
+        btnWorldSelectedConversation.Enabled = canOpenConversation;
+        btnWorldSelectedConversation.Text = interaction?.Kind == WorldInteractionKind.MissionBoard ? "Open notice tree…" : "Open conversation…";
+      }
+      UpdateWorldSelectionInfoActions();
     }
 
     private static string EllipsizeWorldMenuText(string text, int maxChars) {
@@ -2400,6 +2502,7 @@ namespace PugTools {
         toolStripRoomStatus.Text = "Current room: " + room;
         UpdatePhaseBanner(phase);
         UpdateWorldVolumePanel();
+        UpdateSpaceCombatEncounterTimeline();
         if (miniMapPanel != null && miniMapPanel.Visible) miniMapPicture?.Invalidate();
       };
       worldOverlayTimer.Start();
@@ -3347,6 +3450,7 @@ namespace PugTools {
     private async Task PreviewAREA(HashFileInfo info, ulong areaId) {
       ShowWorldLoading("Loading world…", "Reading area.dat and phase metadata…");
       try {
+        ResetWorldSpaceCombatEncounterCache();
         area = new FileFormats.Area(info, currentAssets, areaId);
         area.Read();
         UpdateWorldLoading("Loading map pages and phase metadata…");
@@ -3417,6 +3521,7 @@ namespace PugTools {
         LoadWorldUtilityModels();
         LoadWorldNpcPlacements();
         LoadWorldTaxiRoutes();
+        PreloadWorldSpaceCombatEncounterAssets();
 
         SetStatusLabel(string.Format(
           "Rooms:{0} GR2Assets:{1} SPTAssets:{2} Instanzen:{3} zugeordnet:{4} ignoriert:{5} vorgemerkt:{6} GR2fehlt:{7} GR2Fehler:{8} | SpeedTree fallback:{9}/{10} (ohne GR2:{11}) | Utilities:{12} NPCs:{13} SPN:{14} | {15}",
@@ -3453,6 +3558,14 @@ namespace PugTools {
       worldMapIconImages.Clear();
       if (worldSelectionInfoForm != null && !worldSelectionInfoForm.IsDisposed) worldSelectionInfoForm.Dispose();
       worldSelectionInfoForm = null;
+      if (worldConversationPreviewForm != null && !worldConversationPreviewForm.IsDisposed) worldConversationPreviewForm.Dispose();
+      worldConversationPreviewForm = null;
+      StopWorldConversationPlayback(true);
+      DisposeWorldConversationAudioCache();
+      if (worldConversationPlaybackForm != null && !worldConversationPlaybackForm.IsDisposed) worldConversationPlaybackForm.Dispose();
+      worldConversationPlaybackForm = null;
+      if (worldCodexPreviewForm != null && !worldCodexPreviewForm.IsDisposed) worldCodexPreviewForm.Dispose();
+      worldCodexPreviewForm = null;
       if (render != null) {
         panelRender.StopRender();
         render.Join();

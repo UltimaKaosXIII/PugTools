@@ -2,6 +2,57 @@
 using FileFormats;
 
 namespace PugTools {
+  internal enum WorldInteractionKind {
+    None = 0,
+    Wonkavator,
+    Taxi,
+    QuickTravel,
+    Bank,
+    GuildBank,
+    Mailbox,
+    Vendor,
+    ProfessionTrainer,
+    ClassTrainer,
+    Harvest,
+    MissionBoard,
+    Conversation,
+    Codex,
+    AuctionHouse,
+    EnhancementStation
+  }
+
+  internal sealed class WorldMissionBoardQuest {
+    public ulong Id { get; set; }
+    public string Fqn { get; set; }
+    public string Name { get; set; }
+  }
+
+  internal sealed class WorldMissionBoardNotice {
+    public long NodeId { get; set; }
+    public string Text { get; set; }
+    public readonly List<WorldMissionBoardQuest> Quests = new List<WorldMissionBoardQuest>();
+  }
+
+  internal sealed class WorldInteractionInfo {
+    public WorldInteractionKind Kind { get; set; }
+    // Raw/source identities are retained for inspection and for later richer service UIs. The renderer never has to
+    // reopen the GOM node merely to explain what an already-resolved world object does.
+    public string TaxiTerminalSpec { get; set; }
+    public long WonkaPackageId { get; set; }
+    public string MissionBoardPackage { get; set; }
+    public string Conversation { get; set; }
+    public ulong ConversationId { get; set; }
+    public ulong CodexId { get; set; }
+    public int UtilityType { get; set; }
+    public string Profession { get; set; }
+    public string[] VendorPackages { get; set; } = System.Array.Empty<string>();
+    public readonly List<WorldMissionBoardNotice> MissionBoardNotices = new List<WorldMissionBoardNotice>();
+    public bool MissionBoardLoaded { get; set; }
+    public string MissionBoardError { get; set; }
+    // True only when an old client does not expose the authoritative terminal field and the legacy name hint had to
+    // be kept as a compatibility fallback. Live/current data should normally leave this false.
+    public bool LegacyHeuristic { get; set; }
+  }
   internal sealed class WorldSpawnPointPose {
     public SlimDX.Vector3 Position { get; set; }
     // Authored spawn-point rotation only. The editor gizmo scale is intentionally omitted; Jedipedia combines this
@@ -18,6 +69,7 @@ namespace PugTools {
     // Cached once while the GOM placement is built. Taxi terminals remain an independent interaction layer even when
     // the general NPC population is hidden, without doing string classification/allocation every render frame.
     public bool IsTaxiTerminal { get; set; }
+    public WorldInteractionInfo Interaction { get; set; }
     public string[] Items { get; set; } = System.Array.Empty<string>();
     public string RepublicReaction { get; set; }
     public string ImperialReaction { get; set; }
@@ -26,6 +78,16 @@ namespace PugTools {
     public float AnimationPhase { get; set; }
     public string BodyType { get; set; }
     public WorldNpcAnimationClip Animation { get; set; }
+    // Temporary authored conversation animation. The world conversation player owns this override and clears it
+    // when a line/player session ends; normal idle/locomotion animation remains untouched underneath.
+    public WorldNpcAnimationClip ConversationAnimation { get; set; }
+    public float ConversationAnimationStart { get; set; }
+    public float ConversationAnimationOffset { get; set; }
+    public float ConversationAnimationSpeed { get; set; } = 1f;
+    public bool ConversationAnimationLoop { get; set; }
+    // Temporary staging overrides owned by the conversation player. They are restored when playback stops.
+    public SlimDX.Matrix? ConversationWorld { get; set; }
+    public bool ConversationHidden { get; set; }
     // Optional locomotion clips resolved from the body type's Morpheme/anim_library network. A routed NPC should not
     // slide through the world while its skeleton keeps playing the idle pose.
     public WorldNpcAnimationClip WalkAnimation { get; set; }
@@ -104,9 +166,13 @@ namespace PugTools {
     public int VariantIndex { get; set; }
     public int VariantCount { get; set; } = 1;
     public string DynStartState { get; set; }
-    // Cached from the plc.* prototype. Plain-click interaction can therefore consider only real elevator controls
-    // instead of letting an unrelated spawned prop's broad bounds swallow the click in front of a Wonkavator panel.
+    // Cached from the plc.* prototype. Plain-click interaction can therefore consider only real service objects
+    // instead of letting an unrelated spawned prop's broad bounds swallow the click in front of a control panel.
     public long WonkaPackageId { get; set; }
+    // The exact SWTOR quick-travel interaction is plcAbilitySpecOnUse == 16140902321107152398. Keep the resolved
+    // classification per placement so picking and the destination map use the same decision in every client build.
+    public bool IsQuickTravel { get; set; }
+    public WorldInteractionInfo Interaction { get; set; }
     public bool BlueGlow { get; set; }
     public readonly List<WorldSpawnPointPose> SpawnPoints = new List<WorldSpawnPointPose>();
     // Models remains the union of all visual models so the renderer can build GPU buffers once. DynStates contains

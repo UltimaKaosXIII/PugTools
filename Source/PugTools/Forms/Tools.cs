@@ -100,7 +100,8 @@ namespace PugTools {
       });
       cbxExtractors.SelectedIndex = 0;
       cbxExtractFormat.SelectedIndex = 3;
-      cbxLanguage.SelectedIndex = 0;
+      int languageIndex = cbxLanguage.Items.IndexOf(Config.Language);
+      cbxLanguage.SelectedIndex = languageIndex >= 0 ? languageIndex : 0;
       FormOpen = false;
       txtSqlUsername.Enabled = false;
       txtSqlAddress.Enabled = false;

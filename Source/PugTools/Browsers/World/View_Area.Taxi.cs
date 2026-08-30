@@ -50,14 +50,18 @@ namespace PugTools {
 
     public bool IsTaxiRideActive => taxiRideActive || taxiPendingStart;
     public bool IsTaxiRouteMapActive => taxiRouteMapActive;
-    public string SelectedWorldSpawnFqn => selectedWorldSpnPlacement?.SourceFqn ?? selectedWorldNpcPlacement?.SourceFqn ?? String.Empty;
-    public string SelectedWorldSpawnName => selectedWorldSpnPlacement?.Name ?? selectedWorldNpcPlacement?.Name ?? String.Empty;
+    // Service actions use only the transient plain-click target. Ctrl+click inspection deliberately lives in the
+    // selectedWorld* fields and must never be re-used as an interaction target on a later click somewhere else.
+    public string SelectedWorldSpawnFqn => interactionWorldSpnPlacement?.SourceFqn ?? interactionWorldNpcPlacement?.SourceFqn ?? String.Empty;
+    public string SelectedWorldSpawnName => interactionWorldSpnPlacement?.Name ?? interactionWorldNpcPlacement?.Name ?? String.Empty;
     public bool TryGetSelectedWorldSpawnPosition(out float x, out float y, out float z) {
       x = y = z = 0f;
       try {
         Matrix world;
-        if (selectedWorldSpnPlacement != null) world = SpnPlacementWorld(selectedWorldSpnPlacement, SettingsSnapshot().AnimateSpnObjects);
-        else if (selectedWorldNpcPlacement != null) world = NpcNameplateWorld(selectedWorldNpcPlacement);
+        WorldSpnPlacement spn = interactionWorldSpnPlacement;
+        WorldNpcPlacement npc = interactionWorldNpcPlacement;
+        if (spn != null) world = SpnPlacementWorld(spn, SettingsSnapshot().AnimateSpnObjects);
+        else if (npc != null) world = NpcNameplateWorld(npc);
         else return false;
         x = world.M41; y = world.M42; z = world.M43;
         return Single.IsFinite(x) && Single.IsFinite(y) && Single.IsFinite(z);
@@ -345,6 +349,7 @@ namespace PugTools {
 
     public void OpenTaxiRouteMap(IEnumerable<WorldTaxiRouteInfo> routes, string sourceLabel) {
       if (routes == null) return;
+      CloseQuickTravelMapState();
       List<WorldTaxiRouteInfo> usable = routes.Where(r => TaxiRideLegs(r).Any(x => x?.Path?.Points != null && x.Path.Points.Count >= 2)).ToList();
       if (usable.Count == 0) return;
       lock (taxiRouteMapSync) {

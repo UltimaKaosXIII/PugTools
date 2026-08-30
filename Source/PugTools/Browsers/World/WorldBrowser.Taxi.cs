@@ -117,6 +117,7 @@ namespace PugTools {
       if (btnWorldOrthographic?.Checked == true) btnWorldOrthographic.Checked = false;
       else worldSettings.OrthographicProjection = false;
       ApplyWorldSettings();
+      panelRender.StopSpaceFlypath();
       panelRender.StartTaxiRide(route);
       ActivateWorldRenderInput();
       SetStatusLabel("Taxi ride: " + (route.Label ?? route.PathFqn ?? firstLeg.Path.Name) + "  •  mouse/look keys = free look, Space = pause, wheel = speed, Esc = stop");
@@ -203,10 +204,9 @@ namespace PugTools {
       string label = routes.Select(r => r.SourceLabel).FirstOrDefault(x => !String.IsNullOrWhiteSpace(x))
         ?? (!String.IsNullOrWhiteSpace(selectedName) ? selectedName : hasTerminalReference ? TaxiFriendlyName(terminalFqn) : TaxiFriendlyName(selectedFqn));
       panelRender.OpenTaxiRouteMap(routes, label);
-      // Opening the taxi UI consumes the terminal interaction. Do not leave a giant selection sphere/bounds on the
-      // terminal when the player returns from the map or ride.
-      panelRender.ClearWorldModelSelection();
-      UpdateWorldSelectedObjectMenu();
+      // Opening the taxi UI consumes only the transient plain-click target. Persistent Ctrl+click inspection is a
+      // separate gesture and must remain untouched, matching the rest of the World Browser.
+      panelRender.ClearWorldInteractionTarget();
       ActivateWorldRenderInput();
       return true;
     }

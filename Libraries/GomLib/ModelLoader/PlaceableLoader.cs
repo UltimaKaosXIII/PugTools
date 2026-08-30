@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -59,13 +59,32 @@ namespace GomLib.ModelLoader {
       plc.Id = obj.Id;
       plc.References = obj.References;
 
-      var textLookup = obj.Data.Get<Dictionary<object, object>>("locTextRetrieverMap");
-      var nameLookupData = (GomObjectData)textLookup[NameLookupKey];
-      _ = nameLookupData.Get<long>("strLocalizedTextRetrieverStringID");
-      //plc.Name = _dom.stringTable.TryGetString(plc.Fqn, nameLookupData);
-      plc.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(plc.Fqn, nameLookupData);
-      Normalize.Dictionary(plc.LocalizedName, plc.Fqn);
-      plc.Name = plc.LocalizedName[GomLib.StringTable.SelectedLocalization];
+      var textLookup = obj.Data.ValueOrDefault<Dictionary<object, object>>("locTextRetrieverMap", null);
+      GomObjectData nameLookupData = null;
+      if (textLookup != null) {
+        if (textLookup.TryGetValue(NameLookupKey, out object nameValue)) nameLookupData = nameValue as GomObjectData;
+        if (nameLookupData == null) {
+          ulong unsignedNameLookupKey = unchecked((ulong)NameLookupKey);
+          foreach (KeyValuePair<object, object> pair in textLookup) {
+            bool match = false;
+            try { match = Convert.ToUInt64(pair.Key) == unsignedNameLookupKey; } catch {
+              match = String.Equals(pair.Key?.ToString(), unsignedNameLookupKey.ToString(), StringComparison.Ordinal);
+            }
+            if (match) { nameLookupData = pair.Value as GomObjectData; break; }
+          }
+        }
+      }
+      if (nameLookupData != null) {
+        plc.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(plc.Fqn, nameLookupData);
+      }
+      plc.LocalizedName = Normalize.Dictionary(plc.LocalizedName, plc.Fqn);
+      string selected = GomLib.StringTable.SelectedLocalization ?? "enMale";
+      if (!plc.LocalizedName.TryGetValue(selected, out string selectedName) || String.IsNullOrWhiteSpace(selectedName)) {
+        string language = selected.Length >= 2 ? selected.Substring(0, 2) : selected;
+        selectedName = plc.LocalizedName.FirstOrDefault(x => x.Key.StartsWith(language, StringComparison.OrdinalIgnoreCase) && !String.IsNullOrWhiteSpace(x.Value)).Value;
+        if (String.IsNullOrWhiteSpace(selectedName)) selectedName = plc.LocalizedName.Values.FirstOrDefault(x => !String.IsNullOrWhiteSpace(x));
+      }
+      plc.Name = String.IsNullOrWhiteSpace(selectedName) ? plc.Fqn.Split('.').Last() : selectedName.Trim();
 
       //public Conversation Conversation { get; set; }
       plc.ConversationFqn = obj.Data.ValueOrDefault<string>("plcConvo", null);

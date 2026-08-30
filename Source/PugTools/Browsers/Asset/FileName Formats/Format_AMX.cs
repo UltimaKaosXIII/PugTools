@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
 
 namespace PugTools {
   class Format_AMX {
@@ -15,76 +14,56 @@ namespace PugTools {
       _dest = dest;
       _errors = new List<String>();
       _extension = ext;
-      FileNames = new HashSet<String>();
+      FileNames = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
     }
+
     internal void ParseAMX(Stream fileStream, String fullFileName) {
-      using BinaryReader br = new BinaryReader(fileStream);
-      UInt64 header = br.ReadUInt32();
+      try {
+        using BinaryReader br = new BinaryReader(fileStream);
+        ViewAMX.AmxFileInfo amx = ViewAMX.Parse(br);
+        String source = (fullFileName ?? String.Empty).Replace('\\', '/');
+        Int32 slash = source.LastIndexOf('/');
+        String sourceDir = slash >= 0 ? source.Substring(0, slash + 1) : String.Empty;
 
-      if (header.ToString("X") != "20584D41") {
+        foreach (ViewAMX.AmxAnimationEntry entry in amx.Animations) {
+          if (String.IsNullOrWhiteSpace(entry.Animation)) continue;
+          String body = (entry.BodyType ?? String.Empty).Replace('\\', '/').Trim('/');
+
+          // AMX records reference JBA clips. The old filename finder also
+          // invented <animation>.mph and <animation>.mph.amx paths, but those
+          // are not referenced by this format and polluted the hash candidate
+          // list. Match the actual AnimShare semantics instead.
+          if (!String.IsNullOrEmpty(body))
+            FileNames.Add(("/resources/anim/" + body + "/" + entry.Animation + ".jba").Replace("//", "/"));
+
+          // Some AMX sidecars use an empty/noncanonical bodyType and rely on
+          // the network folder. Jedipedia probes the sibling clip as a second
+          // candidate; keep it as a conservative fallback.
+          if (!String.IsNullOrEmpty(sourceDir))
+            FileNames.Add(sourceDir + entry.Animation + ".jba");
+        }
+      }
+      catch (Exception ex) {
         _errors.Add("File: " + fullFileName);
-        _errors.Add("Invalid header" + header.ToString());
-        return;
-
-      } else {
-        br.ReadUInt16(); //unknown
-        Boolean stop = false;
-
-        do {
-          Byte fileLen = br.ReadByte();
-
-          if (fileLen == 0) {
-            stop = true;
-
-          } else {
-            Byte[] fileNameBytes = br.ReadBytes(fileLen);
-            String fileName = Encoding.ASCII.GetString(fileNameBytes);
-            Byte dirLen = br.ReadByte();
-            Byte[] dirNameBytes = br.ReadBytes(dirLen);
-            String dirName = Encoding.ASCII.GetString(dirNameBytes);
-            String fullName =
-              ("/resources/anim/" + dirName.Replace('\\', '/') + "/" + fileName).Replace("//", "/");
-
-            //humanoid\bfanew
-            //em_wookiee_10
-
-            FileNames.Add(fullName + ".jba");
-            FileNames.Add(fullName + ".mph");
-            FileNames.Add(fullName + ".mph.amx");
-
-            br.ReadUInt32();
-            Byte check = br.ReadByte();
-
-            if (check != 2 && check != 3) stop = true;
-          }
-        } while (!stop);
+        _errors.Add(ex.GetType().Name + ": " + ex.Message);
       }
     }
+
     internal void WriteFile(Boolean _ = false) {
       if (!Directory.Exists(_dest + "\\File_Names"))
         Directory.CreateDirectory(_dest + "\\File_Names");
 
       if (FileNames.Count > 0) {
-        StreamWriter outputFileNames =
+        using StreamWriter outputFileNames =
           new StreamWriter(_dest + "\\File_Names\\" + _extension + "_file_names.txt", false);
-
-        foreach (String file in FileNames) {
-          outputFileNames.WriteLine(file);
-        }
-
-        outputFileNames.Close();
+        foreach (String file in FileNames) outputFileNames.WriteLine(file);
         FileNames.Clear();
       }
 
       if (_errors.Count > 0) {
-        StreamWriter outputErrors =
+        using StreamWriter outputErrors =
           new StreamWriter(_dest + "\\File_Names\\" + _extension + "_error_list.txt", false);
-
-        foreach (String error in _errors) {
-          outputErrors.Write(error + "\r\n");
-        }
-
-        outputErrors.Close();
+        foreach (String error in _errors) outputErrors.Write(error + "\r\n");
         _errors.Clear();
       }
     }

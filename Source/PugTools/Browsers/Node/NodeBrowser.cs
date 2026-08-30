@@ -62,6 +62,7 @@ namespace PugTools {
       _previousAssetsLocation = previousAssetLocation;
       _previousAssetsUsePts = previousUsePTS;
       _compareNodes = compareNodes && !String.IsNullOrWhiteSpace(previousAssetLocation);
+      InitializeNodeFieldCompare();
 
       using System.IO.StringReader stringReader =
         new System.IO.StringReader(Properties.Resources.CustomNodeSorting);
@@ -138,6 +139,8 @@ namespace PugTools {
       _outputList = null;
       _rootList = null;
       _searchNodes = null;
+      if (_fieldDiffForm != null && !_fieldDiffForm.IsDisposed) _fieldDiffForm.Dispose();
+      _fieldDiffForm = null;
 
       Dispose(true);
 

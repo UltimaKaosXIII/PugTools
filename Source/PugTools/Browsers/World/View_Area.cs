@@ -435,6 +435,10 @@ namespace PugTools {
     private RenderEntry selectedWorldRenderEntry;
     private WorldNpcPlacement selectedWorldNpcPlacement;
     private WorldSpnPlacement selectedWorldSpnPlacement;
+    // Plain left-click or a short right-click service interaction is deliberately separate from the persistent
+    // Ctrl+left-click inspector. Service clicks must not create selection labels/bounds or replace an inspection.
+    private WorldNpcPlacement interactionWorldNpcPlacement;
+    private WorldSpnPlacement interactionWorldSpnPlacement;
     private UtilityRenderEntry selectedWorldUtilityEntry;
     private AreaPath selectedWorldPath;
     private Vector3 selectedWorldPathHit;
@@ -864,6 +868,7 @@ namespace PugTools {
       if(displayZ.HasValue)pos.Y=(displayZ.Value+WalkingEyeHeight*10f)/10f;
       camera.Position=pos;
       currentCameraRoom=null;displayCameraRoom=null;walkingVerticalVelocity=0f;walkingGrounded=false;ClearWalkingPlatform();
+      CloseTaxiRouteMapState();CloseQuickTravelMapState();
       mapOpen=false;mapPointerDown=false;mapPointerDragged=false;InvalidateTemporalHistory();InvalidateObjectOcclusionVisibility();
       if(Window is WorldBrowser browser)browser.SetFullMapActive(false);
     }
@@ -899,6 +904,7 @@ namespace PugTools {
       camera.LookAt(pos,pos+look,Vector3.UnitY);
       camera.UpdateViewMatrix();
       currentCameraRoom=null;displayCameraRoom=null;walkingVerticalVelocity=0f;walkingGrounded=false;ClearWalkingPlatform();
+      CloseTaxiRouteMapState();CloseQuickTravelMapState();
       mapOpen=false;mapPointerDown=false;mapPointerDragged=false;InvalidateTemporalHistory();InvalidateObjectOcclusionVisibility();
       if(Window is WorldBrowser browser)browser.SetFullMapActive(false);
     }
@@ -989,12 +995,36 @@ namespace PugTools {
 
     public string SelectedWorldModelSummary => selectedWorldModelSummary ?? String.Empty;
     public string SelectedWorldModelDetails => selectedWorldModelDetails ?? String.Empty;
+    internal WorldInteractionInfo SelectedWorldInteraction => selectedWorldSpnPlacement?.Interaction ?? selectedWorldNpcPlacement?.Interaction;
+    internal WorldNpcPlacement SelectedWorldNpcPlacement => selectedWorldNpcPlacement;
+    internal WorldInteractionInfo InteractionTargetWorldInteraction => interactionWorldSpnPlacement?.Interaction ?? interactionWorldNpcPlacement?.Interaction;
+    internal WorldSpnPlacement InteractionTargetWorldSpnPlacement => interactionWorldSpnPlacement;
+    internal WorldNpcPlacement InteractionTargetWorldNpcPlacement => interactionWorldNpcPlacement;
+
+    internal void RefreshSelectedWorldInteractionDetails(){
+      if(selectedWorldNpcPlacement!=null){
+        WorldNpcPlacement npc=selectedWorldNpcPlacement;Matrix world=NpcNameplateWorld(npc);Vector3 center=new Vector3(world.M41,world.M42,world.M43);float radius=.08f;
+        TryWorldModelsSphere(npc.Models,world,out center,out radius);
+        selectedWorldModelDetails=WorldPickDetails(new WorldPickCandidate{Kind="npc",Npc=npc,Center=center,Radius=Math.Max(.08f,radius)});return;
+      }
+      if(selectedWorldSpnPlacement!=null){
+        WorldSpnPlacement spn=selectedWorldSpnPlacement;WorldRenderSettings settings=SettingsSnapshot();Matrix world=SpnPlacementWorld(spn,settings.AnimateSpnObjects);
+        WorldSpnDynState dyn=ActiveSpnDynState(spn,settings.AnimateSpnObjects);Vector3 center=new Vector3(world.M41,world.M42,world.M43);float radius=.08f;
+        TrySpnReceiverSphere(spn,world,dyn,out center,out radius);
+        selectedWorldModelDetails=WorldPickDetails(new WorldPickCandidate{Kind="spn",Spn=spn,Center=center,Radius=Math.Max(.08f,radius)});
+      }
+    }
 
     public void ClearWorldModelSelection(){
       selectedWorldRenderEntry=null;selectedWorldNpcPlacement=null;selectedWorldSpnPlacement=null;selectedWorldUtilityEntry=null;selectedWorldPath=null;
       selectedWorldPathHit=Vector3.Zero;selectedWorldModelSummary=String.Empty;selectedWorldModelDetails=String.Empty;selectedWorldPickKey=String.Empty;
       selectedWorldCycleIndex=-1;selectedWorldCycleCount=0;
       lastWorldPickX=lastWorldPickY=Int32.MinValue;lastWorldPickIndex=-1;lastWorldPickSignature=String.Empty;
+      ClearWorldInteractionTarget();
+    }
+
+    public void ClearWorldInteractionTarget(){
+      interactionWorldNpcPlacement=null;interactionWorldSpnPlacement=null;
     }
 
     // Backward-compatible one-shot entry point for callers that want a full world pick without cycling.
@@ -1002,25 +1032,29 @@ namespace PugTools {
     public string SelectWorldModelAtScreen(int screenX,int screenY){return SelectWorldObjectAtScreen(screenX,screenY,false,false);}
 
     /// <summary>
-    /// Lightweight interaction pick used by a plain left click. It deliberately ignores ordinary geometry, editor
-    /// helpers and NON-interactive spawned props. The old implementation first picked every SPN sphere and only then
-    /// asked whether the winner was a taxi/Wonkavator; a door, frame or decorative dyn object overlapping the tiny
-    /// elevator button could therefore swallow the click. Only authored taxi terminals and Wonkavators participate.
+    /// Lightweight interaction pick used by a plain left/right click. It deliberately ignores ordinary geometry,
+    /// editor helpers and non-interactive spawned props. The old implementation first picked every SPN sphere and only
+    /// then asked whether the winner was actionable; a door, frame or decorative dyn object overlapping a tiny button
+    /// could therefore swallow the click. Every classified service may participate here, while Ctrl+left-click remains
+    /// exclusively the read-only object inspector.
     /// </summary>
     public string SelectWorldSpawnAtScreen(int screenX,int screenY){
-      if(area==null||camera==null||ClientWidth<=1||ClientHeight<=1){ClearWorldModelSelection();return "No world is loaded.";}
+      ClearWorldInteractionTarget();
+      if(area==null||camera==null||ClientWidth<=1||ClientHeight<=1)return "No world is loaded.";
       WorldRenderSettings s=SettingsSnapshot();
-      if(s.Mode==WorldRenderMode.Map){ClearWorldModelSelection();return "World interaction is only available in the 3D render modes.";}
+      if(s.Mode==WorldRenderMode.Map)return "World interaction is only available in the 3D render modes.";
       try{
-        if(!TryBuildWorldPickRay(screenX,screenY,out Vector3 rayOrigin,out Vector3 rayDirection)){ClearWorldModelSelection();return "Could not build a pick ray for this screen position.";}
+        if(!TryBuildWorldPickRay(screenX,screenY,out Vector3 rayOrigin,out Vector3 rayDirection))return "Could not build a pick ray for this screen position.";
         HashSet<string> visible=BuildVisibleRoomSet(currentCameraRoom,s);
         List<WorldPickCandidate> hits=BuildWorldPickCandidates(rayOrigin,rayDirection,s,visible,true,true)
-          .Where(h=>h?.Npc?.IsTaxiTerminal==true||(h?.Spn?.WonkaPackageId??0)!=0).OrderBy(h=>h.Distance).ToList();
-        if(hits.Count==0){ClearWorldModelSelection();return "No interactive taxi terminal or Wonkavator was hit.";}
-        ApplyWorldPickCandidate(hits[0]);
-        selectedWorldCycleIndex=0;selectedWorldCycleCount=hits.Count;
-        return selectedWorldModelDetails;
-      }catch(Exception ex){ClearWorldModelSelection();return "World interaction failed: "+ex.Message;}
+          .Where(h=>h?.Npc?.Interaction!=null||h?.Spn?.Interaction!=null||h?.Spn?.BlueGlow==true||WorldSpnLooksLikeLoreCandidate(h?.Spn)||
+            h?.Npc?.IsTaxiTerminal==true||(h?.Spn?.WonkaPackageId??0)!=0||h?.Spn?.IsQuickTravel==true)
+          .OrderBy(h=>h.Distance).ToList();
+        if(hits.Count==0)return "No interactive NPC or placeable was hit.";
+        WorldPickCandidate hit=hits[0];
+        interactionWorldNpcPlacement=hit.Npc;interactionWorldSpnPlacement=hit.Spn;
+        return WorldPickDetails(hit);
+      }catch(Exception ex){ClearWorldInteractionTarget();return "World interaction failed: "+ex.Message;}
     }
 
     /// <summary>
@@ -1029,6 +1063,7 @@ namespace PugTools {
     /// overlapping candidates. All expensive ray work happens only here, never in the render loop.
     /// </summary>
     public string SelectWorldObjectAtScreen(int screenX,int screenY,bool markersOnly,bool cycle){
+      ClearWorldInteractionTarget();
       if(area==null||camera==null||ClientWidth<=1||ClientHeight<=1){ClearWorldModelSelection();return "No world is loaded.";}
       WorldRenderSettings s=SettingsSnapshot();
       if(s.Mode==WorldRenderMode.Map){ClearWorldModelSelection();return "World selection is only available in the 3D render modes.";}
@@ -1051,6 +1086,15 @@ namespace PugTools {
         if(cycle&&hits.Count>1)selectedWorldModelDetails+="\r\n\r\nSelection cycle: "+(index+1)+" of "+hits.Count+" (Ctrl+click again to advance).";
         return selectedWorldModelDetails;
       }catch(Exception ex){ClearWorldModelSelection();return "World selection failed: "+ex.Message;}
+    }
+
+    // Codex/tutorial placeables are structurally language-independent.  Do not make their click target depend on
+    // a localized display name or on the interaction resolver having succeeded for the current locale: several
+    // de-de placeables only expose the codex link lazily through their plc/tutorial FQN.
+    private static bool WorldSpnLooksLikeLoreCandidate(WorldSpnPlacement spn){
+      if(spn==null)return false;
+      string probe=((spn.SourceFqn??String.Empty)+" "+(spn.Name??String.Empty)).ToLowerInvariant();
+      return probe.Contains("lore")||probe.Contains("codex")||probe.Contains("knowledge")||probe.Contains("tutorial");
     }
 
     private bool TryBuildWorldPickRay(int screenX,int screenY,out Vector3 origin,out Vector3 direction){
@@ -1087,7 +1131,9 @@ namespace PugTools {
             if(!moving&&!InstanceRoomVisible(npc.Instance,npc.Room,visible))continue;
             if(!InstanceVisibleInWorld(npc.Instance,s))continue;
             Matrix world=NpcNameplateWorld(npc);
-            if(!TryWorldModelsSphere(npc.Models,world,out Vector3 center,out float radius)||!TryRaySphere(rayOrigin,rayDirection,center,Math.Max(.08f,radius),out float distance))continue;
+            if(!TryWorldModelsSphere(npc.Models,world,out Vector3 center,out float radius))continue;
+            float npcPickRadius=interactionPick&&npc.Interaction!=null?WorldInteractionPickRadius(center,radius,s):Math.Max(.08f,radius);
+            if(!TryRaySphere(rayOrigin,rayDirection,center,npcPickRadius,out float distance))continue;
             hits.Add(new WorldPickCandidate{Kind="npc",Key="npc:"+(npc.Room.RoomName??String.Empty)+":"+npc.Instance.ID+":"+(npc.SourceFqn??String.Empty),Distance=distance,HitPoint=rayOrigin+rayDirection*distance,Center=center,Radius=Math.Max(.08f,radius),Npc=npc});
           }
         }
@@ -1098,11 +1144,18 @@ namespace PugTools {
             if(!moving&&!InstanceRoomVisible(spn.Instance,spn.Room,visible))continue;
             if(!InstanceVisibleInWorld(spn.Instance,s))continue;
             Matrix world=SpnPlacementWorld(spn,s.AnimateSpnObjects);WorldSpnDynState dyn=ActiveSpnDynState(spn,s.AnimateSpnObjects);if(dyn!=null&&dyn.Hidden)continue;
-            bool interactiveWonk=interactionPick&&spn.WonkaPackageId!=0;
+            bool interactiveWonk=interactionPick&&(spn.Interaction?.Kind==WorldInteractionKind.Wonkavator||spn.WonkaPackageId!=0);
+            bool interactiveTaxi=interactionPick&&spn.Interaction?.Kind==WorldInteractionKind.Taxi;
+            bool interactiveQuickTravel=interactionPick&&(spn.Interaction?.Kind==WorldInteractionKind.QuickTravel||spn.IsQuickTravel);
+            bool interactiveLoreCandidate=interactionPick&&spn.Interaction==null&&(spn.BlueGlow||WorldSpnLooksLikeLoreCandidate(spn));
+            bool interactiveService=interactionPick&&(spn.Interaction!=null||interactiveWonk||interactiveTaxi||interactiveQuickTravel||interactiveLoreCandidate);
             Vector3 center;float radius;
-            bool haveSphere=interactiveWonk?TrySpnInteractionSphere(spn,world,dyn,out center,out radius):TrySpnReceiverSphere(spn,world,dyn,out center,out radius);
+            bool haveSphere=(interactiveWonk||interactiveTaxi)?TrySpnInteractionSphere(spn,world,dyn,out center,out radius):TrySpnReceiverSphere(spn,world,dyn,out center,out radius);
+            // Some historical bindpoint placeables are effect-only and have no GR2 receiver at all. The client still
+            // gives their placement a clickable quick-travel interaction, so provide a small authored-position sphere.
+            if(!haveSphere&&interactiveQuickTravel){center=new Vector3(world.M41,world.M42,world.M43);radius=.20f;haveSphere=true;}
             if(!haveSphere)continue;
-            float pickRadius=interactiveWonk?WorldInteractionPickRadius(center,radius,s):Math.Max(.08f,radius);
+            float pickRadius=interactiveService?WorldInteractionPickRadius(center,radius,s):Math.Max(.08f,radius);
             if(!TryRaySphere(rayOrigin,rayDirection,center,pickRadius,out float distance))continue;
             hits.Add(new WorldPickCandidate{Kind="spn",Key="spn:"+(spn.Room.RoomName??String.Empty)+":"+spn.Instance.ID+":"+(spn.SourceFqn??String.Empty),Distance=distance,HitPoint=rayOrigin+rayDirection*distance,Center=center,Radius=Math.Max(.08f,radius),Spn=spn});
           }
@@ -1191,13 +1244,15 @@ namespace PugTools {
         if(n.Items!=null&&n.Items.Length>0)sb.AppendLine("Items: "+String.Join(", ",n.Items));if(!String.IsNullOrWhiteSpace(n.BodyType))sb.AppendLine("Body type: "+n.BodyType);
         if(!String.IsNullOrWhiteSpace(n.IdleAnimationName))sb.AppendLine("Idle animation: "+n.IdleAnimationName);if(!String.IsNullOrWhiteSpace(n.PathFqn))sb.AppendLine("Path: "+n.PathFqn);
         if(!String.IsNullOrWhiteSpace(n.RepublicReaction)||!String.IsNullOrWhiteSpace(n.ImperialReaction))sb.AppendLine("Faction reaction: Republic="+(n.RepublicReaction??"?")+", Empire="+(n.ImperialReaction??"?"));
+        AppendWorldInteractionDetails(sb,n.Interaction);
         sb.AppendLine(WorldPickPositionLine("World position",pick.Center));return sb.ToString().TrimEnd();
       }
       if(pick.Spn!=null){
         WorldSpnPlacement spn=pick.Spn;sb.AppendLine("Placeable: "+(spn.Name??spn.SourceFqn??"(unknown)"));sb.AppendLine("Node: "+(spn.SourceFqn??"(none)"));
         sb.AppendLine("Room: "+(spn.Room?.RoomName??"unknown"));sb.AppendLine("Instance id: "+(spn.Instance?.ID??0));if(!String.IsNullOrWhiteSpace(spn.PathFqn))sb.AppendLine("Path: "+spn.PathFqn);
         WorldSpnDynState dyn=ActiveSpnDynState(spn,SettingsSnapshot().AnimateSpnObjects);if(dyn!=null)sb.AppendLine("State: "+(dyn.Name??"(unnamed)")+(dyn.Hidden?" (hidden)":""));
-        if(spn.WonkaPackageId!=0)sb.AppendLine("Wonkavator package: "+spn.WonkaPackageId);
+        AppendWorldInteractionDetails(sb,spn.Interaction);
+        if(spn.Interaction==null&&spn.WonkaPackageId!=0)sb.AppendLine("Wonkavator package: "+spn.WonkaPackageId);
         sb.AppendLine("Interactable glow: "+spn.BlueGlow);sb.AppendLine(WorldPickPositionLine("World position",pick.Center));return sb.ToString().TrimEnd();
       }
       Room room=pick.Utility?.Room??pick.RenderEntry?.Room;AssetInstance inst=pick.Utility?.Instance??pick.RenderEntry?.Instance;AreaAsset asset=null;if(inst!=null&&area!=null)area.AssetIdMap.TryGetValue(inst.assetID,out asset);
@@ -1212,6 +1267,49 @@ namespace PugTools {
       if(pick.Mesh!=null)sb.AppendLine("Mesh: "+(pick.Mesh.meshName??"(unknown)")+"  [LOD "+pick.Mesh.lod+"]");
       if(pick.Piece!=null){GR2_Material material=ResolvePieceMaterial(pick.Model,pick.Piece);sb.AppendLine("Material: "+(material?.materialName??"(none)"));if(material!=null){sb.AppendLine("Material derived: "+(material.derived??"(none)"));sb.AppendLine("Material visibility: "+(material.visibility??"(default)"));sb.AppendLine("Material poly type: "+(material.polyType??"(default)"));sb.AppendLine("Alpha mode: "+(material.alphaMode??"None"));}}
       sb.AppendLine(WorldPickPositionLine("Hit point",pick.HitPoint));sb.AppendLine("Hit distance: "+pick.Distance.ToString("0.###",System.Globalization.CultureInfo.InvariantCulture));return sb.ToString().TrimEnd();
+    }
+
+    private static void AppendWorldInteractionDetails(System.Text.StringBuilder sb,WorldInteractionInfo interaction){
+      if(sb==null||interaction==null||interaction.Kind==WorldInteractionKind.None)return;
+      sb.AppendLine("Interaction: "+WorldInteractionKindName(interaction.Kind)+(interaction.LegacyHeuristic?" (legacy fallback)":""));
+      if(interaction.WonkaPackageId!=0)sb.AppendLine("Wonkavator package: "+interaction.WonkaPackageId);
+      if(!String.IsNullOrWhiteSpace(interaction.TaxiTerminalSpec))sb.AppendLine("Taxi terminal: "+interaction.TaxiTerminalSpec);
+      if(interaction.UtilityType!=0)sb.AppendLine("Utility type: "+interaction.UtilityType);
+      if(!String.IsNullOrWhiteSpace(interaction.Profession))sb.AppendLine("Required profession: "+interaction.Profession);
+      if(interaction.VendorPackages!=null&&interaction.VendorPackages.Length>0){
+        sb.AppendLine("Vendor packages ("+interaction.VendorPackages.Length+"): "+String.Join(", ",interaction.VendorPackages));
+      }
+      if(!String.IsNullOrWhiteSpace(interaction.MissionBoardPackage))sb.AppendLine("Mission-board package: "+interaction.MissionBoardPackage);
+      if(interaction.ConversationId!=0)sb.AppendLine("Conversation id: "+interaction.ConversationId);
+      if(!String.IsNullOrWhiteSpace(interaction.Conversation))sb.AppendLine("Conversation: "+interaction.Conversation);
+      if(interaction.CodexId!=0)sb.AppendLine("Codex id: "+interaction.CodexId);
+      if(interaction.Kind==WorldInteractionKind.MissionBoard){
+        if(!String.IsNullOrWhiteSpace(interaction.MissionBoardError))sb.AppendLine("Mission-board read error: "+interaction.MissionBoardError);
+        sb.AppendLine("Mission-board notices: "+interaction.MissionBoardNotices.Count);
+        for(int i=0;i<interaction.MissionBoardNotices.Count;i++){
+          WorldMissionBoardNotice notice=interaction.MissionBoardNotices[i];if(notice==null)continue;
+          string text=(notice.Text??String.Empty).Replace("\r"," ").Replace("\n"," ").Trim();
+          sb.Append("  "+(i+1)+". node "+notice.NodeId);if(!String.IsNullOrWhiteSpace(text))sb.Append(" — "+text);sb.AppendLine();
+          foreach(WorldMissionBoardQuest quest in notice.Quests){
+            if(quest==null)continue;string label=!String.IsNullOrWhiteSpace(quest.Name)?quest.Name:!String.IsNullOrWhiteSpace(quest.Fqn)?quest.Fqn:quest.Id.ToString();
+            sb.Append("     Quest: "+label+" ["+quest.Id+"]");if(!String.IsNullOrWhiteSpace(quest.Fqn)&&!String.Equals(label,quest.Fqn,StringComparison.Ordinal))sb.Append("  "+quest.Fqn);sb.AppendLine();
+          }
+        }
+      }
+    }
+
+    private static string WorldInteractionKindName(WorldInteractionKind kind){
+      switch(kind){
+        case WorldInteractionKind.Wonkavator:return "Wonkavator";case WorldInteractionKind.Taxi:return "Taxi terminal";
+        case WorldInteractionKind.QuickTravel:return "Quick travel";case WorldInteractionKind.Bank:return "Bank / cargo hold";
+        case WorldInteractionKind.GuildBank:return "Guild bank";case WorldInteractionKind.Mailbox:return "Mailbox";
+        case WorldInteractionKind.Vendor:return "Vendor";case WorldInteractionKind.ProfessionTrainer:return "Crafting trainer";
+        case WorldInteractionKind.ClassTrainer:return "Class trainer";case WorldInteractionKind.Harvest:return "Harvesting node";
+        case WorldInteractionKind.MissionBoard:return "Mission board";case WorldInteractionKind.Conversation:return "Conversation";
+        case WorldInteractionKind.Codex:return "Codex / knowledge object";
+        case WorldInteractionKind.AuctionHouse:return "Auction house";case WorldInteractionKind.EnhancementStation:return "Enhancement station";
+        default:return kind.ToString();
+      }
     }
 
     private static string UtilityCategoryName(byte category){if(category==UtilitySpawner)return "Spawner / encounter";if(category==UtilityCover)return "Cover point";if(category==UtilityLight)return "Light";if(category==UtilitySeed)return "Kynapse seed point";return "Other helper";}
@@ -1323,7 +1421,7 @@ namespace PugTools {
       x=pos.X;z=pos.Z;lookX=look.X;lookZ=look.Z;
     }
 
-    public void Clear(){EndTaxiRide(null);ReleaseWorldGpu(); SetImplicitPhaseName(String.Empty); pathFollowers.Clear();instanceWorldTransforms.Clear(); models.Clear();materials.Clear();rooms.Clear();area=null;}
+    public void Clear(){ClearSpaceFlypathState();EndTaxiRide(null);CloseTaxiRouteMapState();CloseQuickTravelMapState();ReleaseWorldGpu(); SetImplicitPhaseName(String.Empty); pathFollowers.Clear();instanceWorldTransforms.Clear(); models.Clear();materials.Clear();rooms.Clear();area=null;}
     private void ReleaseWorldGpu(){
       // Capture every material while population/SPN/model references are still alive.  Appearance-specific NPC
       // materials are not guaranteed to live in the area's top-level MAT dictionary; releasing only that dictionary
@@ -1439,6 +1537,7 @@ namespace PugTools {
       escapeKeyWasDown=escapeKey;
       if(Util.IsKeyDown(Keys.PrintScreen))makeScreenshot=true;
       if(mapOpen)return;
+      if(UpdateSpaceFlypath(dt,escapeKey))return;
       if(UpdateTaxiRide(dt,escapeKey))return;
 
       bool shift=Util.IsKeyDown(Keys.LShiftKey)||Util.IsKeyDown(Keys.RShiftKey);
@@ -1562,6 +1661,7 @@ namespace PugTools {
         ? renderCameraRoom.EnvironmentScheme??area?.GetEnvironmentScheme("area")??new AreaEnvironmentScheme()
         : area?.GetEnvironmentScheme("area")??new AreaEnvironmentScheme();
       UpdateActiveClipDistance(env,s);
+      UpdateWorldConversationCamera();
       camera.UpdateViewMatrix();
       bool inGame=s.Mode==WorldRenderMode.InGame;
       bool aaAllowed=s.Mode!=WorldRenderMode.Map;
@@ -1627,7 +1727,7 @@ namespace PugTools {
       // conservative D3D11 depth prepass and also give nameplate occlusion the authored walls instead of text-only heuristics.
       if(s.ShowModels&&s.EnableOccluderPrepass&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Wireframe)
         DrawOccluderPrepass(viewProj,visible,s);
-      if(s.ShowTerrain)DrawTerrain(viewProj,visible,s,env,shadows);if(s.ShowDynamicDetails&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDynamicDetails(viewProj,visible,s,env,shadows);if(s.ShowModels)DrawModels(viewProj,visible,s,env,shadows);if((s.ShowNpcs||s.ShowTaxiTerminals)&&s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Map)DrawJedipediaNpcs(viewProj,visible,s,env,shadows);if(s.ShowSpnObjects&&s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaSpnObjects(viewProj,visible,s,env,shadows);DrawTaxiVehicle(viewProj,visible,s,env,shadows);if(s.ShowDecorationHooks&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDecorationHooks(viewProj,visible,s,env,shadows);if(s.ShowWater)DrawWater(viewProj,visible,s);
+      if(s.ShowTerrain)DrawTerrain(viewProj,visible,s,env,shadows);if(s.ShowDynamicDetails&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDynamicDetails(viewProj,visible,s,env,shadows);if(s.ShowModels)DrawModels(viewProj,visible,s,env,shadows);if((s.ShowNpcs||s.ShowTaxiTerminals)&&s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Map)DrawJedipediaNpcs(viewProj,visible,s,env,shadows);if(s.ShowSpnObjects&&s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaSpnObjects(viewProj,visible,s,env,shadows);DrawTaxiVehicle(viewProj,visible,s,env,shadows);DrawSpaceCombatShips(viewProj,visible,s,env,shadows);if(s.ShowDecorationHooks&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDecorationHooks(viewProj,visible,s,env,shadows);if(s.ShowWater)DrawWater(viewProj,visible,s);
       if(s.Mode==WorldRenderMode.Map&&s.ShowMapArt)DrawMapArt(viewProj);
       if(s.ShowRoads)DrawLines(roadGpu,viewProj,s.Mode==WorldRenderMode.Map?float.MaxValue:camera.FarZ);
       if(s.ShowMapNotes&&s.Mode==WorldRenderMode.Map){
@@ -1637,7 +1737,7 @@ namespace PugTools {
       if(s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaUtilities(viewProj,visible,s);
       // The generated minimap already paints its marker in WinForms. Only the interactive M map needs the GPU
       // marker, otherwise the minimap capture would bake a second arrow into its bitmap.
-      if(mapOpen&&s.Mode==WorldRenderMode.Map){DrawTaxiRouteMapOverlay(viewProj,s);DrawMapPlayerMarker(viewProj);}
+      if(mapOpen&&s.Mode==WorldRenderMode.Map){DrawTaxiRouteMapOverlay(viewProj,s);DrawQuickTravelMapOverlay(viewProj,s);DrawMapPlayerMarker(viewProj);}
       DrawWorldSelectionOutline(viewProj,s);
 
       if(useOffscreen)ResolvePostProcessing(s,env,useTaa,useFxaa);
@@ -1646,7 +1746,10 @@ namespace PugTools {
         // that actually rendered this frame (jittered when TAA is enabled).
         Matrix labelViewProj=s.Mode==WorldRenderMode.Map?viewProj:camera.ViewProj;
         DrawNpcNameplates(labelViewProj,viewProj,visible,s);
+        DrawWorldInteractionIcons(labelViewProj,viewProj,visible,s);
         DrawWorldSelectionLabel(labelViewProj,s);
+        DrawWorldConversationSubtitleHud(s);
+        DrawSpaceFlypathHud(s);
         DrawTaxiRideHud(s);
       }
       UpdateObjectOcclusionVisibility(viewProj,visible,s);
@@ -1982,7 +2085,11 @@ namespace PugTools {
       // second top-level display tier anymore: the submenu checkbox is the single source of truth.
       bool showHidden=s?.ShowHiddenGeometry==true;
       if(inst.hidden&&!showHidden)return false;
-      if(!showHidden&&(inst.Viewability==AssetInstanceViewability.MapOnly||inst.Viewability==AssetInstanceViewability.OccluderOnly))return false;
+      // OCCLUDER_ONLY is solver/helper geometry, never a visible world surface. Rendering it in the colour pass can
+      // turn authored doorway blockers into opaque black walls. Keep it out even when hidden helpers are enabled;
+      // the Utilities overlay/wireframe diagnostics remain the place to inspect those shapes.
+      if(inst.Viewability==AssetInstanceViewability.OccluderOnly&&!(showHidden&&s?.Mode==WorldRenderMode.Wireframe))return false;
+      if(!showHidden&&inst.Viewability==AssetInstanceViewability.MapOnly)return false;
       return true;
     }
 
@@ -2400,7 +2507,7 @@ namespace PugTools {
     private static bool IsFloorNonVisualMesh(GR2_Mesh mesh,string assetPath){
       if(mesh==null)return true;string name=(mesh.meshName??String.Empty).ToLowerInvariant();string path=NormalizeAssetPath(assetPath);
       if(IsFloorCollisionMesh(mesh,path))return true;
-      return mesh.lod==-3||mesh.lod==-2||name=="portal"||path.Contains("arch/fadeportal/");
+      return mesh.lod==-3||mesh.lod==-2||name=="portal"||path.Contains("fadeportal");
     }
 
     private FloorMeshData BuildFloorMeshData(GR2_Mesh mesh){
@@ -4004,7 +4111,10 @@ namespace PugTools {
       // Falling back to null here was the reason animated characters became flat grey after lazy material streaming.
       GR2_Material resolved=local;
       if(!String.IsNullOrWhiteSpace(local.materialName)&&materials.TryGetValue(local.materialName,out GR2_Material shared)&&shared!=null)resolved=shared;
-      return EnsureMaterialParsed(resolved);
+      GR2_Material parsed=EnsureMaterialParsed(resolved);
+      // Keep the authored material name available while streamed MAT metadata is still pending so the world pass can
+      // suppress known collision/occluder helper hulls instead of drawing them as a textureless black fallback.
+      return parsed??(LooksLikeHiddenUtilityMaterial(resolved)?resolved:null);
     }
 
     private void BuildAuthoritativeSkyRoomSet(){
@@ -4133,6 +4243,10 @@ namespace PugTools {
 
     private void ApplyCameraLens(WorldRenderSettings s,float cameraFar,bool force=false){
       float fov=GetFieldOfViewRadians(s);float aspect=Math.Max(.01f,AspectRatio);bool ortho=orthographicActive&&s?.OrthographicProjection==true;
+      if(worldConversationCameraActive){
+        float conversationFov=camera.FovY>.01f?camera.FovY:fov;
+        camera.SetLens(conversationFov,aspect,.01f,cameraFar);appliedOrthographicProjection=false;appliedOrthographicHalfHeight=-1f;appliedCameraFar=cameraFar;return;
+      }
       if(ortho){
         float halfHeight=GetOrthographicHalfHeight(s);
         if(!force&&appliedOrthographicProjection&&Math.Abs(appliedCameraFar-cameraFar)<.01f&&Math.Abs(camera.Aspect-aspect)<.0001f&&Math.Abs(camera.FovY-fov)<.0001f&&Math.Abs(appliedOrthographicHalfHeight-halfHeight)<.0001f)return;
@@ -4774,7 +4888,11 @@ namespace PugTools {
 
     private static bool IsNonVisualMesh(GR2 model,GR2_Mesh mesh){
       if(mesh==null)return true;if(IsCollisionMesh(model,mesh))return true;string name=(mesh.meshName??string.Empty).ToLowerInvariant();string path=NormalizeAssetPath(model?.filename);
-      if(mesh.lod==-3)return true;return mesh.lod==-2||name=="portal"||path.Contains("arch/fadeportal/");
+      // Live GR2s tag these as negative LODs; Granny/Beta assets often only carry the authored helper name. Do not
+      // submit either representation to the normal opaque pass or portal/occluder quads appear as solid black doors.
+      bool portalName=name.Contains("portal");
+      bool occluderName=name=="occluder"||name.StartsWith("occluder_",StringComparison.Ordinal)||name.Contains("occlusion");
+      if(mesh.lod==-3||occluderName)return true;return mesh.lod==-2||portalName||path.Contains("fadeportal")||path.Contains("fade_portal");
     }
 
     private bool TryModelLodProjection(GR2 model,Matrix world,float lodFactor,out float projectedSize){
@@ -4883,7 +5001,24 @@ namespace PugTools {
       // checkbox. This avoids the previous double-enable requirement.
       if(visibility.Equals("EditorOnly",StringComparison.OrdinalIgnoreCase))return !showHidden;
       if(visibility.Equals("Hidden",StringComparison.OrdinalIgnoreCase))return !showHidden;
+      // Streamed MAT metadata is intentionally read in the background. Before that XML has arrived, helper hulls
+      // otherwise render with the textureless fallback for a few frames (or forever if a beta MAT is missing),
+      // producing the solid black rectangles seen in some doorways. Jedipedia never submits these collision/occluder
+      // utility materials to the normal world pass. Use the same conservative authored-name fallback until metadata
+      // can confirm Visibility=Hidden; the explicit hidden-geometry diagnostic can still reveal them.
+      if(!showHidden&&String.IsNullOrWhiteSpace(visibility)&&LooksLikeHiddenUtilityMaterial(mat))return true;
       return false;
+    }
+
+    private static bool LooksLikeHiddenUtilityMaterial(GR2_Material mat){
+      string name=(mat?.sourceMaterialName??mat?.materialName??String.Empty).Replace('\\','/').ToLowerInvariant();
+      int slash=name.LastIndexOf('/');if(slash>=0)name=name.Substring(slash+1);
+      if(name.EndsWith(".mat",StringComparison.OrdinalIgnoreCase))name=name.Substring(0,name.Length-4);
+      return name.Contains("utility_hidden")||name.StartsWith("util_collision",StringComparison.Ordinal)||
+        name=="collision"||name.StartsWith("collision_",StringComparison.Ordinal)||
+        name=="occluder"||name.StartsWith("occluder_",StringComparison.Ordinal)||
+        name=="portal"||name.StartsWith("portal_",StringComparison.Ordinal)||
+        name.Contains("fadeportal")||name.Contains("fade_portal");
     }
 
     private EffectTechnique PickModelTech(WorldRenderSettings s,GR2_Material mat,bool sky){
@@ -5377,8 +5512,13 @@ namespace PugTools {
     private IEnumerable<GR2> WorldModelResidencyRoots(){
       foreach(GR2 model in models.Values)if(model!=null)yield return model;
       if(utilityMarkerModels!=null)foreach(GR2 model in utilityMarkerModels.Values)if(model!=null)yield return model;
-      if(npcPlacements!=null)foreach(WorldNpcPlacement placement in npcPlacements)if(placement?.Models!=null)foreach(GR2 model in placement.Models)if(model!=null)yield return model;
-      if(spnPlacements!=null)foreach(WorldSpnPlacement placement in spnPlacements)if(placement?.Models!=null)foreach(GR2 model in placement.Models)if(model!=null)yield return model;
+      // Population data normally belongs exclusively to the render view, but keep this maintenance pass resilient to
+      // a browser-side refresh as well. List<T>.foreach is versioned and throws immediately when another thread
+      // clears/rebuilds the source list; small array snapshots make VRAM trimming observational instead of fatal.
+      WorldNpcPlacement[] npcSnapshot=npcPlacements?.ToArray()??Array.Empty<WorldNpcPlacement>();
+      foreach(WorldNpcPlacement placement in npcSnapshot){GR2[] placementModels=placement?.Models?.ToArray()??Array.Empty<GR2>();foreach(GR2 model in placementModels)if(model!=null)yield return model;}
+      WorldSpnPlacement[] spnSnapshot=spnPlacements?.ToArray()??Array.Empty<WorldSpnPlacement>();
+      foreach(WorldSpnPlacement placement in spnSnapshot){GR2[] placementModels=placement?.Models?.ToArray()??Array.Empty<GR2>();foreach(GR2 model in placementModels)if(model!=null)yield return model;}
       foreach(GR2 model in dynamicDetailMeshModels.Values)if(model!=null)yield return model;
       foreach(GR2 model in strongholdHookModels.Values)if(model!=null)yield return model;
       if(taxiRideVehicleModel!=null)yield return taxiRideVehicleModel;
@@ -6071,14 +6211,16 @@ namespace PugTools {
     }
 
     private void SetMapOpen(bool open){
-      if(mapOpen==open){if(!open)CloseTaxiRouteMapState();return;}
+      if(mapOpen==open){if(!open){CloseTaxiRouteMapState();CloseQuickTravelMapState();}return;}
       mapOpen=open;mapPointerDown=false;mapPointerDragged=false;
-      if(open)ResetMapCamera();else CloseTaxiRouteMapState();
+      if(open)ResetMapCamera();else {CloseTaxiRouteMapState();CloseQuickTravelMapState();}
       InvalidateTemporalHistory();
       if(Window is WorldBrowser browser){
         browser.SetFullMapActive(open);
         browser.SetStatusLabel(open
-          ? (IsTaxiRouteMapActive ? "Taxi map: click a highlighted route/destination, drag = pan, wheel = zoom, M/Esc = close" : "Map: click = teleport, drag = pan, wheel = zoom, move mouse = coordinates, M/Esc = close")
+          ? (IsTaxiRouteMapActive ? "Taxi map: click a highlighted route/destination, drag = pan, wheel = zoom, M/Esc = close"
+            : IsQuickTravelMapActive ? "Quick travel: click a bindpoint destination, drag = pan, wheel = zoom, M/Esc = close"
+            : "Map: click = teleport, drag = pan, wheel = zoom, move mouse = coordinates, M/Esc = close")
           : "Map closed. Camera speed: "+cameraSpeed.ToString("0.##")+" u/s");
       }
     }
@@ -6178,6 +6320,10 @@ namespace PugTools {
             if(TryPickTaxiRouteOnMap(e.Location,out WorldTaxiRouteInfo pickedRoute) && Window is WorldBrowser taxiBrowser){
               CloseTaxiRouteMapState();mapOpen=false;mapPointerDragged=false;InvalidateTemporalHistory();taxiBrowser.SetFullMapActive(false);taxiBrowser.StartTaxiRouteFromMap(pickedRoute);
             } else if(Window is WorldBrowser taxiMapBrowser) taxiMapBrowser.SetStatusLabel("Taxi map: click a highlighted route or destination marker; drag to pan, wheel to zoom, Esc/M to close.");
+          } else if(IsQuickTravelMapActive){
+            WorldQuickTravelTerminal terminal=QuickTravelTerminalAtMapPoint(e.Location);
+            if(terminal!=null)TeleportQuickTravel(terminal);
+            else if(Window is WorldBrowser quickMapBrowser)quickMapBrowser.SetStatusLabel("Quick travel: click a bindpoint destination; drag to pan, wheel to zoom, Esc/M to close.");
           } else TeleportFromMap(e.Location);
         }
       }
@@ -6195,12 +6341,18 @@ namespace PugTools {
           }
         }
         if(!mapPointerDragged&&Window is WorldBrowser mapBrowser){
-          AreaMapNote hoverNote = !IsTaxiRouteMapActive ? HitTestFullMapNote(e.Location) : null;
+          AreaMapNote hoverNote = !IsTaxiRouteMapActive&&!IsQuickTravelMapActive ? HitTestFullMapNote(e.Location) : null;
           mapBrowser.UpdateWorldMapNoteToolTip(hoverNote, e.Location);
           if(IsTaxiRouteMapActive && TryPickTaxiRouteOnMap(e.Location,out WorldTaxiRouteInfo hoverRoute))
             mapBrowser.SetStatusLabel("Taxi destination: "+TaxiRouteMapDisplayName(hoverRoute)+"  •  click to ride");
           else if(IsTaxiRouteMapActive)
             mapBrowser.SetStatusLabel("Taxi map: click a highlighted route/destination; drag = pan, wheel = zoom, Esc/M = close");
+          else if(IsQuickTravelMapActive){
+            WorldQuickTravelTerminal hoverTerminal=QuickTravelTerminalAtMapPoint(e.Location);
+            mapBrowser.SetStatusLabel(hoverTerminal!=null
+              ? "Quick travel destination: "+hoverTerminal.Label+"  •  click to travel"
+              : "Quick travel: click a bindpoint destination; drag = pan, wheel = zoom, Esc/M = close");
+          }
           else {
             Vector2 world=MapWorldAtScreen(e.Location);
             string heightText=TrySampleMapHeight(world.X,world.Y,out float mapY)
@@ -6239,6 +6391,7 @@ namespace PugTools {
     }
     public void HandleMouseWheel(System.Drawing.Point location,int delta){
       if(mapOpen){ZoomMapAt(location,delta);return;}
+      if(HandleSpaceFlypathMouseWheel(delta))return;
       if(HandleTaxiMouseWheel(delta))return;
       if(orthographicActive){
         orthographicZoomTarget=Math.Max(OrthographicZoomMin,Math.Min(OrthographicZoomMax,orthographicZoomTarget*(float)Math.Exp(-delta*OrthographicZoomSensitivity)));

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 
 namespace PugTools {
   internal class Format_SDEF {
@@ -17,51 +18,25 @@ namespace PugTools {
       _extension = ext;
       _fileNames = new HashSet<string>();
     }
+
     internal void ParseSDEF(Stream fileStream) {
-      using BinaryReader br = new BinaryReader(fileStream);
-      UInt32 header = FileFormats.FileHelpers.ReverseBytes(br.ReadUInt32());
-
-      if (header.ToString("X") != "53444546") return;
-      else {
-        //read unknown 1 version info??
-        br.ReadBytes(4);
-
-        //C9 indicates 2 byte integer
-        br.ReadByte();
-
-        //Read 2 byte integer                
-        UInt16 count = FileFormats.FileHelpers.ReverseBytes(br.ReadUInt16());
-
-        for (Int32 c = 0; c < count; c++) {
-          //CF Idenitifes 8 byte integer
-          br.ReadByte();
-
-          //Read the 8 byte integer                    
-          UInt64 id = FileFormats.FileHelpers.ReverseBytes(br.ReadUInt64());
-
-          //null seperator
-          br.ReadByte();
-
-          //CB identifies a 4 byte integer -- CA identifies a 3 byte integer                    
-          Byte cb = br.ReadByte();
-
-          if (cb == 203) {
-            //Read the 4 byte integer
-            br.ReadBytes(4);
-          } else if (cb == 202) {
-            //Read the 3 byte integer
-            br.ReadBytes(3);
-          }
-
-          //null seperator
-          br.ReadByte();
-
-          _fileNames.Add("/resources/systemgenerated/compilednative/" + id);
+      if (fileStream == null) return;
+      try {
+        using BinaryReader br = new BinaryReader(fileStream, Encoding.UTF8, false);
+        ViewHeroScriptLists.HeroScriptListInfo list = ViewHeroScriptLists.Parse(br);
+        if (!String.Equals(list.Kind, "SDEF", StringComparison.Ordinal)) {
+          _errors.Add("scriptdef.list: expected SDEF but parsed " + list.Kind + ".");
+          return;
         }
-      }
 
-      return;
+        foreach (ViewHeroScriptLists.HeroScriptListEntry script in list.Scripts)
+          _fileNames.Add("/resources/systemgenerated/compilednative/" + script.Id);
+      }
+      catch (Exception ex) {
+        _errors.Add("scriptdef.list: " + ex.Message);
+      }
     }
+
     internal void WriteFile() {
       if (!Directory.Exists(_dest + "\\File_Names"))
         Directory.CreateDirectory(_dest + "\\File_Names");

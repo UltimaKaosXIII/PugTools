@@ -121,6 +121,7 @@ namespace PugTools {
       var spnAnimationCache = new Dictionary<string, WorldNpcAnimationClip>(StringComparer.OrdinalIgnoreCase);
       var spnDynCache = new Dictionary<string, SpnDynPreviewTemplate>(StringComparer.OrdinalIgnoreCase);
       var animationCache = new Dictionary<string, WorldNpcAnimationClip>(StringComparer.OrdinalIgnoreCase);
+      var interactionCache = new Dictionary<string, WorldInteractionInfo>(StringComparer.OrdinalIgnoreCase);
       var spawnPointsByParent = BuildSpawnPointIndex();
       var speciesScales = LoadNpcSpeciesScales();
       int failures = 0;
@@ -156,7 +157,7 @@ namespace PugTools {
                     npc = currentDom.NpcLoader.Load(entityFqn);
                     npcCache[entityFqn] = npc;
                   }
-                  WorldNpcPlacement spnPlacement = BuildNpcPlacement(room, instance, entityFqn, npc, appearanceCache, speciesScales, idleAnimation, animationCache);
+                  WorldNpcPlacement spnPlacement = BuildNpcPlacement(room, instance, entityFqn, npc, appearanceCache, speciesScales, idleAnimation, animationCache, interactionCache);
                   if (spnPlacement != null) {
                     // Jedipedia only resolves pth.* ride routes for placeables. Applying the spawner's path to an NPC
                     // turns platform/elevator metadata into character locomotion and can make a creature race back and
@@ -166,7 +167,7 @@ namespace PugTools {
                     builtVariants.Add(spnPlacement);
                   }
                 } else if (entityFqn.StartsWith("plc.", StringComparison.OrdinalIgnoreCase)) {
-                  WorldSpnPlacement spnObject = BuildSpnPlaceablePlacement(room, instance, entityFqn, spnModelCache, spnAnimationCache, spnDynCache);
+                  WorldSpnPlacement spnObject = BuildSpnPlaceablePlacement(room, instance, entityFqn, spnModelCache, spnAnimationCache, spnDynCache, interactionCache);
                   if (spnObject != null) {
                     spnObject.PathFqn = spawnerInfo?.PathFqn;
                     spnObject.TraversalStyle = spawnerInfo?.TraversalStyle ?? 1;
@@ -580,9 +581,11 @@ namespace PugTools {
         AppSlot bodySlot = appearance.AppearanceSlotMap.Values.Where(x => x != null).SelectMany(x => x).FirstOrDefault(x => x != null && !String.IsNullOrWhiteSpace(x.BodyType));
         bodyType = bodySlot?.BodyType;
       }
+      bool clientTaxi = WorldNpcLooksLikeTaxiTerminal(fqn, fqn, null);
       var placement = new WorldNpcPlacement {
         Room = room, Instance = instance, SourceFqn = fqn, Name = fqn, Scale = scale, ShowNameplate = false,
-        IsTaxiTerminal = WorldNpcLooksLikeTaxiTerminal(fqn, fqn, null),
+        IsTaxiTerminal = clientTaxi,
+        Interaction = clientTaxi ? new WorldInteractionInfo { Kind = WorldInteractionKind.Taxi, LegacyHeuristic = true } : null,
         BodyType = bodyType, Animation = ResolveNpcAnimationClip(null, bodyType, animationCache),
         AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, fqn)
       };
@@ -591,7 +594,7 @@ namespace PugTools {
       return placement.Models.Count > 0 ? placement : null;
     }
 
-    private WorldNpcPlacement BuildNpcPlacement(Room room, AssetInstance instance, string sourceFqn, Npc npc, Dictionary<string, List<GR2>> appearanceCache, Dictionary<ulong, float> speciesScales, string idleAnimationName, Dictionary<string, WorldNpcAnimationClip> animationCache) {
+    private WorldNpcPlacement BuildNpcPlacement(Room room, AssetInstance instance, string sourceFqn, Npc npc, Dictionary<string, List<GR2>> appearanceCache, Dictionary<ulong, float> speciesScales, string idleAnimationName, Dictionary<string, WorldNpcAnimationClip> animationCache, Dictionary<string, WorldInteractionInfo> interactionCache) {
       if (npc?.VisualDataList == null || npc.VisualDataList.Count == 0) return null;
       NpcVisualData visual = npc.VisualDataList.FirstOrDefault(x => x != null && !String.IsNullOrWhiteSpace(x.AppearanceFqn));
       if (visual == null) return null;
@@ -613,9 +616,16 @@ namespace PugTools {
         bodyType = bodySlot?.BodyType;
       }
       WorldNpcAnimationClip animation = ResolveNpcAnimationClip(idleAnimationName, bodyType, animationCache);
+      WorldInteractionInfo interaction = ResolveWorldNpcInteraction(sourceFqn, npc, interactionCache);
+      bool isTaxiTerminal = interaction?.Kind == WorldInteractionKind.Taxi;
+      if (!isTaxiTerminal && WorldNpcLooksLikeTaxiTerminal(sourceFqn, displayName, title)) {
+        interaction = new WorldInteractionInfo { Kind = WorldInteractionKind.Taxi, LegacyHeuristic = true };
+        isTaxiTerminal = true;
+        if (interactionCache != null) interactionCache["npc|" + sourceFqn] = interaction;
+      }
       var placement = new WorldNpcPlacement {
         Room = room, Instance = instance, SourceFqn = sourceFqn, Name = displayName,
-        Title = title, IsTaxiTerminal = WorldNpcLooksLikeTaxiTerminal(sourceFqn, displayName, title),
+        Title = title, IsTaxiTerminal = isTaxiTerminal, Interaction = interaction,
         Scale = scale, Items = ResolveVisualItemNames(visual), ShowNameplate = true,
         RepublicReaction = npc.DetFaction?.RepublicReaction, ImperialReaction = npc.DetFaction?.ImperialReaction, HasFactionPackage = npc.DetFaction != null,
         IdleAnimationName = idleAnimationName, AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn), BodyType = bodyType, Animation = animation
@@ -668,6 +678,178 @@ namespace PugTools {
         }
       } catch (Exception ex) {
         System.Diagnostics.Debug.WriteLine("NPC idle animation resolution failed " + (displayName ?? "<default>") + "/" + bodyType + ": " + ex.Message);
+      }
+      if (cache != null) cache[key] = result;
+      return result;
+    }
+
+    private static readonly string[] WorldConversationAnimationNetworks = {
+      "humanoid_action_conversation", "humanoid_action_conversation_loops",
+      "creature_action_conversation", "humanoid_action_conversation_npc_autogen"
+    };
+
+    private static string NormalizeNpcConversationPathSegment(string value) {
+      if (String.IsNullOrWhiteSpace(value)) return String.Empty;
+      var sb = new System.Text.StringBuilder(value.Length);
+      foreach (char c in value.ToLowerInvariant()) if (Char.IsLetterOrDigit(c)) sb.Append(c);
+      return sb.ToString();
+    }
+
+    private static int FindNpcConversationSegment(string[] segments, string wanted, int from) {
+      if (segments == null || String.IsNullOrWhiteSpace(wanted)) return -1;
+      string padded = wanted;
+      if (wanted.Length > 0 && Char.IsDigit(wanted[wanted.Length - 1]) && (wanted.Length < 2 || !Char.IsDigit(wanted[wanted.Length - 2])))
+        padded = wanted.Substring(0, wanted.Length - 1) + "0" + wanted[wanted.Length - 1];
+      for (int i = Math.Max(0, from); i < segments.Length; i++) {
+        string segment = segments[i] ?? String.Empty;
+        if (segment.EndsWith(wanted, StringComparison.OrdinalIgnoreCase) ||
+            (!String.Equals(padded, wanted, StringComparison.OrdinalIgnoreCase) && segment.EndsWith(padded, StringComparison.OrdinalIgnoreCase))) return i;
+      }
+      return -1;
+    }
+
+    private bool TryResolveNpcConversationNetworkClip(string value, NpcAnimationSpec spec, out string clipName, out string networkName) {
+      clipName = null; networkName = null;
+      if (currentAssets == null || spec == null || String.IsNullOrWhiteSpace(value)) return false;
+      string[] wanted = value.Split(new[] { '.' }, StringSplitOptions.RemoveEmptyEntries)
+        .Select(NormalizeNpcConversationPathSegment).Where(x => x.Length > 0).ToArray();
+      if (wanted.Length == 0) return false;
+
+      var categories = new List<string>();
+      void AddCategory(string category) {
+        if (!String.IsNullOrWhiteSpace(category) && !categories.Contains(category, StringComparer.OrdinalIgnoreCase)) categories.Add(category.Trim().ToLowerInvariant());
+      }
+      AddCategory(spec.Category);
+      foreach (string category in new[] { "humanoid", "creature", "droid", "npc", "pet" }) AddCategory(category);
+
+      string bestClip = null, bestNetwork = null;
+      int bestLength = Int32.MaxValue;
+      foreach (string category in categories) foreach (string network in WorldConversationAnimationNetworks) {
+        string basePath = "/resources/anim/" + category + "/" + spec.Folder + "/";
+        using File mphFile = currentAssets.FindFile(basePath + network + ".mph");
+        if (mphFile == null) continue;
+        try {
+          using Stream stream = mphFile.OpenCopyInMemory();
+          using var br = new BinaryReader(stream);
+          ViewMPH.MphFileInfo mph = ViewMPH.Parse(br);
+          foreach (ViewMPH.MphSection section in mph.Sections.Where(x => x.Network != null)) {
+            foreach (ViewMPH.MphNode node in section.Network.Nodes) {
+              if (node == null || String.IsNullOrWhiteSpace(node.Name) || !node.Fields.TryGetValue("JBA", out string jba) || String.IsNullOrWhiteSpace(jba)) continue;
+              string[] segments = node.Name.Split(new[] { '|' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(NormalizeNpcConversationPathSegment).Where(x => x.Length > 0).ToArray();
+              int at = 0; bool matched = true;
+              foreach (string want in wanted) {
+                int where = FindNpcConversationSegment(segments, want, at);
+                if (where < 0) { matched = false; break; }
+                at = where + 1;
+              }
+              if (!matched || segments.Length >= bestLength) continue;
+              bestClip = AnimationStem(jba); bestNetwork = network; bestLength = segments.Length;
+            }
+          }
+        } catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("Conversation MPH index failed " + basePath + network + ".mph: " + ex.Message);
+        }
+      }
+      if (String.IsNullOrWhiteSpace(bestClip)) return false;
+      clipName = bestClip; networkName = bestNetwork; return true;
+    }
+
+    private WorldNpcAnimationClip ResolveNpcConversationAnimationClip(string value, string bodyType,
+        Dictionary<string, WorldNpcAnimationClip> cache) {
+      if (String.IsNullOrWhiteSpace(value) || String.IsNullOrWhiteSpace(bodyType) || currentAssets == null) return null;
+      string key = "<conversation>|" + value.Trim().ToLowerInvariant() + "|" + bodyType.Trim().ToLowerInvariant();
+      if (cache != null && cache.TryGetValue(key, out WorldNpcAnimationClip cached)) return cached;
+      WorldNpcAnimationClip result = null;
+      try {
+        string[] parts = value.Trim().Split(new[] { '.' }, StringSplitOptions.RemoveEmptyEntries);
+        string leaf = AnimationStem(parts.LastOrDefault());
+        var candidates = new List<string>();
+        void Add(string name) { name = AnimationStem(name); if (!String.IsNullOrWhiteSpace(name) && !candidates.Contains(name, StringComparer.OrdinalIgnoreCase)) candidates.Add(name); }
+        Add(leaf);
+        string group = parts.Length > 1 ? AnimationStem(parts[parts.Length - 2]) : null;
+        string stem = leaf, tail = String.Empty;
+        if (!String.IsNullOrWhiteSpace(leaf)) {
+          int underscore = leaf.LastIndexOf('_');
+          if (underscore >= 0 && underscore + 1 < leaf.Length && Int32.TryParse(leaf.Substring(underscore + 1), out _)) {
+            stem = leaf.Substring(0, underscore); tail = leaf.Substring(underscore);
+          }
+          foreach (string prefix in new[] { "dl_", "as_", "em_", "ex_", "mv_", "ad_" }) {
+            Add(prefix + leaf);
+            if (!String.IsNullOrWhiteSpace(group)) {
+              Add(prefix + stem + "_" + group + tail);
+              if (tail.Length > 0) Add(prefix + stem + "_" + group);
+            }
+          }
+          // RoboDirector short names omit the underscore and leading zero (rd3 -> dl_rd_03).
+          int digitStart = leaf.Length;
+          while (digitStart > 0 && Char.IsDigit(leaf[digitStart - 1])) digitStart--;
+          if (digitStart < leaf.Length && Int32.TryParse(leaf.Substring(digitStart), out int number)) {
+            string rdStem = leaf.Substring(0, digitStart).TrimEnd('_');
+            Add(rdStem + "_" + number.ToString("00", System.Globalization.CultureInfo.InvariantCulture));
+            Add("dl_" + rdStem + "_" + number.ToString("00", System.Globalization.CultureInfo.InvariantCulture));
+          }
+        }
+        List<NpcAnimationSpec> specs = ResolveNpcAnimationSpecs(bodyType);
+        // Most authored conversation values are paths THROUGH a Morpheme network, not filenames. Resolve the complete
+        // dotted path first (conversation.jedi.agree_2 -> dl_agree_jedi_2, robodirector.rd3 -> dl_rd_03), exactly as
+        // Jedipedia's mphParseNetworkClips()/viewerNpcAnimNetworkMatch does. Only then fall back to filename spellings.
+        foreach (NpcAnimationSpec spec in specs) {
+          if (!TryResolveNpcConversationNetworkClip(value, spec, out string networkClip, out string matchedNetwork)) continue;
+          result = TryLoadNpcAnimationClip(spec, networkClip, matchedNetwork, value);
+          if (result != null) break;
+        }
+        foreach (string candidate in result == null ? candidates : new List<string>()) {
+          foreach (NpcAnimationSpec spec in specs) {
+            foreach (string network in WorldConversationAnimationNetworks.Concat(new[] { "anim_library" })) {
+              result = TryLoadNpcAnimationClip(spec, candidate, network, value);
+              if (result != null) break;
+            }
+            if (result != null) break;
+          }
+          if (result != null) break;
+        }
+        // Some trees use a hydAnimationInfo display name rather than a conversation path.
+        if (result == null) result = ResolveNpcAnimationClip(value, bodyType, cache);
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Conversation animation resolution failed " + value + "/" + bodyType + ": " + ex.Message);
+      }
+      if (cache != null) cache[key] = result;
+      return result;
+    }
+
+    private WorldNpcAnimationClip ResolveNpcConversationPostureClip(string value, string bodyType,
+        Dictionary<string, WorldNpcAnimationClip> cache) {
+      if (String.IsNullOrWhiteSpace(bodyType) || currentAssets == null) return null;
+      string posture = String.IsNullOrWhiteSpace(value) ? "Normal" : value.Trim();
+      string key = "<posture>|" + posture.ToLowerInvariant() + "|" + bodyType.Trim().ToLowerInvariant();
+      if (cache != null && cache.TryGetValue(key, out WorldNpcAnimationClip cached)) return cached;
+      WorldNpcAnimationClip result = null;
+      try {
+        var candidates = new List<string>();
+        if (String.Equals(posture, "Normal", StringComparison.OrdinalIgnoreCase)) candidates.Add("dl_idle");
+        else {
+          string name = AnimationStem(posture);
+          string stripped = name != null && name.StartsWith("po_", StringComparison.OrdinalIgnoreCase) ? name.Substring(3) : name;
+          foreach (string candidate in new[] { name + "_idle", name, name + "_loop", "as_" + stripped + "_loop", "po_" + stripped + "_idle", "dl_idle" })
+            if (!String.IsNullOrWhiteSpace(candidate) && !candidates.Contains(candidate, StringComparer.OrdinalIgnoreCase)) candidates.Add(candidate);
+        }
+        List<NpcAnimationSpec> specs = ResolveNpcAnimationSpecs(bodyType);
+        foreach (string candidate in candidates) {
+          foreach (NpcAnimationSpec spec in specs) {
+            foreach (string network in WorldConversationAnimationNetworks.Concat(new[] { "anim_library" })) {
+              result = TryLoadNpcAnimationClip(spec, candidate, network, posture);
+              if (result != null) break;
+            }
+            if (result != null) break;
+          }
+          if (result != null) break;
+        }
+        // A body type with no dedicated conversation network still uses its ordinary standing idle instead of the
+        // rigid bind pose. This is only a fallback; authored Play Animation/Set Posture beats replace it immediately.
+        if (result == null) result = ResolveNpcAnimationClip("Idle", bodyType, cache);
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Conversation posture resolution failed " + posture + "/" + bodyType + ": " + ex.Message);
       }
       if (cache != null) cache[key] = result;
       return result;
@@ -903,35 +1085,111 @@ namespace PugTools {
 
     private WorldNpcAnimationClip TryLoadNpcAnimationClip(NpcAnimationSpec spec, string clipName, string networkName, string displayName) {
       if (spec == null || String.IsNullOrWhiteSpace(clipName)) return null;
-      string basePath = "/resources/anim/" + spec.Category + "/" + spec.Folder + "/";
-      using File jbaFile = currentAssets.FindFile(basePath + clipName + ".jba");
-      if (jbaFile == null) return null;
 
-      JBAAnimation animation;
-      using (Stream stream = jbaFile.OpenCopyInMemory()) using (var br = new BinaryReader(stream)) animation = JBAReader.Read(br);
-      if (animation == null || animation.BoneCount <= 0 || animation.Length <= 0f) return null;
-      animation.PrepareSamples();
-
-      JBARig rig = null;
-      foreach (string mappingName in new[] { AnimationStem(networkName), "anim_library" }.Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase)) {
-        using File mphFile = currentAssets.FindFile(basePath + mappingName + ".mph");
-        if (mphFile == null) continue;
-        try {
-          using Stream mphStream = mphFile.OpenCopyInMemory();
-          using var mphReader = new BinaryReader(mphStream);
-          rig = MPHAnimationReader.FindRigForClip(mphReader, clipName);
-          if (rig != null) break;
-        } catch { }
+      // Jedipedia probes the character spec's category first and then the other SWTOR animation roots while keeping
+      // the SAME AnimNetworkFolder. Some body types point at a folder whose conversation clips were authored under a
+      // different category; restricting the lookup to spec.Category finds a .jba for many idles but leaves conversation
+      // actors rigid because its matching .mph can never be reached.
+      var categories = new List<string>();
+      void AddCategory(string category) {
+        if (!String.IsNullOrWhiteSpace(category) && !categories.Contains(category, StringComparer.OrdinalIgnoreCase))
+          categories.Add(category.Trim().ToLowerInvariant());
       }
+      AddCategory(spec.Category);
+      foreach (string category in new[] { "humanoid", "creature", "droid", "npc", "pet" }) AddCategory(category);
+
       IList<GR2_Bone_Skeleton> skeleton = LoadNpcAnimationSkeleton(spec.SkeletonPath);
-      return new WorldNpcAnimationClip {
-        DisplayName = String.IsNullOrWhiteSpace(displayName) ? clipName : displayName.Trim(),
-        Action = clipName,
-        Network = AnimationStem(networkName),
-        Animation = animation,
-        Rig = rig,
-        Skeleton = skeleton
-      };
+      if (skeleton == null || skeleton.Count == 0) return null;
+
+      foreach (string category in categories) {
+        string basePath = "/resources/anim/" + category + "/" + spec.Folder + "/";
+        using File jbaFile = currentAssets.FindFile(basePath + clipName + ".jba");
+        if (jbaFile == null) continue;
+
+        JBAAnimation animation;
+        try {
+          using Stream stream = jbaFile.OpenCopyInMemory();
+          using var br = new BinaryReader(stream);
+          animation = JBAReader.Read(br);
+        } catch { continue; }
+        if (animation == null || animation.BoneCount <= 0 || animation.Length <= 0f) continue;
+        animation.PrepareSamples();
+
+        bool hasNamedChannels = animation.BoneNames != null && animation.BoneNames
+          .Take(Math.Min(animation.BoneNames.Count, Math.Max(0, animation.BoneCount)))
+          .Any(name => !String.IsNullOrWhiteSpace(name) && !name.StartsWith("bone_", StringComparison.OrdinalIgnoreCase));
+
+        JBARig rig = null;
+        int boundBones = hasNamedChannels ? CountWorldNpcAnimationBindings(animation, null, skeleton) : 0;
+        if (boundBones <= 0) {
+          // Use the small authored network only when its exact RigToAnimMap actually binds this skeleton. If it names
+          // the clip but points at a different LOD/rig, keep going to anim_library.mph just like Jedipedia does. The
+          // previous code accepted any non-null JBARig and only discovered the zero-bone result later in the renderer.
+          foreach (string mappingName in new[] { AnimationStem(networkName), "anim_library" }
+              .Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase)) {
+            using File mphFile = currentAssets.FindFile(basePath + mappingName + ".mph");
+            if (mphFile == null) continue;
+            try {
+              using Stream mphStream = mphFile.OpenCopyInMemory();
+              using var mphReader = new BinaryReader(mphStream);
+              JBARig candidateRig = MPHAnimationReader.FindRigForClip(mphReader, clipName);
+              if (candidateRig == null) continue;
+              int candidateBindings = CountWorldNpcAnimationBindings(animation, candidateRig, skeleton);
+              if (candidateBindings <= 0) continue;
+              rig = candidateRig;
+              boundBones = candidateBindings;
+              break;
+            } catch { }
+          }
+        }
+        if (boundBones <= 0) continue;
+
+        return new WorldNpcAnimationClip {
+          DisplayName = String.IsNullOrWhiteSpace(displayName) ? clipName : displayName.Trim(),
+          Action = clipName,
+          Network = AnimationStem(networkName),
+          Animation = animation,
+          Rig = rig,
+          Skeleton = skeleton
+        };
+      }
+      return null;
+    }
+
+    private static int CountWorldNpcAnimationBindings(JBAAnimation animation, JBARig rig, IList<GR2_Bone_Skeleton> skeleton) {
+      if (animation == null || skeleton == null || skeleton.Count == 0) return 0;
+      int sampleCount = Math.Max(0, animation.BoneCount);
+      if (sampleCount == 0) return 0;
+      var channelByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+      bool authoritative = animation.BoneNames != null && animation.BoneNames
+        .Take(Math.Min(animation.BoneNames.Count, sampleCount))
+        .Any(name => !String.IsNullOrWhiteSpace(name) && !name.StartsWith("bone_", StringComparison.OrdinalIgnoreCase));
+      if (authoritative) {
+        int count = Math.Min(animation.BoneNames.Count, sampleCount);
+        for (int channel = 0; channel < count; channel++) {
+          string name = WorldNpcCanonicalAnimationBoneName(animation.BoneNames[channel]);
+          if (String.IsNullOrWhiteSpace(name) || name.StartsWith("bone_", StringComparison.OrdinalIgnoreCase)) continue;
+          channelByName[name] = channel;
+        }
+      } else if (rig?.Bones != null && rig.AnimToRig != null) {
+        for (int channel = 0; channel < Math.Min(sampleCount, rig.AnimToRig.Length); channel++) {
+          int rigIndex = rig.AnimToRig[channel];
+          if (rigIndex < 0 || rigIndex >= rig.Bones.Count) continue;
+          string name = WorldNpcCanonicalAnimationBoneName(rig.Bones[rigIndex].Name);
+          if (!String.IsNullOrWhiteSpace(name)) channelByName[name] = channel;
+        }
+      }
+      if (channelByName.Count == 0) return 0;
+      int bindings = 0;
+      foreach (GR2_Bone_Skeleton bone in skeleton) {
+        string name = WorldNpcCanonicalAnimationBoneName(bone?.boneName);
+        if (!String.IsNullOrWhiteSpace(name) && channelByName.ContainsKey(name)) bindings++;
+      }
+      return bindings;
+    }
+
+    private static string WorldNpcCanonicalAnimationBoneName(string name) {
+      return String.Equals(name, "Bip01", StringComparison.OrdinalIgnoreCase) ? "GOD" : (name ?? String.Empty).Trim();
     }
 
     private IList<GR2_Bone_Skeleton> LoadNpcAnimationSkeleton(string skeletonPath) {
@@ -968,7 +1226,8 @@ namespace PugTools {
     private string LocalizedNpcName(Npc npc, string fallbackFqn) {
       if (npc == null) return PrettySpawnName(fallbackFqn);
       string selected = GomLib.StringTable.SelectedLocalization;
-      if (npc.LocalizedName != null && npc.LocalizedName.TryGetValue(selected, out string localized) && IsRealLocalizedName(localized, fallbackFqn)) return localized.Trim();
+      string localizedNpcName = WorldLocalizedText(npc.LocalizedName, npc.Name);
+      if (IsRealLocalizedName(localizedNpcName, fallbackFqn)) return localizedNpcName.Trim();
       if (IsRealLocalizedName(npc.Name, fallbackFqn)) return npc.Name.Trim();
       try {
         GomLib.StringTable table = currentDom?.StringTable?.Find("str.npc");
@@ -1006,7 +1265,7 @@ namespace PugTools {
 
     private WorldSpnPlacement BuildSpnPlaceablePlacement(Room room, AssetInstance instance, string sourceFqn,
         Dictionary<string, List<GR2>> modelCache, Dictionary<string, WorldNpcAnimationClip> animationCache,
-        Dictionary<string, SpnDynPreviewTemplate> dynCache) {
+        Dictionary<string, SpnDynPreviewTemplate> dynCache, Dictionary<string, WorldInteractionInfo> interactionCache) {
       Placeable placeable = null;
       GomObject node = null;
       try { placeable = currentDom.PlaceableLoader.Load(sourceFqn); } catch { }
@@ -1019,18 +1278,62 @@ namespace PugTools {
         if (dynCache != null) dynCache[sourceFqn] = dynTemplate;
       }
 
+      // Bindpoints are identified by the exact ability used by the client. PlaceableLoader already exposes the same
+      // check through PlaceableCategory.Bindpoint, while the raw-node fallback keeps RED/Beta revisions working if a
+      // legacy prototype cannot be fully materialized by the high-level loader.
+      const ulong quickTravelAbility = 16140902321107152398UL;
+      ulong rawAbility = 0;
+      try { rawAbility = node?.Data.ValueOrDefault<ulong>("plcAbilitySpecOnUse", 0) ?? 0; } catch { }
+      bool isQuickTravel = placeable?.Category == PlaceableCategory.Bindpoint ||
+        placeable?.AbilitySpecOnUseId == quickTravelAbility || rawAbility == quickTravelAbility;
+      WorldInteractionInfo interaction = ResolveWorldPlaceableInteraction(sourceFqn, placeable, node, isQuickTravel, interactionCache);
+
       WorldNpcAnimationClip animation = null;
       List<GR2> loaded;
       if (dynTemplate != null) loaded = dynTemplate.Models;
       else loaded = GetSpnPlaceableModels(sourceFqn, placeable, node, modelCache, animationCache, out animation);
-      // A dyn assembly may intentionally contain only a light row. Jedipedia keeps that placement even without
-      // geometry, because the light is a world-space contribution rather than a drawable model.
-      if ((loaded == null || loaded.Count == 0) && (dynTemplate == null || dynTemplate.Lights.Count == 0)) return null;
-
-      string name = placeable?.Name;
-      if (placeable?.LocalizedName != null && placeable.LocalizedName.TryGetValue(GomLib.StringTable.SelectedLocalization, out string localized) && IsRealLocalizedName(localized, sourceFqn)) name = localized;
+      // Some German/French STBs only ship one gender row for a knowledge object. Selecting deMale/frMale used to
+      // miss a deFemale/frFemale-only PLC name, after which the lore fallback compared the English/FQN label against
+      // localized cdx titles and the object became non-interactive. Use the same exact -> same-language -> any fallback
+      // as dialog text before resolving the codex.
+      object rawNameRetriever = null;
+      if (node?.Data != null) {
+        object rawLocMap = WorldInteractionDataValue(node.Data, "locTextRetrieverMap", "4611686102842470023");
+        rawNameRetriever = WorldCodexDictionaryValue(rawLocMap, 15685385242400905286UL);
+      }
+      string name = WorldLocalizedText(placeable?.LocalizedName, placeable?.Name);
+      if (!IsRealLocalizedName(name, sourceFqn) && rawNameRetriever != null) {
+        // PlaceableLoader itself indexes LocalizedName[SelectedLocalization] and can throw before filling CodexId/Name
+        // when a DE/FR PLC ships only the opposite gender row. Read the stable locTextRetrieverMap entry directly so
+        // knowledge objects remain name-resolvable even when the high-level Placeable could not be materialized.
+        string rawLocalizedName = WorldCodexLocalizedText(sourceFqn, rawNameRetriever);
+        if (IsRealLocalizedName(rawLocalizedName, sourceFqn)) name = rawLocalizedName;
+      }
       if (!IsRealLocalizedName(name, sourceFqn)) name = PrettySpawnName(sourceFqn);
-      long wonkaPackageId = placeable?.WonkaPackageId ?? 0;
+
+      // Tutorial/lore PLCs in a few generations do not expose plcCodexSpec through the normal prototype shape. Their
+      // localized label/FQN leaf still matches a unique cdx.* entry (for example Item Modification ->
+      // cdx.game_rules.tutorials.item_modifications). Resolve that cheap name-only fallback while placements are built
+      // so the object participates in normal left/right-click picking even when it has no usable/glow flag.
+      if (interaction == null) {
+        // First use the language-independent (STB bucket,string-id) identity shared by many knowledge PLC/cdx pairs;
+        // only fall back to localized/FQN text when the two nodes deliberately use different retrievers.
+        ulong loreCodexId = ResolveWorldLoreCodexByRetriever(rawNameRetriever);
+        if (loreCodexId == 0) loreCodexId = ResolveWorldLoreCodexByLocalizedPlaceableName(rawNameRetriever, sourceFqn);
+        if (loreCodexId == 0) loreCodexId = ResolveWorldLoreCodexBySourceFqn(sourceFqn);
+        if (loreCodexId == 0) loreCodexId = ResolveWorldLoreCodexByName(name, sourceFqn);
+        if (loreCodexId != 0) {
+          interaction = new WorldInteractionInfo { Kind = WorldInteractionKind.Codex, CodexId = loreCodexId };
+          if (interactionCache != null) interactionCache["plc|" + sourceFqn] = interaction;
+        }
+      }
+
+      // A dyn assembly may intentionally contain only a light row. Jedipedia keeps that placement even without
+      // geometry, because the light is a world-space contribution rather than a drawable model. Effect-only bindpoints
+      // and knowledge objects are also kept when they expose an interaction without a GR2.
+      if ((loaded == null || loaded.Count == 0) && (dynTemplate == null || dynTemplate.Lights.Count == 0) && interaction == null) return null;
+
+      long wonkaPackageId = interaction?.WonkaPackageId ?? (placeable?.WonkaPackageId ?? 0);
       if (wonkaPackageId == 0) wonkaPackageId = WonkInt64(node?.Data.ValueOrDefault<object>("wnkPackageID", null));
       bool blueGlow = SpnPlaceableHasBlueGlow(placeable, node);
       // A dyn row's Usable bit says WHICH part of an already-interactive plc receives the click; it does not make a
@@ -1045,6 +1348,8 @@ namespace PugTools {
         AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn),
         DynStartState = dynTemplate?.StartState,
         WonkaPackageId = wonkaPackageId,
+        IsQuickTravel = isQuickTravel,
+        Interaction = interaction,
         BlueGlow = blueGlow
       };
       if (loaded != null) foreach (GR2 model in loaded) if (model != null && !placement.Models.Contains(model)) placement.Models.Add(model);

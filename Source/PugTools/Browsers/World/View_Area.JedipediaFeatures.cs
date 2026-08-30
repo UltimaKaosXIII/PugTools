@@ -59,6 +59,9 @@ namespace PugTools {
 
     private sealed class SpnMotionPoint {
       public Vector3 Position;
+      // Path control Euler rotation, interpolated alongside the smoothed route. Space-combat ships use it as the
+      // authored up reference while the tangent supplies forward, matching the ordinary path-follower frame.
+      public Vector3 Rotation;
       public float Speed = 1f;
       public float HoldTime;
     }
@@ -299,9 +302,16 @@ namespace PugTools {
     private const int WalkingFloorStreamGraceMaxFrames = 90;
 
     private void SetJedipediaFeatureData(Dictionary<string, GR2> utilityModels, List<WorldNpcPlacement> npcData, List<WorldSpnPlacement> spnData) {
-      utilityMarkerModels = utilityModels ?? new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
-      npcPlacements = npcData ?? new List<WorldNpcPlacement>();
-      spnPlacements = spnData ?? new List<WorldSpnPlacement>();
+      // WorldBrowser builds these collections on a worker task and keeps the same mutable containers for the next
+      // area load. The D3D render thread must never retain those containers directly: a later Clear()/Add() on the
+      // browser side can otherwise invalidate an in-flight foreach (most visibly in WorldModelResidencyRoots).
+      // Placements/models themselves are fully built before LoadModel(), so a shallow container snapshot is enough
+      // and avoids duplicating the comparatively heavy GR2 object graphs.
+      utilityMarkerModels = utilityModels == null
+        ? new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase)
+        : new Dictionary<string, GR2>(utilityModels, StringComparer.OrdinalIgnoreCase);
+      npcPlacements = npcData == null ? new List<WorldNpcPlacement>() : new List<WorldNpcPlacement>(npcData);
+      spnPlacements = spnData == null ? new List<WorldSpnPlacement>() : new List<WorldSpnPlacement>(spnData);
       BuildNpcSpatialIndex();
       BuildSpnSpatialIndex();
       npcGeometryPrepared = false;
@@ -753,8 +763,12 @@ namespace PugTools {
       // A pinned region/trigger remains visible outside Utilities. Pins are changed from the WinForms thread, so
       // keep list mutation/disposal out of the render thread's enumeration.
       if (s.Mode != WorldRenderMode.Map || mapOpen) lock (pinnedVolumeGpu) DrawLines(pinnedVolumeGpu, vp, range);
-      // Phase gateways are controlled directly by their spawned-content toggle, independently of utility helpers.
-      if (s.ShowPhaseGateways) { DrawOverlayTriangles(phaseGatewayPlaneGpu, vp, range); DrawLines(phaseGatewayGpu, vp, range); }
+      // SWTOR/Jedipedia visualize INSTANCE_GATEWAY as a translucent green plane plus its boundary. The plane is
+      // rendered with the depth-read/alpha Overlay pass, so it stays transparent and is occluded by real geometry.
+      if (s.ShowPhaseGateways) {
+        DrawOverlayTriangles(phaseGatewayPlaneGpu, vp, range);
+        DrawLines(phaseGatewayGpu, vp, range);
+      }
       if (s.ShowUtilityOther) DrawLines(utilityOtherGpu, vp, range);
     }
 
@@ -783,7 +797,7 @@ namespace PugTools {
     }
 
     private static bool NpcLayerVisible(WorldNpcPlacement placement, WorldRenderSettings s) {
-      return s != null && (s.ShowNpcs || (s.ShowTaxiTerminals && IsTaxiNpc(placement)));
+      return placement?.ConversationHidden != true && s != null && (s.ShowNpcs || (s.ShowTaxiTerminals && IsTaxiNpc(placement)));
     }
 
     private bool NpcVisibleForWork(Vector3 position) {
@@ -829,14 +843,24 @@ namespace PugTools {
 
         // SWTOR spawner facing is authored opposite to the GR2 character forward axis. Apply the same
         // half-turn to both bind-pose and animated NPCs; nameplate bones are transformed through this matrix too.
-        WorldNpcAnimationClip activeClip = placement.Animation;
-        bool animate = s.Mode != WorldRenderMode.Map && s.AnimateNpcs && activeClip?.Animation != null &&
-          (rootPosition - camera.Position).LengthSquared() <= NpcAnimationRenderDistance * NpcAnimationRenderDistance;
+        WorldNpcAnimationClip activeClip = placement.ConversationAnimation ?? placement.Animation;
+        bool conversationClip = placement.ConversationAnimation != null;
+        // Conversation playback owns the actor pose. Do not let the ordinary background-idle toggle/LOD freeze a
+        // cinematic actor that has an explicit posture/beat clip; the game keeps that actor animated for the shot.
+        bool animate = s.Mode != WorldRenderMode.Map && activeClip?.Animation != null &&
+          (conversationClip || (s.AnimateNpcs &&
+            (rootPosition - camera.Position).LengthSquared() <= NpcAnimationRenderDistance * NpcAnimationRenderDistance));
         float animationTime = 0f;
         if (animate) {
           float length = activeClip.Animation.Length;
-          animationTime = length > 0f ? ((float)elapsed + placement.AnimationPhase * length) % length : 0f;
-          if (animationTime < 0f) animationTime += length;
+          float baseTime = conversationClip
+            ? Math.Max(0f, (elapsed - placement.ConversationAnimationStart) * Math.Max(.0001f, placement.ConversationAnimationSpeed) + placement.ConversationAnimationOffset)
+            : elapsed + placement.AnimationPhase * length;
+          if (conversationClip && !placement.ConversationAnimationLoop) animationTime = length > 0f ? Math.Min(baseTime, Math.Max(0f, length - .0001f)) : 0f;
+          else {
+            animationTime = length > 0f ? baseTime % length : 0f;
+            if (animationTime < 0f) animationTime += length;
+          }
           // The animated rig will refresh this from attach_nameplate this frame. Clearing it avoids retaining the
           // previous pose when an animation/model fails and is exactly the kind of stale anchor that makes labels swim.
           placement.NameplateLocal = null;
@@ -933,6 +957,11 @@ namespace PugTools {
     }
 
     private Matrix NpcPlacementBaseWorld(WorldNpcPlacement placement) {
+      if (placement?.ConversationWorld.HasValue == true) return placement.ConversationWorld.Value;
+      return NpcPlacementAuthoredWorld(placement);
+    }
+
+    private Matrix NpcPlacementAuthoredWorld(WorldNpcPlacement placement) {
       Matrix baseWorld = InstanceWorld(placement.Instance, placement.Room);
       if (placement?.SpawnPoints != null && placement.SpawnPoints.Count > 0) {
         // pth.* belongs to placeables in Jedipedia/SWTOR's spawner path. NPCs can have spn_pt dispenser positions,
@@ -1228,7 +1257,7 @@ namespace PugTools {
       if (path?.Points == null || path.Points.Count == 0) return result;
       List<AreaPathPoint> points = path.Points;
       Func<AreaPathPoint, SpnMotionPoint> control = point => new SpnMotionPoint {
-        Position = point.Position, Speed = SafeSpnSpeed(point.Speed), HoldTime = Math.Max(0f, point.HoldTime)
+        Position = point.Position, Rotation = point.Rotation, Speed = SafeSpnSpeed(point.Speed), HoldTime = Math.Max(0f, point.HoldTime)
       };
 
       if (!path.Smooth || points.Count < 3) {
@@ -1250,6 +1279,7 @@ namespace PugTools {
           float speedA = SafeSpnSpeed(points[i].Speed), speedB = SafeSpnSpeed(points[next].Speed);
           result.Add(new SpnMotionPoint {
             Position = PathHermite(a, b, tangents[i], tangents[next], t),
+            Rotation = Vector3.Lerp(points[i].Rotation, points[next].Rotation, t),
             Speed = speedA + (speedB - speedA) * t,
             HoldTime = 0f
           });

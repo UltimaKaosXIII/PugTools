@@ -364,7 +364,7 @@ namespace FileFormats {
         GR2_Mesh mesh = new GR2_Mesh {
           parent = target,
           meshName = AsString(Get(meshObj, "Name")) ?? "mesh",
-          lod = IsCollisionName(AsString(Get(meshObj, "Name"))) ? (Int16)(-1) : (Int16)0,
+          lod = MeshHintLod(AsString(Get(meshObj, "Name"))),
           numVerts = checked((UInt32)vertices.Count)
         };
 
@@ -506,9 +506,16 @@ namespace FileFormats {
       };
     }
 
-    private static Boolean IsCollisionName(String name) {
-      if (String.IsNullOrEmpty(name)) return false;
-      return name.IndexOf("collision", StringComparison.OrdinalIgnoreCase) >= 0;
+    private static Int16 MeshHintLod(String name) {
+      if (String.IsNullOrEmpty(name)) return 0;
+      // Granny/legacy GR2s do not carry SWTOR's modern LOD utility tags. Jedipedia classifies these helper meshes by
+      // their authored names: collision=-1, portal=-2, occluder=-3. Leaving portal/occluder at LOD0 is what turns old
+      // doorway helpers into opaque black walls in the normal world pass.
+      if (name.IndexOf("collision", StringComparison.OrdinalIgnoreCase) >= 0) return -1;
+      if (name.IndexOf("portal", StringComparison.OrdinalIgnoreCase) >= 0) return -2;
+      if (name.IndexOf("occluder", StringComparison.OrdinalIgnoreCase) >= 0 ||
+          name.IndexOf("occlusion", StringComparison.OrdinalIgnoreCase) >= 0) return -3;
+      return 0;
     }
 
     private static void ExpandBounds(GR2_Bounding_Box box, Single x, Single y, Single z, Boolean first) {

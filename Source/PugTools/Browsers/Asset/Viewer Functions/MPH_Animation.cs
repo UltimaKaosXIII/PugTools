@@ -195,23 +195,22 @@ namespace FileFormats {
             if (entry.AnimIndex >= list.Names.Count) continue;
 
             String name = list.Names[(Int32)entry.AnimIndex];
+            // AnimationList entries are not consistently bare stems: older/current clients may store foo.jba or a
+            // resource-relative path. The JBA resolver hands us a stem, so normalize both sides before selecting the
+            // RigToAnim map. An exact raw comparison otherwise finds the clip file but binds no usable rig.
+            String listed = Path.GetFileNameWithoutExtension((name ?? String.Empty).Replace('\\', '/'));
             if (!String.Equals(
-                  name,
+                  listed,
                   wanted,
                   StringComparison.OrdinalIgnoreCase))
               continue;
 
-            // Match Jedipedia jbaApplyRigToAnimMap(): the standalone JBA
-            // page pairs the selected RigToAnimMap with the first type-2 rig
-            // section. Using AnimationList.jointSectionIndex here can select a
-            // mask/joint subsection whose bone names belong to another layout,
-            // which yields a full-looking 102/102 map that binds to the wrong
-            // GR2 bones (notably npc/ithorian).
-            MPHRigSection rig = firstRig;
-            if (rig == null
-                || rig.Bones == null
-                || rig.Bones.Count == 0)
-              continue;
+            // The AnimationList set identifies the rig this RigToAnimMap was authored against. Jedipedia's
+            // current NPC path uses that set-0 rig and only falls back to the first type-2 rig when the indexed
+            // section is absent. Using the first rig unconditionally can bind a valid clip to a different LOD rig,
+            // producing zero useful GR2 bone matches and making a conversation actor look completely static.
+            MPHRigSection rig = rigs.TryGetValue(set.RigSectionIndex, out MPHRigSection indexedRig) ? indexedRig : firstRig;
+            if (rig == null || rig.Bones == null || rig.Bones.Count == 0) continue;
 
             if (!maps.TryGetValue(entry.BoneMappingIndex, out MPHMapSection map))
               continue;

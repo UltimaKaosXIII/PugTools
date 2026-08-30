@@ -11,6 +11,7 @@ namespace PugTools {
     private static Boolean _crossLinkDOM;
     private static String _extractAssetsPath = ".";
     private static String _extractPath = ".";
+    private static String _language = "en-us";
     private static String _prevAssetsPath = ".";
     private static Boolean _prevAssetsUsePTS;
 
@@ -37,6 +38,13 @@ namespace PugTools {
     public static String ExtractPath {
       get => _extractPath;
       set => _extractPath = value;
+    }
+    public static String Language {
+      get => _language;
+      set {
+        string locale = (value ?? String.Empty).Trim().ToLowerInvariant();
+        _language = locale == "de-de" || locale == "fr-fr" ? locale : "en-us";
+      }
     }
     public static String PrevAssetsPath {
       get => _prevAssetsPath;
@@ -118,9 +126,13 @@ namespace PugTools {
       }
 
       // Cross Link DOM
-      str = ConfigFile.AppSettings.Settings["CrossLinkDOM"].Value;
+      str = ConfigFile.AppSettings.Settings["CrossLinkDOM"]?.Value;
 
       if (str != null) CrossLinkDOM = Convert.ToBoolean(str);
+
+      // UI / localized asset language
+      str = ConfigFile.AppSettings.Settings["Language"]?.Value;
+      if (!String.IsNullOrWhiteSpace(str)) Language = str;
     }
     public static void Save() {
       // Path to the asset files
@@ -150,6 +162,11 @@ namespace PugTools {
       // Cross Link DOM
       str = CrossLinkDOM.ToString();
       if (str != null) ConfigFile.AppSettings.Settings["CrossLinkDOM"].Value = str;
+
+      // UI / localized asset language
+      str = Language;
+      if (ConfigFile.AppSettings.Settings["Language"] == null) ConfigFile.AppSettings.Settings.Add("Language", str);
+      else ConfigFile.AppSettings.Settings["Language"].Value = str;
 
       ConfigFile.Save(ConfigurationSaveMode.Modified);
       ConfigurationManager.RefreshSection("appSettings");

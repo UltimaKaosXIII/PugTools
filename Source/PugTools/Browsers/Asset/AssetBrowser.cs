@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -60,6 +61,17 @@ namespace PugTools {
     private WaveOutEvent m_waveOut;
     private XmlDocument m_xmlDoc;
 
+    // DirectMusic SGT playback. SGTs are decoded to an in-memory PCM WAV so beta
+    // Microsoft-ADPCM assets do not depend on an installed Windows ACM codec.
+    private Boolean m_sgtActive;
+    private Byte[] m_sgtDecodedWave;
+    private String m_sgtDecodeError;
+    private MemoryStream m_sgtPcmStream;
+    private WaveFileReader m_sgtWaveReader;
+    private WaveOutEvent m_sgtWaveOut;
+    private System.Windows.Forms.Timer m_sgtUiTimer;
+    private ToolStripButton m_sgtSaveButton;
+
     // JBA playback reuses the existing audio ToolStrip so the controls stay
     // consistent with WEM/BNK playback.
     private Boolean m_jbaActive;
@@ -92,6 +104,9 @@ namespace PugTools {
       m_jbaUiTimer = new System.Windows.Forms.Timer { Interval = 50 };
       m_jbaUiTimer.Tick += JbaUiTimerTick;
 
+      m_sgtUiTimer = new System.Windows.Forms.Timer { Interval = 100 };
+      m_sgtUiTimer.Tick += SgtUiTimerTick;
+
       // JBA-only diagnostic overlay. Keep this dynamic so the existing audio
       // toolbar/designer stays untouched; when a JBA is selected the button is
       // inserted immediately before the progress bar.
@@ -110,6 +125,18 @@ namespace PugTools {
         toolStrip1.Items.Insert(jbaProgressIndex, m_jbaSkeletonButton);
       else
         toolStrip1.Items.Add(m_jbaSkeletonButton);
+
+      m_sgtSaveButton = new ToolStripButton {
+        AutoSize = true,
+        DisplayStyle = ToolStripItemDisplayStyle.Text,
+        Text = "Save WAV",
+        ToolTipText = "Save the decoded SGT audio as a standard PCM WAV",
+        Visible = false
+      };
+      m_sgtSaveButton.Click += SgtSaveButtonClick;
+      Int32 sgtProgressIndex = toolStrip1.Items.IndexOf(toolStrip1ProgressBar1);
+      if (sgtProgressIndex >= 0) toolStrip1.Items.Insert(sgtProgressIndex, m_sgtSaveButton);
+      else toolStrip1.Items.Add(m_sgtSaveButton);
 
       if (!m_hashData.Loaded) m_hashData.Load();
 
@@ -165,12 +192,19 @@ namespace PugTools {
         treeViewFast1 = null;
       }
 
+      try { StopSgtPreview(true); } catch { }
       try {
         if (m_audioPlaying) m_waveOut?.Stop();
         m_waveOut?.Dispose();
       } catch { }
       m_waveOut = null;
       m_audioPlaying = false;
+
+      try {
+        m_sgtUiTimer?.Stop();
+        m_sgtUiTimer?.Dispose();
+      } catch { }
+      m_sgtUiTimer = null;
 
       try {
         m_jbaUiTimer?.Stop();
@@ -1024,6 +1058,14 @@ namespace PugTools {
     private async void PreviewAsset(TreeListItem asset) {
       if (asset.HashInfo.File != null) {
 
+        // A preview owns its playback source. Tear down SGT cleanly and tell the
+        // existing WEM loop to stop before replacing the archive stream.
+        if (m_sgtActive || m_sgtWaveReader != null) StopSgtPreview(true);
+        else if (m_audioPlaying) {
+          m_audioPlaying = false;
+          try { m_waveOut?.Stop(); } catch { }
+        }
+
         // Stop JBA UI state before switching to another asset.
         m_jbaActive = false;
         m_jbaUiTimer?.Stop();
@@ -1031,6 +1073,7 @@ namespace PugTools {
           m_jbaSkeletonButton.Checked = false;
           m_jbaSkeletonButton.Visible = false;
         }
+        if (m_sgtSaveButton != null) m_sgtSaveButton.Visible = false;
         m_panelRender?.SetShowSkeleton(false);
 
         // Restore the audio strip defaults; JBA temporarily repurposes button 3
@@ -1075,8 +1118,36 @@ namespace PugTools {
 
         m_rootList = new ArrayList();
 
-        if (asset.HashInfo.Directory == "/resources/systemgenerated/compilednative") {
-          await Task.Run(PreviewAssetSCPT);
+        string selectedAssetPath = ((asset.HashInfo.Directory ?? String.Empty).TrimEnd('/', '\\') + "/" + asset.HashInfo.FileName).Replace("//", "/");
+        bool heroScriptList = selectedAssetPath.Equals("/resources/systemgenerated/scriptdef.list", StringComparison.OrdinalIgnoreCase)
+                           || selectedAssetPath.Equals("/resources/systemgenerated/scripts.list", StringComparison.OrdinalIgnoreCase);
+
+        if (heroScriptList) {
+          m_rootList.Clear();
+          try {
+            await Task.Run(PreviewAssetHeroScriptList);
+            FinishStructuredTreePreview();
+          }
+          catch (Exception ex) {
+            System.Diagnostics.Debug.WriteLine("HeroScript list structured preview failed: " + ex);
+            toolStripStatusLabel2.Text = "HeroScript list parse failed: " + ex.Message;
+            m_inputStream.Position = 0;
+            await Task.Run(PreviewAssetHEX);
+            txtRawView.Visible = true;
+          }
+        } else if (asset.HashInfo.Directory == "/resources/systemgenerated/compilednative") {
+          m_rootList.Clear();
+          try {
+            await Task.Run(PreviewAssetSCPT);
+            FinishStructuredTreePreview();
+          }
+          catch (Exception ex) {
+            System.Diagnostics.Debug.WriteLine("SCPT structured preview failed: " + ex);
+            toolStripStatusLabel2.Text = "SCPT parse failed: " + ex.Message;
+            m_inputStream.Position = 0;
+            await Task.Run(PreviewAssetHEX);
+            txtRawView.Visible = true;
+          }
         } else {
           switch (asset.HashInfo.Extension.ToUpper()) {
             case "DDS":
@@ -1101,8 +1172,38 @@ namespace PugTools {
             case "SVY":
             case "TBL":
             case "LOD":
+            case "TXT":
+            case "INI":
+            case "LST":
+            case "TAB":
+            case "ABL":
+            case "CAM":
+            case "CDX":
+            case "CNV":
+            case "COS":
+            case "DYN":
+            case "ENC":
+            case "HYD":
+            case "ITM":
+            case "IPP":
+            case "MPN":
+            case "NAM":
+            case "NPC":
+            case "NPP":
+            case "PCS":
+            case "PLC":
+            case "PTH":
+            case "QST":
+            case "RDD":
+            case "SPN_C":
+            case "SPN_CRF":
+            case "SPN_LST":
+            case "SPN_P":
+            case "STG":
+            case "STR":
               await Task.Run(PreviewAssetXML);
-              webBrowser1.Visible = true;
+              if (m_xmlDoc?.DocumentElement != null) webBrowser1.Visible = true;
+              else txtRawView.Visible = true;
               break;
 
             case "NOT":
@@ -1148,8 +1249,170 @@ namespace PugTools {
               break;
             }
 
+            case "AMX":
+              m_rootList.Clear();
+              try {
+                String amxSourcePath = asset.HashInfo.Directory + "/" + asset.HashInfo.FileName;
+                await Task.Run(() => PreviewAssetAMX(amxSourcePath));
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("AMX structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "AMX parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
+            case "MPH":
+              m_rootList.Clear();
+              try {
+                String mphSourcePath = asset.HashInfo.Directory + "/" + asset.HashInfo.FileName;
+                await Task.Run(() => PreviewAssetMPH(mphSourcePath));
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("MPH structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "MPH parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
+            case "CLO":
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetCLO);
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("CLO structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "CLO parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
+            case "SPT":
+              m_rootList.Clear();
+              try {
+                String sptSourcePath = asset.HashInfo.Directory + "/" + asset.HashInfo.FileName;
+                await Task.Run(() => PreviewAssetSPT(sptSourcePath));
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("SPT structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "SPT parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
+            case "COLLISION":
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetCollision);
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("Collision structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "Collision parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
+            case "SIG":
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetSIG);
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("SIG structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "SIG parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
+            case "FXE":
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetFXE);
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("FXE structured preview failed: " + ex);
+                // FXE and FXA use the same FACE archive magic, and a few beta manifests label actor archives as FXE.
+                // Jedipedia identifies them by structure. Try that structure before dropping to a raw hex dump.
+                try {
+                  m_inputStream.Position = 0;
+                  await Task.Run(PreviewAssetFXA);
+                  toolStripStatusLabel2.Text = "FACE actor data (FXA layout; archive entry is typed FXE)";
+                  FinishStructuredTreePreview();
+                }
+                catch (Exception actorEx) {
+                  System.Diagnostics.Debug.WriteLine("FXE-as-FXA structured preview failed: " + actorEx);
+                  toolStripStatusLabel2.Text = "FXE parse failed: " + ex.Message;
+                  m_inputStream.Position = 0;
+                  await Task.Run(PreviewAssetHEX);
+                  txtRawView.Visible = true;
+                }
+              }
+              break;
+
+            case "FXA":
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetFXA);
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("FXA structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "FXA parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
             case "DYC":
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetDYC);
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("DYC structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "DYC parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetRAW);
+                txtRawView.Visible = true;
+              }
+              break;
+
             case "MAG":
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetMAG);
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("MAG structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "MAG parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetRAW);
+                txtRawView.Visible = true;
+              }
+              break;
+
             case "PRT":
               await Task.Run(PreviewAssetRAW);
               txtRawView.Visible = true;
@@ -1200,6 +1463,25 @@ namespace PugTools {
               treeViewGrid1.Visible = true;
               break;
 
+            case "SGT":
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetSGT);
+                FinishStructuredTreePreview();
+                if (m_sgtDecodedWave != null && m_sgtDecodedWave.Length > 44)
+                  StartSgtPlayback(m_sgtDecodedWave);
+                else if (!String.IsNullOrWhiteSpace(m_sgtDecodeError))
+                  toolStripStatusLabel2.Text = "SGT playback unavailable: " + m_sgtDecodeError;
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("SGT structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "SGT parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
             case "WAV":
             case "WEM":
             case "OGG":
@@ -1221,7 +1503,23 @@ namespace PugTools {
               break;
 
             case "SCPT":
-              await Task.Run(PreviewAssetSCPT);
+              m_rootList.Clear();
+              try {
+                await Task.Run(PreviewAssetSCPT);
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("SCPT structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "SCPT parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
+              break;
+
+            case "FX":
+              await Task.Run(PreviewAssetFX);
+              txtRawView.Visible = true;
               break;
 
             case "GFX":
@@ -2128,18 +2426,224 @@ namespace PugTools {
       catch (Exception) { }
     }
 
-    private void PreviewAssetSCPT() {
-      try {
-        using (BinaryReader br = new BinaryReader(m_inputStream)) {
-          using (MemoryStream stream = ViewSCPT.DecryptSCPT(br)) {
-            DynamicFileByteProvider byteProvider = new DynamicFileByteProvider(stream);
+    private void PreviewAssetHeroScriptList() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      using BinaryReader br = new BinaryReader(m_inputStream, Encoding.UTF8, true);
+      ViewHeroScriptLists.HeroScriptListInfo list = ViewHeroScriptLists.Parse(br);
+      m_rootList = ViewHeroScriptLists.BuildTree(list);
+    }
 
-            hexBox1.ByteProvider = byteProvider;
-            hexBox1.Visible = true;
-          }
-        }
+    private void PreviewAssetSCPT() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      using BinaryReader br = new BinaryReader(m_inputStream, Encoding.UTF8, true);
+      ViewSCPT.ScptFileInfo scpt = ViewSCPT.Parse(br);
+      m_rootList = ViewSCPT.BuildTree(scpt);
+    }
+
+    private void PreviewAssetAMX(String sourcePath) {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      using BinaryReader br = new BinaryReader(m_inputStream, Encoding.UTF8, true);
+      ViewAMX.AmxFileInfo amx = ViewAMX.Parse(br);
+      m_rootList = ViewAMX.BuildTree(amx, sourcePath);
+    }
+
+    private void PreviewAssetMPH(String sourcePath) {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      using BinaryReader br = new BinaryReader(m_inputStream, Encoding.UTF8, true);
+      ViewMPH.MphFileInfo mph = ViewMPH.Parse(br);
+      m_rootList = ViewMPH.BuildTree(mph, sourcePath);
+    }
+
+    private void PreviewAssetCLO() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewCLO.CloInfo clo = ViewCLO.Parse(m_inputStream);
+      m_rootList = ViewCLO.BuildTree(clo);
+    }
+
+    private void PreviewAssetSPT(String sourcePath) {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewSPT.SptInfo spt = ViewSPT.Parse(m_inputStream);
+      m_rootList = ViewSPT.BuildTree(spt, sourcePath);
+    }
+
+    private void PreviewAssetCollision() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewCollision.CollisionInfo collision = ViewCollision.ParseStandalone(m_inputStream);
+      m_rootList = ViewCollision.BuildTree(collision);
+    }
+
+    private void PreviewAssetSIG() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewSIG.SigInfo sig = ViewSIG.Parse(m_inputStream);
+      m_rootList = ViewSIG.BuildTree(sig);
+    }
+
+    private void PreviewAssetFXE() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewFXE.FxeInfo fxe = ViewFXE.Parse(m_inputStream);
+      m_rootList = ViewFXE.BuildTree(fxe);
+    }
+
+    private void PreviewAssetFXA() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewFXA.FxaInfo fxa = ViewFXA.Parse(m_inputStream);
+      m_rootList = ViewFXA.BuildTree(fxa);
+    }
+
+    private void PreviewAssetDYC() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewTextSpecs.TextSpecInfo dyc = ViewTextSpecs.ParseDyc(m_inputStream);
+      m_rootList = ViewTextSpecs.BuildTree(dyc);
+    }
+
+    private void PreviewAssetMAG() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewTextSpecs.TextSpecInfo mag = ViewTextSpecs.ParseMag(m_inputStream);
+      m_rootList = ViewTextSpecs.BuildTree(mag);
+    }
+
+    private void PreviewAssetSGT() {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      ViewSGT.SgtInfo sgt = ViewSGT.Parse(m_inputStream);
+      m_rootList = ViewSGT.BuildTree(sgt);
+      m_sgtDecodedWave = null;
+      m_sgtDecodeError = null;
+      try { m_sgtDecodedWave = ViewSGT.DecodeToPcmWave(m_inputStream, sgt); }
+      catch (Exception ex) { m_sgtDecodeError = ex.Message; }
+    }
+
+    private void StartSgtPlayback(Byte[] pcmWave) {
+      if (pcmWave == null || pcmWave.Length <= 44 || m_closing) return;
+
+      // Do not reuse m_waveOut: an older WEM conversion/playback task can still be winding down
+      // for a few milliseconds after an asset change. A dedicated output keeps SGT from re-arming
+      // that task's m_audioPlaying flag or disposing the device under its loop.
+      m_audioPlaying = false;
+      try { m_waveOut?.Stop(); } catch { }
+      try { m_sgtWaveOut?.Stop(); m_sgtWaveOut?.Dispose(); } catch { }
+      try { m_sgtWaveReader?.Dispose(); } catch { }
+      try { m_sgtPcmStream?.Dispose(); } catch { }
+      m_sgtWaveOut = null;
+      m_sgtWaveReader = null;
+      m_sgtPcmStream = null;
+
+      m_sgtPcmStream = new MemoryStream(pcmWave, false);
+      m_sgtWaveReader = new WaveFileReader(m_sgtPcmStream);
+      m_sgtWaveOut = new WaveOutEvent { Volume = 1.0F };
+      m_sgtWaveOut.Init(m_sgtWaveReader);
+      m_sgtActive = true;
+
+      toolStrip1Button1.Enabled = true;
+      toolStrip1Button2.Enabled = true;
+      toolStrip1Button3.Enabled = true;
+      toolStrip1Button1.Text = ";";
+      toolStrip1Button1.ToolTipText = "Pause";
+      toolStrip1Button3.Checked = false;
+      toolStrip1Button3.ToolTipText = "Mute";
+      toolStrip1ProgressBar1.Enabled = true;
+      if (m_sgtSaveButton != null) m_sgtSaveButton.Visible = true;
+      toolStrip1.Visible = true;
+
+      UpdateSgtToolbar();
+      m_sgtWaveOut.Play();
+      m_sgtUiTimer?.Start();
+    }
+
+    private void StopSgtPreview(Boolean disposeSource) {
+      if (!m_sgtActive && m_sgtWaveReader == null && m_sgtPcmStream == null) {
+        if (disposeSource) { m_sgtDecodedWave = null; m_sgtDecodeError = null; }
+        return;
       }
-      catch (Exception) { }
+
+      try { m_sgtWaveOut?.Stop(); } catch { }
+      if (disposeSource) {
+        try { m_sgtUiTimer?.Stop(); } catch { }
+        try { m_sgtWaveOut?.Dispose(); } catch { }
+        m_sgtWaveOut = null;
+        try { m_sgtWaveReader?.Dispose(); } catch { }
+        try { m_sgtPcmStream?.Dispose(); } catch { }
+        m_sgtWaveReader = null;
+        m_sgtPcmStream = null;
+        m_sgtDecodedWave = null;
+        m_sgtDecodeError = null;
+        m_sgtActive = false;
+        if (m_sgtSaveButton != null) m_sgtSaveButton.Visible = false;
+      }
+    }
+
+    private void SgtSaveButtonClick(Object sender, EventArgs e) {
+      if (m_sgtDecodedWave == null || m_sgtDecodedWave.Length <= 44) return;
+      String suggested = "audio.wav";
+      if (treeViewFast1?.SelectedNode?.Tag is TreeListItem item && !String.IsNullOrWhiteSpace(item.HashInfo.FileName))
+        suggested = Path.GetFileNameWithoutExtension(item.HashInfo.FileName) + ".wav";
+      using SaveFileDialog dialog = new SaveFileDialog {
+        Filter = "Wave audio (*.wav)|*.wav|All files (*.*)|*.*",
+        FileName = suggested,
+        AddExtension = true,
+        DefaultExt = "wav",
+        OverwritePrompt = true
+      };
+      if (dialog.ShowDialog(this) != DialogResult.OK) return;
+      try {
+        System.IO.File.WriteAllBytes(dialog.FileName, m_sgtDecodedWave);
+        StatusLabel1Text("Saved decoded SGT audio: " + dialog.FileName);
+      }
+      catch (Exception ex) {
+        MessageBox.Show(this, ex.Message, "Unable to save WAV", MessageBoxButtons.OK, MessageBoxIcon.Error);
+      }
+    }
+
+    private void SgtUiTimerTick(Object sender, EventArgs e) {
+      if (!m_sgtActive || m_sgtWaveReader == null || m_sgtWaveOut == null) {
+        m_sgtUiTimer?.Stop();
+        return;
+      }
+      UpdateSgtToolbar();
+    }
+
+    private void UpdateSgtToolbar() {
+      if (!m_sgtActive || m_sgtWaveReader == null) return;
+      TimeSpan current = m_sgtWaveReader.CurrentTime;
+      TimeSpan total = m_sgtWaveReader.TotalTime;
+      toolStrip1Label1.Text = String.Format(
+        CultureInfo.InvariantCulture,
+        "{0:D2}:{1:D2}/{2:D2}:{3:D2}",
+        current.Minutes, current.Seconds, total.Minutes, total.Seconds
+      );
+      Int32 maximum = (Int32)Math.Max(1, Math.Min(Int32.MaxValue, total.TotalMilliseconds));
+      Int32 value = (Int32)Math.Max(0, Math.Min(maximum, current.TotalMilliseconds));
+      toolStrip1ProgressBar1.Maximum = maximum;
+      toolStrip1ProgressBar1.Value = value;
+      if (m_sgtWaveOut != null && m_sgtWaveOut.PlaybackState == PlaybackState.Playing) {
+        toolStrip1Button1.Text = ";";
+        toolStrip1Button1.ToolTipText = "Pause";
+      } else {
+        toolStrip1Button1.Text = "4";
+        toolStrip1Button1.ToolTipText = "Play";
+      }
+    }
+
+    private void FinishStructuredTreePreview() {
+      NodeListItem.ResetTreeListViewColumns(treeViewGrid1);
+      treeViewGrid1.Roots = m_rootList;
+      foreach (NodeListItem root in m_rootList.Cast<NodeListItem>()) treeViewGrid1.Expand(root);
+      treeViewGrid1.AutoResizeColumns(ColumnHeaderAutoResizeStyle.ColumnContent);
+      loadingSwirl1.Visible = false;
+      toolStripProgressBar1.Visible = false;
+      treeViewGrid1.Visible = true;
     }
 
     private void PreviewAssetSTB() {
@@ -2206,6 +2710,9 @@ namespace PugTools {
             });
 
             Invoke(new Action(() => {
+              // A newly selected SGT owns these same controls with a separate WaveOutEvent.
+              // Do not let the tail of an older WEM task disable its toolbar.
+              if (m_sgtActive) return;
               toolStrip1Button1.Enabled = false;
               toolStrip1Button2.Enabled = false;
               toolStrip1Button3.Enabled = false;
@@ -2234,31 +2741,55 @@ namespace PugTools {
       }
     }
 
+    private void PreviewAssetFX() {
+      if (InvokeRequired) { Invoke(PreviewAssetFX); return; }
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      Byte[] data;
+      using (MemoryStream copy = new MemoryStream()) { m_inputStream.CopyTo(copy); data = copy.ToArray(); }
+      Encoding encoding = data.Length >= 4 && data[3] == 0 ? Encoding.Unicode : Encoding.UTF8;
+      Int32 offset = 0;
+      if (data.Length >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) { encoding = Encoding.UTF8; offset = 3; }
+      else if (data.Length >= 2 && data[0] == 0xFF && data[1] == 0xFE) { encoding = Encoding.Unicode; offset = 2; }
+      else if (data.Length >= 2 && data[0] == 0xFE && data[1] == 0xFF) { encoding = Encoding.BigEndianUnicode; offset = 2; }
+      String text = encoding.GetString(data, offset, data.Length - offset).Replace("\0", String.Empty);
+      txtRawView.ReadOnly = false;
+      txtRawView.Text = text;
+      txtRawView.ReadOnly = true;
+      toolStripStatusLabel2.Text = "Legacy FX source (" + encoding.WebName + ")";
+    }
+
     private void PreviewAssetXML() {
       if (InvokeRequired) Invoke(PreviewAssetXML);
       else {
-        using StreamReader reader = new StreamReader(m_inputStream);
-
-        String output = reader.ReadToEnd();
-        output = output.Replace("&lt;", "<").Replace("&gt;", ">").Replace("&amp;lt;", "<")
-          .Replace("&amp;gt;", ">").Replace("&amp;apos;", "'").Replace("\0", "");
-
-        m_xmlDoc = new XmlDocument();
-
-        try {
-          m_xmlDoc.LoadXml(output);
-        }
-        catch (Exception) { // ex) {
-                            // Debug.WriteLine(ex.Message);
-        }
+        m_inputStream.Position = 0;
+        using StreamReader reader = new StreamReader(m_inputStream, Encoding.UTF8, true, 4096, true);
+        String output = reader.ReadToEnd().Replace("\0", "");
 
         txtRawView.ReadOnly = false;
         txtRawView.Text = output;
-
-        webBrowser1.DocumentText =
-          new CodeColorizer().Colorize(PreviewAssetXMLBeautify(m_xmlDoc), Languages.Xml);
-
         txtRawView.ReadOnly = true;
+
+        m_xmlDoc = null;
+        String candidate = output.TrimStart('\uFEFF', ' ', '\t', '\r', '\n');
+        if (candidate.StartsWith("<", StringComparison.Ordinal)) {
+          try {
+            XmlDocument doc = new XmlDocument();
+            doc.LoadXml(candidate);
+            if (doc.DocumentElement != null) {
+              m_xmlDoc = doc;
+              webBrowser1.DocumentText =
+                new CodeColorizer().Colorize(PreviewAssetXMLBeautify(doc), Languages.Xml);
+            }
+          }
+          catch (XmlException) {
+            // A large part of the beta-only extension set is plain text rather
+            // than XML. Keep the exact text visible instead of showing an empty
+            // browser page when an old file only looks XML-like.
+          }
+        }
+
+        if (m_xmlDoc == null) webBrowser1.DocumentText = String.Empty;
       }
     }
 
@@ -2753,6 +3284,17 @@ namespace PugTools {
         return;
       }
 
+      if (m_sgtActive && m_sgtWaveReader != null && m_sgtWaveOut != null) {
+        if (m_sgtWaveOut.PlaybackState == PlaybackState.Playing) {
+          m_sgtWaveOut.Pause();
+        } else {
+          if (m_sgtWaveReader.Position >= m_sgtWaveReader.Length) m_sgtWaveReader.Position = 0;
+          m_sgtWaveOut.Play();
+        }
+        UpdateSgtToolbar();
+        return;
+      }
+
       if (m_waveOut == null) return;
 
       if (m_waveOut.PlaybackState == PlaybackState.Paused) {
@@ -2777,6 +3319,13 @@ namespace PugTools {
         return;
       }
 
+      if (m_sgtActive && m_sgtWaveReader != null && m_sgtWaveOut != null) {
+        m_sgtWaveOut.Stop();
+        m_sgtWaveReader.Position = 0;
+        UpdateSgtToolbar();
+        return;
+      }
+
       if (m_waveOut == null) return;
 
       m_waveOut.Stop();
@@ -2796,6 +3345,19 @@ namespace PugTools {
         m_panelRender.SetAnimationLoop(toolStrip1Button3.Checked);
         toolStrip1Button3.ToolTipText =
           toolStrip1Button3.Checked ? "Loop animation: On" : "Loop animation: Off";
+        return;
+      }
+
+      if (m_sgtActive && m_sgtWaveOut != null) {
+        if (m_sgtWaveOut.Volume == 0) {
+          toolStrip1Button3.Checked = false;
+          toolStrip1Button3.ToolTipText = "Mute";
+          m_sgtWaveOut.Volume = 1.0F;
+        } else {
+          toolStrip1Button3.Checked = true;
+          toolStrip1Button3.ToolTipText = "Unmute";
+          m_sgtWaveOut.Volume = 0.0F;
+        }
         return;
       }
 

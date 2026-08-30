@@ -59,6 +59,12 @@ namespace FileFormats {
     public Vector2 uvScale = new Vector2(1f, 1f);
     public Single envBlendMaterialTileMult = 1f;
     public Single diffuseTextureAlphaMax = 1f;
+    // SWTOR OpacityFade: distance-driven opacity used for dark/light transition panels in doorways/windows.
+    // Defaults match the game/Jedipedia shader when a MAT omits one of the inputs.
+    public Single opacityFadeMinDistance = 0f;
+    public Single opacityFadeMinOpacity = 0f;
+    public Single opacityFadeMaxDistance = 100f;
+    public Single opacityFadeMaxOpacity = 1f;
     // Material tint used by SWTOR VFX/stronghold hook shaders (diffuseFlatColorProp).
     public Vector4 diffuseFlatColor = new Vector4(1f, 1f, 1f, 1f);
     public Boolean hasDiffuseFlatColor;
@@ -404,6 +410,14 @@ namespace FileFormats {
             envBlendMaterialTileMult = ParseSingle(inputValue, 1f);
           } else if (semantic.Equals("DiffuseTextureAlphaMax", StringComparison.OrdinalIgnoreCase)) {
             diffuseTextureAlphaMax = ParseSingle(inputValue, 1f);
+          } else if (semantic.Equals("OpacityFadeMinDistance", StringComparison.OrdinalIgnoreCase)) {
+            opacityFadeMinDistance = ParseSingle(inputValue, opacityFadeMinDistance);
+          } else if (semantic.Equals("OpacityFadeMinOpacity", StringComparison.OrdinalIgnoreCase)) {
+            opacityFadeMinOpacity = ParseSingle(inputValue, opacityFadeMinOpacity);
+          } else if (semantic.Equals("OpacityFadeMaxDistance", StringComparison.OrdinalIgnoreCase)) {
+            opacityFadeMaxDistance = ParseSingle(inputValue, opacityFadeMaxDistance);
+          } else if (semantic.Equals("OpacityFadeMaxOpacity", StringComparison.OrdinalIgnoreCase)) {
+            opacityFadeMaxOpacity = ParseSingle(inputValue, opacityFadeMaxOpacity);
           } else if (semantic.Equals("diffuseFlatColorProp", StringComparison.OrdinalIgnoreCase)) {
             diffuseFlatColor = ParseVector4(inputValue, new Vector4(1f,1f,1f,1f));
             hasDiffuseFlatColor = true;
@@ -476,6 +490,16 @@ namespace FileFormats {
             }
           }
           */
+        }
+
+        // OpacityFade is not an opaque black helper wall. The game replaces texture alpha with a distance ramp.
+        // A non-zero cutoff with None/Test is the authored hard-cutout form; otherwise Jedipedia promotes the
+        // material to Full so the ramp becomes real translucency (notably hut_env_interior_trans_dark on Hutta).
+        if (derived.Equals("OpacityFade", StringComparison.OrdinalIgnoreCase)) {
+          Boolean cutout = this.alphaTestValue > 0f &&
+            (this.alphaMode.Equals("None", StringComparison.OrdinalIgnoreCase) || this.alphaMode.Equals("Test", StringComparison.OrdinalIgnoreCase));
+          if (!cutout) this.alphaMode = "Full";
+          alphaClip = cutout || !this.alphaMode.Equals("None", StringComparison.OrdinalIgnoreCase);
         }
 
         if (palette1.X == 0 && palette1.Y == 0.5 && palette1.Z == 0 && palette1.W == 1

@@ -110,13 +110,16 @@
     public bool ShowVolumeList { get; set; } = false;
     // The object label is the default selection feedback. The old wireframe bounds box can become enormous for
     // shell/portal assets, so keep it opt-in.
-    public bool ShowSelectionBounds { get; set; } = false;
+    public bool ShowSelectionBounds { get; set; } = true;
 
     // Taxi rides show their resolved vehicle by default, but users can hide it from the Taxi routes submenu.
     public bool ShowTaxiVehicle { get; set; } = true;
     // Taxi droids/terminal NPCs are an interaction surface, not ordinary population. Keep them visible even when
     // the general NPC layer is disabled; the Taxi routes submenu exposes this independently and defaults it on.
     public bool ShowTaxiTerminals { get; set; } = true;
+    // Encounter ships spawned by the Space Combat rail preview. These are transient client entities, not ordinary
+    // area placements, and therefore have their own visibility switch just like the taxi ride vehicle.
+    public bool ShowSpaceCombatShips { get; set; } = true;
 
     // Spawned/client-only NPC preview. Models are kept separate from ordinary area geometry so they
     // can be switched off without changing the authored world. Names/items are independent overlays.
@@ -127,6 +130,8 @@
     public bool ShowSpnObjects { get; set; } = true;
     public bool AnimateSpnObjects { get; set; } = true;
     public bool ShowPlaceableGlow { get; set; } = true;
+    // Screen-space service/quest markers over classified NPC/SPN interactions. This is independent of nameplates.
+    public bool ShowInteractionIcons { get; set; } = true;
 
     // Ground-following first-person movement. This deliberately reuses the floor indices that room
     // culling already builds, so stairs/interiors work without a second collision representation.

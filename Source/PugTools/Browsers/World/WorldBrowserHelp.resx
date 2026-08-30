@@ -145,7 +145,8 @@ Map and interface
 M - Open / close full map
 Shift + M - Toggle minimap
 Ctrl + F - Find mapnote
-Ctrl + Click - Select world object
+Left-click or short right-click - Interact with a service / conversation
+Ctrl + Left-click - Select world object and show information
 Ctrl + Right-click - Clear selection
 Ctrl + Shift + F - Toggle FPS / occlusion statistics
 Alt + Z or Alt + Y - Hide / show viewer interface

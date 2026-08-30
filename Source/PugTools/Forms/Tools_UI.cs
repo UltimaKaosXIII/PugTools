@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -88,6 +88,10 @@ namespace PugTools {
       GomLib.StringTable.SelectedLocale = locale;
       GomLib.StringTable.SelectedLocalization = localization;
       GomLib.Models.Tooltip.Language = localization;
+      if (!String.Equals(Config.Language, locale, StringComparison.OrdinalIgnoreCase)) {
+        Config.Language = locale;
+        Config.Save();
+      }
     }
 
     private void BtnExtract_Click(Object sender, EventArgs e) {
