@@ -147,6 +147,9 @@ namespace PugTools {
       public System.Numerics.Vector3[] BindTranslationMorpheme;
       public System.Numerics.Quaternion[] WorldRotationMorpheme;
       public System.Numerics.Vector3[] WorldTranslationMorpheme;
+      public float[] FaceValues;
+      public bool[] FaceDriven;
+      public ViewFXA.FxaInfo FaceActor;
       public readonly Dictionary<string, Matrix> SkinMatrices = new Dictionary<string, Matrix>(StringComparer.OrdinalIgnoreCase);
       public readonly Dictionary<GR2_Mesh, Matrix[]> Palettes = new Dictionary<GR2_Mesh, Matrix[]>();
       public readonly Dictionary<GR2_Mesh, Buffer> GpuBuffers = new Dictionary<GR2_Mesh, Buffer>();
@@ -169,6 +172,10 @@ namespace PugTools {
     private readonly Dictionary<GR2, Dictionary<WorldNpcAnimationClip, NpcSkinState>> npcSkinStates = new Dictionary<GR2, Dictionary<WorldNpcAnimationClip, NpcSkinState>>();
     private Dictionary<string, GR2> utilityMarkerModels = new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
     private List<WorldNpcPlacement> npcPlacements = new List<WorldNpcPlacement>();
+    // The game has no authored AREA instance for the local conversation player. Keep the stand-in separate from the
+    // static population snapshot so playback can attach/detach it without racing a full spatial-index rebuild.
+    private volatile WorldNpcPlacement worldConversationVirtualPlayer;
+    private readonly List<WorldNpcPlacement> worldConversationVirtualResources = new List<WorldNpcPlacement>();
     // Population-heavy worlds can contain thousands of NPC templates. Walking the whole list several times per
     // frame (draw, depth-visibility, nameplates) was still CPU-bound even after render-distance culling. Keep a tiny
     // fixed spatial index of the authored/stable NPC spawn poses so those passes only enumerate nearby cells.
@@ -307,6 +314,8 @@ namespace PugTools {
       // browser side can otherwise invalidate an in-flight foreach (most visibly in WorldModelResidencyRoots).
       // Placements/models themselves are fully built before LoadModel(), so a shallow container snapshot is enough
       // and avoids duplicating the comparatively heavy GR2 object graphs.
+      ReleaseWorldConversationVirtualResources();
+      ClearNpcClothRuntime();
       utilityMarkerModels = utilityModels == null
         ? new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase)
         : new Dictionary<string, GR2>(utilityModels, StringComparer.OrdinalIgnoreCase);
@@ -339,6 +348,31 @@ namespace PugTools {
       currentPhaseName = implicitPhaseName ?? String.Empty;
     }
 
+    internal void SetWorldConversationVirtualPlayer(WorldNpcPlacement placement) {
+      worldConversationVirtualPlayer = placement;
+      if (placement != null && !worldConversationVirtualResources.Contains(placement)) worldConversationVirtualResources.Add(placement);
+      // Its GR2s are prepared lazily by DrawModel/TryDrawAnimatedNpcModel just like streamed population models.
+      // No population snapshot or dPVS index mutation is necessary.
+    }
+
+    private void ReleaseWorldConversationVirtualResources() {
+      var released = new HashSet<GR2>();
+      foreach (WorldNpcPlacement placement in worldConversationVirtualResources) {
+        if (placement?.Models == null) continue;
+        foreach (GR2 model in placement.Models) {
+          if (model == null || !released.Add(model)) continue;
+          if (npcSkinStates.TryGetValue(model, out Dictionary<WorldNpcAnimationClip, NpcSkinState> states)) {
+            foreach (NpcSkinState state in states.Values) state?.Dispose();
+            npcSkinStates.Remove(model);
+          }
+          ReleaseModelBuffers(model);
+        }
+      }
+      foreach (WorldNpcPlacement placement in worldConversationVirtualResources) if (placement != null) npcClothStates.Remove(placement);
+      worldConversationVirtualResources.Clear();
+      worldConversationVirtualPlayer = null;
+    }
+
     private static int NpcSpatialCell(float coordinate) => (int)Math.Floor(coordinate / NpcSpatialCellSize);
 
     private void BuildNpcSpatialIndex() {
@@ -360,8 +394,14 @@ namespace PugTools {
     }
 
     private IEnumerable<WorldNpcPlacement> NearbyNpcPlacements(float range) {
-      if (npcPlacements == null || npcPlacements.Count == 0) yield break;
-      if (camera == null || npcSpatialGrid.Count == 0) { foreach (WorldNpcPlacement placement in npcPlacements) yield return placement; yield break; }
+      WorldNpcPlacement virtualPlayer = worldConversationVirtualPlayer;
+      bool havePopulation = npcPlacements != null && npcPlacements.Count > 0;
+      if (!havePopulation && virtualPlayer == null) yield break;
+      if (camera == null || npcSpatialGrid.Count == 0) {
+        if (havePopulation) foreach (WorldNpcPlacement placement in npcPlacements) yield return placement;
+        if (virtualPlayer != null) yield return virtualPlayer;
+        yield break;
+      }
       // One-cell padding covers character bounds and authored spawn offsets. The exact distance/frustum tests below
       // remain authoritative, so this broad phase can only add work, never hide a visible NPC.
       float query = Math.Max(0f, range) + NpcSpatialCellSize;
@@ -371,6 +411,7 @@ namespace PugTools {
         if (npcSpatialGrid.TryGetValue((x, z), out List<WorldNpcPlacement> bucket))
           foreach (WorldNpcPlacement placement in bucket) yield return placement;
       foreach (WorldNpcPlacement placement in npcSpatialFallback) yield return placement;
+      if (virtualPlayer != null) yield return virtualPlayer;
     }
 
     private static int SpnSpatialCell(float coordinate) => (int)Math.Floor(coordinate / SpnSpatialCellSize);
@@ -797,7 +838,8 @@ namespace PugTools {
     }
 
     private static bool NpcLayerVisible(WorldNpcPlacement placement, WorldRenderSettings s) {
-      return placement?.ConversationHidden != true && s != null && (s.ShowNpcs || (s.ShowTaxiTerminals && IsTaxiNpc(placement)));
+      return placement?.ConversationHidden != true && s != null &&
+        (placement?.ConversationVirtual == true || s.ShowNpcs || (s.ShowTaxiTerminals && IsTaxiNpc(placement)));
     }
 
     private bool NpcVisibleForWork(Vector3 position) {
@@ -809,18 +851,21 @@ namespace PugTools {
     }
 
     private void DrawJedipediaNpcs(Matrix vp, HashSet<string> visible, WorldRenderSettings s, AreaEnvironmentScheme cameraEnv, bool sceneShadows) {
-      if ((!s.ShowNpcs && !s.ShowTaxiTerminals) || npcPlacements == null || npcPlacements.Count == 0) return;
+      WorldNpcPlacement virtualPlayer = worldConversationVirtualPlayer;
+      if ((!s.ShowNpcs && !s.ShowTaxiTerminals && virtualPlayer == null) ||
+          ((npcPlacements == null || npcPlacements.Count == 0) && virtualPlayer == null)) return;
       EnsureNpcGeometryPrepared();
       Room activeRoom = null;
       foreach (WorldNpcPlacement placement in NearbyNpcPlacements(NpcMaxRenderDistance)) {
         if (!NpcLayerVisible(placement, s)) continue;
-        if (placement?.Instance == null || placement.Room == null || placement.Models == null) continue;
+        bool virtualActor = placement?.ConversationVirtual == true;
+        if (placement == null || (!virtualActor && placement.Instance == null) || placement.Room == null || placement.Models == null) continue;
         if (!SpnVariantActive(placement.VariantIndex, placement.VariantCount, placement.SpawnPoints)) continue;
         bool hasSpawnMotion = placement.SpawnPoints != null && placement.SpawnPoints.Count > 0;
-        // An authored spn_pt spawn position can lie outside the dPVS/static room of the editor handle. Let the
-        // population distance/frustum gate decide visibility for those placements instead.
-        if (!hasSpawnMotion && !InstanceRoomVisible(placement.Instance, placement.Room, visible)) continue;
-        if (!InstanceVisibleInWorld(placement.Instance, s)) continue;
+        // A conversation player is not an AREA instance at all. Its stage mark is already in world space, so the
+        // static room/phase gates would incorrectly discard it. Authored NPCs retain the normal dPVS checks.
+        if (!virtualActor && !hasSpawnMotion && !InstanceRoomVisible(placement.Instance, placement.Room, visible)) continue;
+        if (!virtualActor && !InstanceVisibleInWorld(placement.Instance, s)) continue;
 
         Matrix baseWorld = NpcPlacementBaseWorld(placement);
         Vector3 rootPosition = new Vector3(baseWorld.M41, baseWorld.M42, baseWorld.M43);
@@ -864,15 +909,19 @@ namespace PugTools {
           // The animated rig will refresh this from attach_nameplate this frame. Clearing it avoids retaining the
           // previous pose when an animation/model fails and is exactly the kind of stale anchor that makes labels swim.
           placement.NameplateLocal = null;
+          placement.OverheadIconLocalFrame = null;
         } else {
           placement.NameplateLocal = NpcBindNameplateLocal(placement);
+          placement.OverheadIconLocalFrame = NpcBindOverheadIconFrame(placement);
         }
 
         foreach (GR2 model in placement.Models) {
           if (!animate || !TryDrawAnimatedNpcModel(model, npcWorld, vp, s, activeClip, animationTime, placement))
             DrawModel(model, npcWorld, vp, s, false, null);
         }
+        DrawNpcWeapons(placement, npcWorld, vp, s, activeClip, animationTime, animate);
         if (!placement.NameplateLocal.HasValue) placement.NameplateLocal = NpcBindNameplateLocal(placement);
+        if (!placement.OverheadIconLocalFrame.HasValue) placement.OverheadIconLocalFrame = NpcBindOverheadIconFrame(placement);
       }
     }
 
@@ -962,6 +1011,7 @@ namespace PugTools {
     }
 
     private Matrix NpcPlacementAuthoredWorld(WorldNpcPlacement placement) {
+      if (placement?.ConversationVirtual == true && placement.Instance == null) return ApplyNpcScale(Matrix.Identity, placement.Scale);
       Matrix baseWorld = InstanceWorld(placement.Instance, placement.Room);
       if (placement?.SpawnPoints != null && placement.SpawnPoints.Count > 0) {
         // pth.* belongs to placeables in Jedipedia/SWTOR's spawner path. NPCs can have spn_pt dispenser positions,
@@ -1031,6 +1081,40 @@ namespace PugTools {
       return -1;
     }
 
+    private static int NpcOverheadIconBoneIndex(IList<GR2_Bone_Skeleton> skeleton) {
+      if (skeleton == null) return -1;
+      // Do not share the text-nameplate priority here. Jedipedia/SWTOR attach overhead .fxspec effects to the
+      // literal NamePlate bone because its ORIENTATION is part of the authored effect transform.
+      for (int i = 0; i < skeleton.Count; i++)
+        if (String.Equals(skeleton[i]?.boneName, "NamePlate", StringComparison.OrdinalIgnoreCase)) return i;
+      return -1;
+    }
+
+    private static Matrix? NpcOverheadIconFrameFromSkin(NpcSkinState state) {
+      int index = NpcOverheadIconBoneIndex(state?.Skeleton);
+      if (index < 0 || state.CurrentValid == null || index >= state.CurrentValid.Length || !state.CurrentValid[index]) return null;
+      Matrix bone = state.CurrentWorld[index];
+      return NpcFinite(bone) ? bone : (Matrix?)null;
+    }
+
+    private static Matrix? NpcOverheadIconFrameFromBind(IList<GR2_Bone_Skeleton> skeleton) {
+      int index = NpcOverheadIconBoneIndex(skeleton);
+      if (index < 0) return null;
+      Matrix bone = skeleton[index].root;
+      return NpcFinite(bone) ? bone : (Matrix?)null;
+    }
+
+    private static Matrix? NpcBindOverheadIconFrame(WorldNpcPlacement placement) {
+      IList<GR2_Bone_Skeleton> skeleton = placement?.Animation?.Skeleton;
+      Matrix? result = NpcOverheadIconFrameFromBind(skeleton);
+      if (result.HasValue || placement?.Models == null) return result;
+      foreach (GR2 model in placement.Models) {
+        result = NpcOverheadIconFrameFromBind(model?.skeleton_bones);
+        if (result.HasValue) return result;
+      }
+      return null;
+    }
+
     private static Vector3? NpcNameplateLocalFromSkin(NpcSkinState state) {
       int index = NpcNameplateBoneIndex(state?.Skeleton);
       if (index < 0 || state.CurrentValid == null || index >= state.CurrentValid.Length || !state.CurrentValid[index]) return null;
@@ -1071,13 +1155,74 @@ namespace PugTools {
       EnsureModelGeometryPrepared(model);
       NpcSkinState state = GetNpcSkinState(model, clip);
       if (state == null || state.BoundBoneCount <= 0) return false;
-      if (!UpdateNpcSkinState(state, animationTime)) return false;
+      if (!UpdateNpcSkinState(state, animationTime, nameplatePlacement)) return false;
+      // JBA/Morpheme + FaceFX produce the driving rig first. CLO then replaces only the particle-bone entries in
+      // this placement's palette, matching Jedipedia's viewerCloCaptureAnchors -> clothWriteBones order.
+      if (nameplatePlacement != null) ApplyNpcCloth(state, nameplatePlacement, model, world, s);
       if (nameplatePlacement != null && !nameplatePlacement.NameplateLocal.HasValue) {
         Vector3? local = NpcNameplateLocalFromSkin(state);
         if (local.HasValue) nameplatePlacement.NameplateLocal = local.Value;
       }
+      if (nameplatePlacement != null && !nameplatePlacement.OverheadIconLocalFrame.HasValue) {
+        Matrix? frame = NpcOverheadIconFrameFromSkin(state);
+        if (frame.HasValue) nameplatePlacement.OverheadIconLocalFrame = frame.Value;
+      }
       DrawNpcModelWithSkinBuffers(model, state, world, vp, s, blueGlow);
       return true;
+    }
+
+    private void DrawNpcWeapons(WorldNpcPlacement placement, Matrix npcWorld, Matrix vp, WorldRenderSettings s,
+        WorldNpcAnimationClip clip, float animationTime, bool animate) {
+      if (placement?.Weapons == null || placement.Weapons.Count == 0 || placement.CombatMode <= 1) return;
+      Matrix right = Matrix.Identity, left = Matrix.Identity;
+      bool haveRight = TryNpcWeaponBoneFrame(placement, clip, animationTime, animate, "rightweapon", out right);
+      bool haveLeft = TryNpcWeaponBoneFrame(placement, clip, animationTime, animate, "leftweapon", out left);
+      foreach (WorldNpcWeaponAttachment weapon in placement.Weapons) {
+        if (weapon?.Model == null || weapon.WeaponMode != placement.CombatMode) continue;
+        bool isLeft = String.Equals(weapon.BoneName, "leftweapon", StringComparison.OrdinalIgnoreCase);
+        Matrix bone = isLeft ? left : right;
+        if (isLeft ? !haveLeft : !haveRight) continue;
+        Matrix weaponWorld = bone * npcWorld;
+        DrawModel(weapon.Model, weaponWorld, vp, s, false, null);
+      }
+    }
+
+    private bool TryNpcWeaponBoneFrame(WorldNpcPlacement placement, WorldNpcAnimationClip clip, float animationTime,
+        bool animate, string boneName, out Matrix frame) {
+      frame = Matrix.Identity;
+      string wanted = NpcCanonicalAnimationBoneName(boneName);
+      if (String.IsNullOrWhiteSpace(wanted)) return false;
+
+      // An animated weapon follows the exact final body pose (including Morpheme and FaceFX hierarchy composition).
+      // The skinning matrix itself is not a bone frame; CurrentWorld is the model-space bone transform that Jedipedia
+      // reconstructs as skinMatrix * inverse(inverseBind) before attaching RightWeapon/LeftWeapon.
+      if (animate && clip?.Animation != null && placement?.Models != null) {
+        foreach (GR2 bodyModel in placement.Models) {
+          NpcSkinState state = GetNpcSkinState(bodyModel, clip);
+          if (state?.Skeleton == null || state.BoundBoneCount <= 0) continue;
+          if (!UpdateNpcSkinState(state, animationTime, placement)) continue;
+          for (int i = 0; i < state.Skeleton.Count && i < state.CurrentWorld.Length; i++) {
+            if (!state.CurrentValid[i] || !String.Equals(NpcCanonicalAnimationBoneName(state.Skeleton[i].boneName), wanted, StringComparison.OrdinalIgnoreCase)) continue;
+            frame = state.CurrentWorld[i];
+            return NpcFinite(frame);
+          }
+        }
+      }
+
+      // Static/distant NPCs still need the complete bind-world transform of the weapon bone instead of placing the
+      // weapon at the character origin. Prefer the animation skeleton because it is the wearer character spec's rig.
+      IList<GR2_Bone_Skeleton> skeleton = clip?.Skeleton;
+      if (skeleton == null || skeleton.Count == 0) {
+        GR2 body = placement?.Models?.FirstOrDefault(m => m?.skeleton_bones != null && m.skeleton_bones.Count > 0);
+        skeleton = body?.skeleton_bones;
+      }
+      if (skeleton == null) return false;
+      foreach (GR2_Bone_Skeleton bone in skeleton) {
+        if (bone == null || !String.Equals(NpcCanonicalAnimationBoneName(bone.boneName), wanted, StringComparison.OrdinalIgnoreCase)) continue;
+        frame = bone.root;
+        return NpcFinite(frame);
+      }
+      return false;
     }
 
     private bool SpnVariantActive(int variantIndex, int variantCount, IList<WorldSpawnPointPose> points) {
@@ -1440,12 +1585,14 @@ namespace PugTools {
       }
     }
 
-    private bool UpdateNpcSkinState(NpcSkinState state, float animationTime) {
+    private bool UpdateNpcSkinState(NpcSkinState state, float animationTime, WorldNpcPlacement placement) {
       if (state?.Clip?.Animation == null || state.PoseSamples == null || state.BoundBoneCount <= 0) return false;
       state.LastUseFrame = worldRenderFrame;
       try {
         state.Clip.Animation.SampleInto(animationTime, state.PoseSamples);
-        NpcBuildJbaWorldPose(state, state.PoseSamples);
+        WorldNpcFaceFxClip face = placement?.ConversationFaceFx;
+        float[] faceValues = face == null ? null : NpcEvaluateFaceFx(state, face, Math.Max(0f, elapsed - placement.ConversationFaceFxStart));
+        NpcBuildJbaWorldPose(state, state.PoseSamples, face, faceValues);
         state.SkinMatrices.Clear();
         IList<GR2_Bone_Skeleton> skeleton = state.Skeleton;
         for (int i = 0; i < skeleton.Count; i++) {
@@ -1707,7 +1854,7 @@ namespace PugTools {
       return hero;
     }
 
-    private static void NpcBuildJbaWorldPose(NpcSkinState state, IReadOnlyList<JBATransform> poseFrame) {
+    private static void NpcBuildJbaWorldPose(NpcSkinState state, IReadOnlyList<JBATransform> poseFrame, WorldNpcFaceFxClip face = null, float[] faceValues = null) {
       IList<GR2_Bone_Skeleton> skeleton = state?.Skeleton;
       if (state == null || poseFrame == null || skeleton == null) return;
       int count = Math.Min(skeleton.Count, state.CurrentWorld.Length);
@@ -1724,6 +1871,14 @@ namespace PugTools {
         } else {
           rotation = state.BindRotationMorpheme[i];
           translation = state.BindTranslationMorpheme[i];
+        }
+        // FaceFX runs after the body clip has produced its finished local pose and before hierarchy composition.
+        // Like the SWTOR client/Jedipedia, only channels actually driven by the current Morpheme LOD receive face
+        // deltas; undriven facial bones remain inherited from the nearest driven ancestor.
+        if (driven && face != null && faceValues != null &&
+            NpcTryFaceFxDelta(face, faceValues, bone.boneName, out System.Numerics.Quaternion faceRotation, out System.Numerics.Vector3 faceTranslation)) {
+          rotation = NpcJbaQuatMultiply(faceRotation, rotation);
+          translation += faceTranslation;
         }
         if (!NpcJbaFinite(rotation) || !NpcJbaFinite(translation)) {
           state.CurrentValid[i] = false;
@@ -2820,11 +2975,16 @@ namespace PugTools {
       utilityRenderEntries.Clear();
       phaseRegionTriggers.Clear();
       currentPhaseName = implicitPhaseName ?? String.Empty;
+      ReleaseWorldConversationVirtualResources();
       foreach (Dictionary<WorldNpcAnimationClip, NpcSkinState> states in npcSkinStates.Values) foreach (NpcSkinState state in states.Values) state?.Dispose();
       npcSkinStates.Clear();
+      ClearNpcClothRuntime();
       var released = new HashSet<GR2>();
       foreach (GR2 model in utilityMarkerModels.Values) if (model != null && released.Add(model)) ReleaseModelBuffers(model);
-      foreach (WorldNpcPlacement p in npcPlacements) if (p?.Models != null) foreach (GR2 model in p.Models) if (model != null && released.Add(model)) ReleaseModelBuffers(model);
+      foreach (WorldNpcPlacement p in npcPlacements) {
+        if (p?.Models != null) foreach (GR2 model in p.Models) if (model != null && released.Add(model)) ReleaseModelBuffers(model);
+        if (p?.Weapons != null) foreach (WorldNpcWeaponAttachment weapon in p.Weapons) if (weapon?.Model != null && released.Add(weapon.Model)) ReleaseModelBuffers(weapon.Model);
+      }
       foreach (WorldSpnPlacement p in spnPlacements) if (p?.Models != null) foreach (GR2 model in p.Models) if (model != null && released.Add(model)) ReleaseModelBuffers(model);
       utilityMarkerModels = new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
       npcPlacements = new List<WorldNpcPlacement>();

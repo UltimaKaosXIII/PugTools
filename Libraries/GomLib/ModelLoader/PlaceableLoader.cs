@@ -78,12 +78,7 @@ namespace GomLib.ModelLoader {
         plc.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(plc.Fqn, nameLookupData);
       }
       plc.LocalizedName = Normalize.Dictionary(plc.LocalizedName, plc.Fqn);
-      string selected = GomLib.StringTable.SelectedLocalization ?? "enMale";
-      if (!plc.LocalizedName.TryGetValue(selected, out string selectedName) || String.IsNullOrWhiteSpace(selectedName)) {
-        string language = selected.Length >= 2 ? selected.Substring(0, 2) : selected;
-        selectedName = plc.LocalizedName.FirstOrDefault(x => x.Key.StartsWith(language, StringComparison.OrdinalIgnoreCase) && !String.IsNullOrWhiteSpace(x.Value)).Value;
-        if (String.IsNullOrWhiteSpace(selectedName)) selectedName = plc.LocalizedName.Values.FirstOrDefault(x => !String.IsNullOrWhiteSpace(x));
-      }
+      string selectedName = GomLib.StringTable.SelectLocalizedText(plc.LocalizedName, null);
       plc.Name = String.IsNullOrWhiteSpace(selectedName) ? plc.Fqn.Split('.').Last() : selectedName.Trim();
 
       //public Conversation Conversation { get; set; }

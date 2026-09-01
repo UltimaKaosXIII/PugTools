@@ -116,6 +116,8 @@ namespace PugTools {
     private Panel miniMapTitleBar;
     private Label miniMapTitle;
     private Button miniMapClose;
+    private Button miniMapScopeButton;
+    private Button miniMapSourceButton;
     private PictureBox miniMapPicture;
     private Panel miniMapResizeGrip;
     private Bitmap miniMapImage;
@@ -729,17 +731,44 @@ namespace PugTools {
         ToolTipText = "Original SWTOR map-note icons. All icon classes are disabled by default."
       };
       KeepCheckMenuOpen(mapIconsMenu);
-      AddWorldDropDownToggle(mapIconsMenu, "Quick travel / bind points", worldSettings.ShowMapIconBindpoints, v => {
-        worldSettings.ShowMapIconBindpoints = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      AddWorldDropDownToggle(mapIconsMenu, "Exploration missions", worldSettings.ShowMapIconExplorationQuests, v => {
+        worldSettings.ShowMapIconExplorationQuests = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
       });
-      AddWorldDropDownToggle(mapIconsMenu, "Map exits / links", worldSettings.ShowMapIconMapLinks, v => {
-        worldSettings.ShowMapIconMapLinks = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
-      });
-      AddWorldDropDownToggle(mapIconsMenu, "Quests", worldSettings.ShowMapIconQuests, v => {
+      AddWorldDropDownToggle(mapIconsMenu, "Quests / mission boards", worldSettings.ShowMapIconQuests, v => {
         worldSettings.ShowMapIconQuests = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Vendors", worldSettings.ShowMapIconVendors, v => {
+        worldSettings.ShowMapIconVendors = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
       });
       AddWorldDropDownToggle(mapIconsMenu, "Taxi terminals", worldSettings.ShowMapIconTaxi, v => {
         worldSettings.ShowMapIconTaxi = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Class trainers", worldSettings.ShowMapIconClassTrainers, v => {
+        worldSettings.ShowMapIconClassTrainers = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Crew-skill trainers", worldSettings.ShowMapIconCrewTrainers, v => {
+        worldSettings.ShowMapIconCrewTrainers = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Quick travel / bind points", worldSettings.ShowMapIconBindpoints, v => {
+        worldSettings.ShowMapIconBindpoints = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Resource nodes", worldSettings.ShowMapIconResources, v => {
+        worldSettings.ShowMapIconResources = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Mailboxes", worldSettings.ShowMapIconMailboxes, v => {
+        worldSettings.ShowMapIconMailboxes = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Modification stations", worldSettings.ShowMapIconEnhancementStations, v => {
+        worldSettings.ShowMapIconEnhancementStations = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Cargo hold / banks", worldSettings.ShowMapIconCargoHold, v => {
+        worldSettings.ShowMapIconCargoHold = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Galactic Trade Network", worldSettings.ShowMapIconGalacticMarket, v => {
+        worldSettings.ShowMapIconGalacticMarket = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
+      });
+      AddWorldDropDownToggle(mapIconsMenu, "Map exits / links", worldSettings.ShowMapIconMapLinks, v => {
+        worldSettings.ShowMapIconMapLinks = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
       });
       AddWorldDropDownToggle(mapIconsMenu, "Elevators / Wonkavators", worldSettings.ShowMapIconWonkavator, v => {
         worldSettings.ShowMapIconWonkavator = v; worldSettings.ShowMapNotes = worldSettings.AnyMapIconEnabled;
@@ -1385,7 +1414,8 @@ namespace PugTools {
     private static string MapnoteSearchText(AreaMapNote note) {
       if (note == null) return String.Empty;
       return String.Join(" ", new[] {
-        note.Id ?? String.Empty, note.Fqn ?? String.Empty, note.Label ?? String.Empty,
+        note.Id ?? String.Empty, note.Fqn ?? String.Empty, note.Label ?? String.Empty, note.Icon ?? String.Empty, note.ServiceKind ?? String.Empty,
+        String.Join(" ", note.QuestNames ?? new List<string>()), String.Join(" ", note.QuestObjectives ?? new List<string>()),
         String.Join(" ", note.Tags ?? new List<string>()), String.Join(" ", note.ParentTags ?? new List<string>()),
         note.Position.X.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
         note.Position.Y.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture),
@@ -1886,18 +1916,68 @@ namespace PugTools {
       }
       if (packageId == 0) return false;
 
-      WonkPackageInfo package = LoadWonkPackage(packageId, selectedName);
+      Vector3? currentPosition = null;
+      if (panelRender.TryGetSelectedWorldSpawnPosition(out float selectedX, out float selectedY, out float selectedZ))
+        currentPosition = new Vector3(selectedX, selectedY, selectedZ);
+      return OpenWonkavatorDialog(packageId, selectedName, currentPosition, false);
+    }
+
+    internal bool TryOpenWonkavatorForMapNote(AreaMapNote note, bool closeFullMapOnTeleport = false) {
+      if (note == null || panelRender == null || currentDom == null) return false;
+      string key = (note.Icon ?? String.Empty).ToLowerInvariant();
+      bool wonka = note.WonkaPackageId != 0 || String.Equals(note.ServiceKind, "Wonkavator", StringComparison.OrdinalIgnoreCase) ||
+        key.Contains("wonka") || key.Contains("elevator") || key.Contains("lift");
+      if (!wonka) return false;
+
+      long packageId = note.WonkaPackageId;
+      if (packageId == 0 && !String.IsNullOrWhiteSpace(note.Fqn)) {
+        string fqn = note.Fqn.Trim().Trim('.');
+        foreach (string candidate in new[] { fqn, fqn.StartsWith("mpn.", StringComparison.OrdinalIgnoreCase) ? fqn : "mpn." + fqn }
+          .Distinct(StringComparer.OrdinalIgnoreCase)) {
+          try {
+            GomLib.Models.MapNote resolved = currentDom.MapNoteLoader.Load(candidate);
+            packageId = resolved?.WonkaPackageId ?? 0;
+            if (packageId != 0) break;
+          } catch { }
+        }
+      }
+      if (packageId == 0 && worldSpnPlacements != null) {
+        // Synthetic/service markers normally carry the package id directly. If an authored icon does not, bind it
+        // to the nearest structurally identified Wonkavator so old client data remains clickable as well.
+        const float radiusSq = 9f;
+        WorldSpnPlacement nearest = worldSpnPlacements
+          .Where(x => x?.Interaction?.Kind == WorldInteractionKind.Wonkavator &&
+            (x.Interaction.WonkaPackageId != 0 || x.WonkaPackageId != 0) && x.Instance != null && x.Room != null)
+          .Select(x => new { Spn = x, Pos = TryWorldMapPlacementPosition(x.Room, x.Instance, x.SpawnPoints, out Vector3 pos) ? (Vector3?)pos : null })
+          .Where(x => x.Pos.HasValue && HorizontalMapDistanceSquared(x.Pos.Value, note.Position) <= radiusSq)
+          .OrderBy(x => HorizontalMapDistanceSquared(x.Pos.Value, note.Position))
+          .Select(x => x.Spn).FirstOrDefault();
+        packageId = nearest?.Interaction?.WonkaPackageId ?? nearest?.WonkaPackageId ?? 0;
+      }
+      if (packageId == 0) {
+        SetStatusLabel("Wonkavator map symbol found, but no elevator package is available in the local client data.");
+        return true;
+      }
+
+      string title = WorldMapNoteDisplayName(note);
+      UpdateWorldMapNoteToolTip(null, Point.Empty);
+      return OpenWonkavatorDialog(packageId, title, note.Position, closeFullMapOnTeleport);
+    }
+
+    private bool OpenWonkavatorDialog(long packageId, string fallbackTitle, Vector3? currentPosition, bool closeFullMapOnTeleport) {
+      if (panelRender == null || currentDom == null || packageId == 0) return false;
+      WonkPackageInfo package = LoadWonkPackage(packageId, fallbackTitle);
       if (package == null) return true;
 
-      // Preselect the destination that best matches the terminal's current world position. Elevator packages are
-      // frequently reused on several floors; selecting row zero made the dialog look as if the terminal always lived
-      // on the main level even when it was opened elsewhere. Y is deliberately included so stacked floors resolve.
+      // Preselect the destination that best matches the terminal/map symbol position. Elevator packages are frequently
+      // reused on several floors; Y is included so stacked floors resolve to the correct current destination.
       WonkDestinationItem currentDestination = null;
-      if (panelRender.TryGetSelectedWorldSpawnPosition(out float selectedX, out float selectedY, out float selectedZ)) {
+      if (currentPosition.HasValue) {
+        Vector3 origin = currentPosition.Value;
         currentDestination = package.Destinations
           .Where(x => x?.Note != null)
           .OrderBy(x => {
-            float dx = x.Note.Position.X - selectedX, dy = x.Note.Position.Y - selectedY, dz = x.Note.Position.Z - selectedZ;
+            float dx = x.Note.Position.X - origin.X, dy = x.Note.Position.Y - origin.Y, dz = x.Note.Position.Z - origin.Z;
             return dx * dx + dy * dy + dz * dz;
           }).FirstOrDefault();
       }
@@ -1956,6 +2036,7 @@ namespace PugTools {
       if (selectedDestination?.Note != null) {
         panelRender.RequestTeleportWarmup(selectedDestination.Note);
         panelRender.TeleportToMapNote(selectedDestination.Note);
+        if (closeFullMapOnTeleport && panelRender.IsFullMapOpen) panelRender.CloseInteractiveMap();
         SetStatusLabel((de ? "Wonkavator: " : fr ? "Ascenseur : " : "Elevator: ") + selectedDestination.Name);
       }
       if (selectedDestination?.Note == null) panelRender.CancelTeleportWarmup();
@@ -2252,7 +2333,24 @@ namespace PugTools {
       miniMapClose = new Button { Dock = DockStyle.Right, Width = 26, Text = "×", TabStop = false, FlatStyle = FlatStyle.Flat };
       miniMapClose.FlatAppearance.BorderSize = 0;
       miniMapClose.Click += (_, __) => { if (btnWorldMiniMap != null) btnWorldMiniMap.Checked = false; else SetMiniMapVisible(false); };
+      miniMapSourceButton = new Button { Dock = DockStyle.Right, Width = 82, Text = "In-game", TabStop = false, FlatStyle = FlatStyle.Flat };
+      miniMapSourceButton.FlatAppearance.BorderSize = 0;
+      miniMapSourceButton.Click += (_, __) => {
+        if(panelRender==null)return;
+        panelRender.SetMiniMapOriginalArt(!panelRender.MiniMapPrefersOriginalArt);
+        miniMapTitle.Text="Minimap — rendering…";
+      };
+      miniMapScopeButton = new Button { Dock = DockStyle.Right, Width = 72, Text = "Area", TabStop = false, FlatStyle = FlatStyle.Flat };
+      miniMapScopeButton.FlatAppearance.BorderSize = 0;
+      miniMapScopeButton.Click += (_, __) => {
+        if(panelRender==null)return;
+        if(panelRender.MiniMapIsWorldScope&&!panelRender.MiniMapHasAreaScope)SetStatusLabel("No separate area map exists at the current height; the world map remains active.");
+        else panelRender.SetMiniMapWorldScope(!panelRender.MiniMapIsWorldScope);
+        miniMapTitle.Text="Minimap — rendering…";
+      };
       miniMapTitleBar.Controls.Add(miniMapTitle);
+      miniMapTitleBar.Controls.Add(miniMapScopeButton);
+      miniMapTitleBar.Controls.Add(miniMapSourceButton);
       miniMapTitleBar.Controls.Add(miniMapClose);
 
       miniMapPicture = new PictureBox { Dock = DockStyle.Fill, BackColor = Color.FromArgb(28, 28, 28), Cursor = Cursors.Cross };
@@ -2503,7 +2601,10 @@ namespace PugTools {
         UpdatePhaseBanner(phase);
         UpdateWorldVolumePanel();
         UpdateSpaceCombatEncounterTimeline();
-        if (miniMapPanel != null && miniMapPanel.Visible) miniMapPicture?.Invalidate();
+        if (miniMapPanel != null && miniMapPanel.Visible) {
+          if(panelRender?.MiniMapNeedsAutoScopeRefresh()==true) RefreshMiniMapForCamera();
+          miniMapPicture?.Invalidate();
+        }
       };
       worldOverlayTimer.Start();
     }
@@ -2543,6 +2644,7 @@ namespace PugTools {
         return;
       }
       worldFullMapActive = active;
+      EnsureWorldMapModeControls();
       if (!active) UpdateWorldMapNoteToolTip(null, Point.Empty, renderPanel);
       bool showMini = !worldInterfaceHidden && !active && btnWorldMiniMap != null && btnWorldMiniMap.Checked;
       if (miniMapPanel != null) {
@@ -2550,6 +2652,7 @@ namespace PugTools {
         if (showMini) { LayoutMiniMapWithinHost(); miniMapPanel.BringToFront(); }
       }
       UpdateWorldVolumePanel(true);
+      RefreshWorldMapModeControls();
     }
 
     private void SetMiniMapVisible(bool visible) {
@@ -2559,14 +2662,30 @@ namespace PugTools {
         LayoutMiniMapWithinHost();
         miniMapPanel.BringToFront();
         ActivateWorldRenderInput();
-        if (miniMapImage == null) {
-          miniMapTitle.Text = "Minimap — rendering…";
-          panelRender?.RequestMiniMapSnapshot();
-        } else {
-          UpdateMiniMapTitle();
-          miniMapPicture.Invalidate();
-        }
+        miniMapTitle.Text = "Minimap — rendering…";
+        panelRender?.RequestMiniMapSnapshot(true);
+        RefreshMiniMapModeControls();
       }
+    }
+
+    internal void RefreshMiniMapForCamera(){
+      if(miniMapPanel?.Visible!=true||panelRender==null)return;
+      miniMapTitle.Text="Minimap — rendering…";
+      panelRender.RequestMiniMapSnapshot(true);
+    }
+
+    internal void RefreshMiniMapModeControls(){
+      if(_closing||IsDisposed||Disposing)return;
+      if(InvokeRequired){try{BeginInvoke(new Action(RefreshMiniMapModeControls));}catch{}return;}
+      if(miniMapScopeButton==null||miniMapSourceButton==null||panelRender==null)return;
+      bool world=panelRender.MiniMapIsWorldScope,hasArea=panelRender.MiniMapHasAreaScope;
+      bool preferOriginal=panelRender.MiniMapPrefersOriginalArt,originalAvailable=panelRender.MiniMapOriginalArtAvailable;
+      miniMapScopeButton.Text=world?(hasArea?"Area":"World"):"World";
+      miniMapScopeButton.Enabled=true;
+      miniMapSourceButton.Text=preferOriginal?"PugTools":"In-game";
+      miniMapSourceButton.ForeColor=preferOriginal&&!originalAvailable?Color.Khaki:SystemColors.ControlText;
+      worldMapNoteToolTip?.SetToolTip(miniMapScopeButton,hasArea?"Switch between the current SWTOR submap and the world map.":"No separate area map exists at the current height.");
+      worldMapNoteToolTip?.SetToolTip(miniMapSourceButton,originalAvailable?"Switch between the generated PugTools map and the original SWTOR map art.":"No original SWTOR art exists for this page.");
     }
 
     private void InvalidateMiniMapSnapshot() {
@@ -2593,6 +2712,7 @@ namespace PugTools {
       miniMapMinX = minX; miniMapMaxX = maxX; miniMapMinZ = minZ; miniMapMaxZ = maxZ;
       miniMapZoom = 1f; miniMapCenterX = (minX + maxX) * .5f; miniMapCenterZ = (minZ + maxZ) * .5f;
       UpdateMiniMapTitle();
+      RefreshMiniMapModeControls();
       ResizeMiniMapToImageAspect();
       miniMapPicture?.Invalidate();
     }
@@ -2648,7 +2768,9 @@ namespace PugTools {
 
     private void UpdateMiniMapTitle() {
       if (miniMapTitle == null) return;
-      miniMapTitle.Text = miniMapImage == null ? "Minimap — rendering…" : string.Format(System.Globalization.CultureInfo.InvariantCulture, "Minimap — {0:0.#}× — click teleport / drag pan", miniMapZoom);
+      if(miniMapImage==null){miniMapTitle.Text="Minimap — rendering…";return;}
+      string page=panelRender==null?String.Empty:(panelRender.MiniMapIsWorldScope?panelRender.MiniMapWorldName:panelRender.MiniMapAreaName);
+      miniMapTitle.Text=string.Format(System.Globalization.CultureInfo.InvariantCulture,"Minimap{0} — {1:0.#}×",String.IsNullOrWhiteSpace(page)?String.Empty:" — "+page,miniMapZoom);
     }
 
     private void MiniMapHandleMouseWheel(Point point, int delta) {
@@ -2744,22 +2866,56 @@ namespace PugTools {
     private bool WorldMapNoteVisible(AreaMapNote note) {
       if (note == null || !worldSettings.ShowMapNotes) return false;
       string key = (note.Icon ?? String.Empty).ToLowerInvariant();
-      if (key.Contains("bindpoint") || key.Contains("bind_point") || key.Contains("bind")) return worldSettings.ShowMapIconBindpoints;
+      if (key.Contains("bindpoint") || key.Contains("bind_point") || key.Contains("bind") || key.Contains("quicktravel")) return worldSettings.ShowMapIconBindpoints;
       if (key.Contains("maplink") || key.Contains("map_link") || key.Contains("exit")) return worldSettings.ShowMapIconMapLinks;
-      if (key.Contains("quest")) return worldSettings.ShowMapIconQuests;
+      if (key.Contains("explorationquest") || key.Contains("questarc")) return worldSettings.ShowMapIconExplorationQuests;
+      if (key.Contains("quest") || key.Contains("missionboard")) return worldSettings.ShowMapIconQuests;
       if (key.Contains("taxi")) return worldSettings.ShowMapIconTaxi;
+      if (key.Contains("vendor")) return worldSettings.ShowMapIconVendors;
+      if (key.Contains("crewtrainer") || key.Contains("professiontrainer")) return worldSettings.ShowMapIconCrewTrainers;
+      if (key.Contains("classtrainer") || key == "trainer") return worldSettings.ShowMapIconClassTrainers;
+      if (key.Contains("resource") || key.Contains("harvest")) return worldSettings.ShowMapIconResources;
+      if (key.Contains("mail")) return worldSettings.ShowMapIconMailboxes;
+      if (key.Contains("enhancement") || key.Contains("modification")) return worldSettings.ShowMapIconEnhancementStations;
+      if (key.Contains("guildbank") || key.Contains("bank") || key.Contains("cargohold")) return worldSettings.ShowMapIconCargoHold;
+      if (key.Contains("auction") || key.Contains("galacticmarket")) return worldSettings.ShowMapIconGalacticMarket;
       if (key.Contains("wonkavator") || key.Contains("wonka") || key.Contains("elevator") || key.Contains("lift")) return worldSettings.ShowMapIconWonkavator;
       return worldSettings.ShowMapIconOther;
     }
 
     private static string WorldMapIconFileName(string iconName) {
       string key = (iconName ?? String.Empty).ToLowerInvariant();
-      if (key.Contains("bindpoint") || key.Contains("bind_point")) return "mpn-bindpoint.png";
+      if (key.Contains("bindpoint") || key.Contains("bind_point") || key.Contains("quicktravel")) return "mpn-bindpoint.png";
       if (key.Contains("maplink") || key.Contains("map_link") || key.Contains("exit")) return "mpn-maplink.png";
-      if (key.Contains("quest")) return "mpn-quest.png";
+      if (key.Contains("explorationquest") || key.Contains("questarc")) return "mpn-explorationquest.png";
+      if (key.Contains("quest") && !key.Contains("missionboard")) return "mpn-quest.png";
       if (key.Contains("taxi")) return "mpn-taxi.png";
+      if (key.Contains("vendor")) return "mpn-vendor.png";
+      if (key.Contains("crewtrainer") || key.Contains("professiontrainer")) return "mpn-crewtrainer.png";
+      if (key.Contains("classtrainer") || key == "trainer") return "mpn-classtrainer.png";
+      if (key.Contains("resource") || key.Contains("harvest")) return "mpn-resource.png";
+      if (key.Contains("mail")) return "mpn-mailbox.png";
+      if (key.Contains("enhancement") || key.Contains("modification")) return "mpn-enhancement.png";
+      if (key.Contains("guildbank")) return "mpn-guildbank.png";
+      if (key.Contains("bank") || key.Contains("cargohold")) return "mpn-bank.png";
+      if (key.Contains("auction") || key.Contains("galacticmarket")) return "mpn-auction.png";
+      if (key.Contains("missionboard")) return "mpn-missionboard.png";
       if (key.Contains("wonkavator") || key.Contains("elevator") || key.Contains("lift")) return "mpn-wonkavator.png";
+      if (key == "defaulticon" || key == "default") return "mpn-default.png";
       return null;
+    }
+
+    private static bool WorldMapIconNeedsHorizontalFlip(string iconName) {
+      string fileName = WorldMapIconFileName(iconName);
+      if (String.IsNullOrWhiteSpace(fileName)) return false;
+      // Bundled SWTOR/Jedipedia icons already have the authored orientation. The newer service/filter icons are
+      // generated locally and need one horizontal correction in screen space.
+      switch (fileName.ToLowerInvariant()) {
+        case "mpn-explorationquest.png": case "mpn-vendor.png": case "mpn-crewtrainer.png": case "mpn-classtrainer.png":
+        case "mpn-resource.png": case "mpn-mailbox.png": case "mpn-enhancement.png": case "mpn-guildbank.png":
+        case "mpn-bank.png": case "mpn-auction.png": case "mpn-missionboard.png": case "mpn-default.png": return true;
+        default: return false;
+      }
     }
 
     private Image GetWorldMapIcon(string iconName) {
@@ -2775,8 +2931,14 @@ namespace PugTools {
       if (worldMapIconImages.TryGetValue(fileName, out Image cached)) return cached;
       try {
         string path = Path.Combine(AppContext.BaseDirectory, "Resources", "WorldMapIcons", fileName);
-        if (!System.IO.File.Exists(path)) return null;
-        using (Image source = Image.FromFile(path)) cached = new Bitmap(source);
+        if (System.IO.File.Exists(path)) {
+          using (Image source = Image.FromFile(path)) cached = new Bitmap(source);
+        } else {
+          string generatedKey = Path.GetFileNameWithoutExtension(fileName ?? String.Empty);
+          if (generatedKey.StartsWith("mpn-", StringComparison.OrdinalIgnoreCase)) generatedKey = generatedKey.Substring(4);
+          cached = WorldMapIconFactory.Create(generatedKey);
+          if (cached == null) return null;
+        }
         worldMapIconImages[fileName] = cached;
         return cached;
       } catch (Exception ex) {
@@ -2799,6 +2961,15 @@ namespace PugTools {
         } finally { graphics.Restore(state); }
         return;
       }
+      if (WorldMapIconNeedsHorizontalFlip(note.Icon)) {
+        System.Drawing.Drawing2D.GraphicsState state = graphics.Save();
+        try {
+          graphics.TranslateTransform(centerX, centerY);
+          graphics.ScaleTransform(-1f, 1f);
+          graphics.DrawImage(icon, -icon.Width * .5f, -icon.Height * .5f, icon.Width, icon.Height);
+        } finally { graphics.Restore(state); }
+        return;
+      }
       graphics.DrawImage(icon, centerX - icon.Width * .5f, centerY - icon.Height * .5f, icon.Width, icon.Height);
     }
 
@@ -2817,15 +2988,26 @@ namespace PugTools {
       string loc = GomLib.StringTable.SelectedLocalization ?? "enMale";
       bool de = loc.StartsWith("de", StringComparison.OrdinalIgnoreCase), fr = loc.StartsWith("fr", StringComparison.OrdinalIgnoreCase);
       if (key.Contains("taxi")) return de ? "Taxi" : fr ? "Taxi" : "Taxi";
+      if (key.Contains("vendor")) return de ? "Händler" : fr ? "Marchand" : "Vendor";
+      if (key.Contains("crewtrainer") || key.Contains("professiontrainer")) return de ? "Crew-Fähigkeiten-Ausbilder" : fr ? "Formateur de métier" : "Crew-skill trainer";
+      if (key.Contains("classtrainer") || key == "trainer") return de ? "Ausbilder" : fr ? "Entraîneur" : "Trainer";
+      if (key.Contains("resource") || key.Contains("harvest")) return de ? "Ressource" : fr ? "Ressource" : "Resource";
+      if (key.Contains("mail")) return de ? "Post" : fr ? "Boîte aux lettres" : "Mailbox";
+      if (key.Contains("enhancement") || key.Contains("modification")) return de ? "Modifikationsstation" : fr ? "Station de modification" : "Modification station";
+      if (key.Contains("guildbank") || key.Contains("bank") || key.Contains("cargohold")) return de ? "Laderaumzugang" : fr ? "Soute" : "Cargo hold";
+      if (key.Contains("auction") || key.Contains("galacticmarket")) return de ? "Galaktischer Markt" : fr ? "Marché galactique" : "Galactic Trade Network";
       if (key.Contains("wonka") || key.Contains("elevator") || key.Contains("lift")) return de ? "Aufzug" : fr ? "Ascenseur" : "Elevator";
-      if (key.Contains("bind")) return de ? "Schnellreisepunkt" : fr ? "Point de voyage rapide" : "Quick travel point";
+      if (key.Contains("bind") || key.Contains("quicktravel")) return de ? "Schnellreisepunkt" : fr ? "Point de voyage rapide" : "Quick travel point";
       if (key.Contains("maplink") || key.Contains("exit")) return de ? "Kartenausgang" : fr ? "Sortie de carte" : "Map exit";
+      if (key.Contains("explorationquest") || key.Contains("questarc")) return de ? "Erkundungsmission" : fr ? "Mission d'exploration" : "Exploration mission";
+      if (key.Contains("missionboard")) return de ? "Missionsbrett" : fr ? "Terminal de mission" : "Mission board";
       if (key.Contains("quest")) return de ? "Quest" : fr ? "Quête" : "Quest";
       return String.IsNullOrWhiteSpace(icon) ? (de ? "Kartensymbol" : fr ? "Icône de carte" : "Map icon") : icon;
     }
 
     private string BuildWorldMapNoteToolTip(AreaMapNote note) {
       if (note == null) return String.Empty;
+      EnsureWorldMapNoteQuestInfo(note);
       string loc = GomLib.StringTable.SelectedLocalization ?? "enMale";
       bool de = loc.StartsWith("de", StringComparison.OrdinalIgnoreCase), fr = loc.StartsWith("fr", StringComparison.OrdinalIgnoreCase);
       string nameLabel = de ? "Name" : fr ? "Nom" : "Name";
@@ -2836,11 +3018,21 @@ namespace PugTools {
       string destinationLabel = de ? "Ziel-ID" : fr ? "ID de destination" : "Destination ID";
       string iconLabel = de ? "Symbol" : fr ? "Icône" : "Icon";
       string mapLinkLabel = de ? "Kartenziel" : fr ? "Carte cible" : "Map target";
+      string questLabel = de ? "Quest" : fr ? "Quête" : "Quest";
+      string objectiveLabel = de ? "Ziel" : fr ? "Objectif" : "Objective";
       var sb = new StringBuilder();
       sb.AppendLine(nameLabel + ": " + WorldMapNoteDisplayName(note));
       sb.AppendLine("FQN: " + (String.IsNullOrWhiteSpace(note.Fqn) ? "-" : note.Fqn));
       sb.AppendLine(typeLabel + ": " + LocalizedMapNoteType(note.Icon));
       if (!String.IsNullOrWhiteSpace(note.Icon)) sb.AppendLine(iconLabel + ": " + note.Icon);
+      if (note.QuestNames != null && note.QuestNames.Count > 0) {
+        foreach (string questName in note.QuestNames.Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase))
+          sb.AppendLine(questLabel + ": " + questName.Trim());
+      }
+      if (note.QuestObjectives != null && note.QuestObjectives.Count > 0) {
+        foreach (string objective in note.QuestObjectives.Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase))
+          sb.AppendLine(objectiveLabel + ": " + objective.Trim().Replace("\r", " ").Replace("\n", " / "));
+      }
       if (!String.IsNullOrWhiteSpace(note.Id)) sb.AppendLine("ID: " + note.Id);
       if (note.AssetId != 0) sb.AppendLine("Asset ID: " + note.AssetId.ToString(System.Globalization.CultureInfo.InvariantCulture));
       if (!String.IsNullOrWhiteSpace(note.Condition) && !String.Equals(note.Condition, "None", StringComparison.OrdinalIgnoreCase)) sb.AppendLine(conditionLabel + ": " + note.Condition);
@@ -2942,6 +3134,17 @@ namespace PugTools {
       if (e.Button != MouseButtons.Left || panelRender == null || miniMapImage == null) return;
       Rectangle dst = MiniMapImageRectangle();
       if (dst.IsEmpty || !dst.Contains(e.Location) || miniMapMaxX <= miniMapMinX || miniMapMaxZ <= miniMapMinZ) return;
+      AreaMapNote clickedNote = HitTestMiniMapNote(e.Location);
+      if (clickedNote != null && TryOpenTaxiMapForMapNote(clickedNote)) return;
+      if (clickedNote != null && TryOpenWonkavatorForMapNote(clickedNote, false)) return;
+      if (clickedNote != null && TryOpenMapLinkForMapNote(clickedNote, true)) return;
+      if (clickedNote != null && IsWorldQuestMapNote(clickedNote)) {
+        // Quest pins are always informational. Never fall through to the minimap teleport path just because the
+        // reverse quest link is missing in this particular client/cache build.
+        if (!TryShowWorldMapQuestDetails(clickedNote))
+          SetStatusLabel("Quest information is not available for this map symbol in the local client data.");
+        return;
+      }
       float u = (e.X - dst.Left) / (float)dst.Width;
       float v = (e.Y - dst.Top) / (float)dst.Height;
       MiniMapVisibleWorldBounds(out float visibleMinX, out float visibleMaxX, out float visibleMinZ, out float visibleMaxZ);
@@ -3118,6 +3321,7 @@ namespace PugTools {
           await Task.Run(() => PreviewAREA(info, currentAreaId));
           BuildDataViewer();
           renderPanel.Visible = true;
+          ApplyPendingMapLinkAfterAreaLoad();
           treeViewFast1.Enabled = true;
           toolStripProgressBar1.Visible = false;
 
@@ -3355,7 +3559,8 @@ namespace PugTools {
           if (min == null || min.Count < 3 || max == null || max.Count < 3) continue;
           List<float> miniMin = page.ValueOrDefault<List<float>>("mapPageMiniMinCoord", null);
           List<float> miniMax = page.ValueOrDefault<List<float>>("mapPageMiniMaxCoord", null);
-          string image = "/resources/world/areas/" + areaId + "/" + mapName + "_r.dds";
+          string mapPrefix = areaId == 36268000006UL || areaId == 3758002374UL ? "livecontent/systemgenerated" : "areas";
+          string image = "/resources/world/" + mapPrefix + "/" + areaId + "/" + mapName + "_r.dds";
           using File imageFile = currentAssets.FindFile(image);
           targetArea.MapPages.Add(new AreaMapPage {
             Guid = page.ValueOrDefault<long>("mapPageGUID", 0),
@@ -3444,6 +3649,7 @@ namespace PugTools {
           note.MapLinkMapNameSId = resolved.MapLink.MapNameSId;
           note.MapLinkSubmapNameSId = resolved.MapLink.SubmapNameSId;
         }
+        EnrichWorldMapNoteQuestInfo(note, resolved);
       }
     }
 
@@ -3520,6 +3726,7 @@ namespace PugTools {
         UpdateWorldLoading("Loading utilities, NPCs, SPN objects and animations…");
         LoadWorldUtilityModels();
         LoadWorldNpcPlacements();
+        BuildWorldServiceMapNotes();
         LoadWorldTaxiRoutes();
         PreloadWorldSpaceCombatEncounterAssets();
 

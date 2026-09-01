@@ -32,6 +32,7 @@ namespace PugTools {
     private Conversation worldConversationPlaybackConversation;
     private DialogNode worldConversationPlaybackNode;
     private WorldNpcPlacement worldConversationPrimaryNpc;
+    private WorldNpcPlacement worldConversationPlayerNpc;
     private WaveOutEvent worldConversationWaveOut;
     private System.Windows.Forms.Timer worldConversationAdvanceTimer;
     private int worldConversationPlaybackSerial;
@@ -40,6 +41,7 @@ namespace PugTools {
     private readonly Dictionary<string, WorldNpcAnimationClip> worldConversationAnimationCache = new Dictionary<string, WorldNpcAnimationClip>(StringComparer.OrdinalIgnoreCase);
     private object worldConversationAnimationCacheAssets;
     private readonly HashSet<WorldNpcPlacement> worldConversationAnimatedNpcs = new HashSet<WorldNpcPlacement>();
+    private readonly HashSet<WorldNpcPlacement> worldConversationFaceFxNpcs = new HashSet<WorldNpcPlacement>();
     private readonly HashSet<WorldNpcPlacement> worldConversationStagedNpcs = new HashSet<WorldNpcPlacement>();
     private readonly List<System.Windows.Forms.Timer> worldConversationCinematicTimers = new List<System.Windows.Forms.Timer>();
 
@@ -195,6 +197,7 @@ namespace PugTools {
       int serial = ++worldConversationPlaybackSerial;
       StopWorldConversationAudio();
       StopWorldConversationCinematicTimers();
+      ClearWorldConversationFaceFx();
       ClearWorldConversationAnimations();
       worldConversationPlaybackNode = node;
       worldConversationPlaybackChoices.Controls.Clear();
@@ -206,8 +209,11 @@ namespace PugTools {
       worldConversationPlaybackSpeaker.Text = speaker + "   •   node #" + node.NodeId.ToString(CultureInfo.InvariantCulture);
       worldConversationPlaybackText.Text = text;
       panelRender?.SetWorldConversationSubtitle(speaker, text);
-      worldConversationPlaybackStatus.Text = "Applying cinematic actions…";
-      StartWorldConversationCinematics(conversation, node, serial);
+      worldConversationPlaybackStatus.Text = "Applying conversation staging…";
+      // Staging can be applied while VO is being decoded, but the timed beats must NOT start yet. Starting the timers
+      // before ConvertWEM/WaveOut.Play made short gestures finish during audio loading; FaceFX then started with the
+      // voice while the body was already holding the gesture's last frame, which looked exactly like a rigid actor.
+      ApplyWorldConversationStaging(conversation, node);
 
       bool audioStarted = false;
       try {
@@ -222,6 +228,8 @@ namespace PugTools {
       if (audioStarted) {
         worldConversationPlaybackStatus.Text = "Playing voice-over" + (node.IsPlayerNode ? " (first matching player voice)" : String.Empty) + ".";
       } else {
+        // With no VO there is no external clock to anchor to; start the beats when subtitle timing starts.
+        StartWorldConversationCinematicActions(conversation, node, serial);
         worldConversationPlaybackStatus.Text = "No playable voice-over found; using subtitle timing.";
         ScheduleWorldConversationAdvance(text);
       }
@@ -366,6 +374,8 @@ namespace PugTools {
           converted = await wem.ConvertWEM();
         }
         if (!converted || wem.Vorbis == null || serial != worldConversationPlaybackSerial) continue;
+        WorldNpcPlacement faceSpeaker = FindWorldConversationSpeakerPlacement(conversation, node);
+        WorldNpcFaceFxClip face = LoadWorldConversationFaceFx(conversation, node, wem, faceSpeaker);
         try {
           wem.Vorbis.Position = 0;
           var output = new WaveOutEvent { Volume = 1f };
@@ -383,10 +393,18 @@ namespace PugTools {
             } catch { try { output.Dispose(); } catch { } }
           };
           worldConversationPlaybackStatus.Text = "VO: " + wem.WemName;
+          if (face != null && faceSpeaker != null) {
+            panelRender?.SetWorldConversationFaceFx(faceSpeaker, face);
+            worldConversationFaceFxNpcs.Add(faceSpeaker);
+          }
           output.Play();
+          // Body clips/cameras share the exact start anchor with FaceFX/VO. This also keeps authored hydTime values
+          // meaningful when WEM conversion took noticeable time.
+          StartWorldConversationCinematicActions(conversation, node, serial);
           return true;
         } catch (Exception ex) {
           System.Diagnostics.Debug.WriteLine("Conversation audio output failed: " + ex.Message);
+          if (faceSpeaker != null) { panelRender?.ClearWorldConversationFaceFx(faceSpeaker); worldConversationFaceFxNpcs.Remove(faceSpeaker); }
           try { worldConversationWaveOut?.Dispose(); } catch { }
           worldConversationWaveOut = null;
         }
@@ -499,6 +517,9 @@ namespace PugTools {
         try { output.Stop(); } catch { }
         try { output.Dispose(); } catch { }
       }
+      // A stopped take must return the face to neutral immediately, including while the UI is waiting on a player
+      // choice. Otherwise the last non-zero lip/eyelid key would remain frozen until the next dialog node starts.
+      ClearWorldConversationFaceFx();
     }
 
     private void DisposeWorldConversationAudioCache() {
@@ -508,30 +529,40 @@ namespace PugTools {
       worldConversationAudioCacheAssets = null;
       worldConversationAnimationCache.Clear();
       worldConversationAnimationCacheAssets = null;
+      worldConversationFaceFxSetCache.Clear();
+      worldConversationFaceFxActorCache.Clear();
+      worldConversationFaceFxCacheAssets = null;
     }
 
     private void StopWorldConversationPlayback(bool clearConversation) {
       ++worldConversationPlaybackSerial;
       StopWorldConversationAudio();
       StopWorldConversationCinematicTimers();
+      ClearWorldConversationFaceFx();
       ClearWorldConversationAnimations();
       ClearWorldConversationStaging();
       panelRender?.ClearWorldConversationCamera(true);
       panelRender?.ClearWorldConversationSubtitle();
+      panelRender?.SetWorldConversationVirtualPlayer(null);
       worldConversationPlaybackNode = null;
       if (worldConversationPlaybackChoices != null) worldConversationPlaybackChoices.Controls.Clear();
       if (worldConversationPlaybackNext != null) worldConversationPlaybackNext.Enabled = false;
-      if (clearConversation) { worldConversationPlaybackConversation = null; worldConversationPrimaryNpc = null; }
+      if (clearConversation) {
+        worldConversationPlaybackConversation = null; worldConversationPrimaryNpc = null;
+        worldConversationPlayerNpc = null;
+      }
       if (worldConversationPlaybackStatus != null) worldConversationPlaybackStatus.Text = clearConversation ? String.Empty : "Playback stopped.";
     }
 
     private void FinishWorldConversation(string status) {
       StopWorldConversationAudio();
       StopWorldConversationCinematicTimers();
+      ClearWorldConversationFaceFx();
       ClearWorldConversationAnimations();
       ClearWorldConversationStaging();
       panelRender?.ClearWorldConversationCamera(true);
       panelRender?.ClearWorldConversationSubtitle();
+      panelRender?.SetWorldConversationVirtualPlayer(null);
       worldConversationPlaybackStatus.Text = status;
       worldConversationPlaybackNext.Enabled = false;
       worldConversationPlaybackChoices.Controls.Clear();
@@ -543,8 +574,7 @@ namespace PugTools {
       worldConversationAnimatedNpcs.Clear();
     }
 
-    private void StartWorldConversationCinematics(Conversation conversation, DialogNode node, int serial) {
-      ApplyWorldConversationStaging(conversation, node);
+    private void StartWorldConversationCinematicActions(Conversation conversation, DialogNode node, int serial) {
       List<WorldConversationCinematicAction> actions = ReadWorldConversationCinematicActions(conversation, node.NodeId);
       foreach (WorldConversationCinematicAction action in actions.OrderBy(x => x.Time)) {
         if (action == null || action.Ignored) continue;
@@ -574,7 +604,13 @@ namespace PugTools {
     }
 
     private WorldNpcPlacement FindWorldConversationSpeakerPlacement(Conversation conversation, DialogNode node) {
-      if (node == null || node.IsPlayerNode) return null;
+      if (node == null) return null;
+      if (node.IsPlayerNode) return EnsureWorldConversationPlayerPlacement();
+      return FindWorldConversationNpcSpeakerPlacement(conversation, node);
+    }
+
+    private WorldNpcPlacement FindWorldConversationNpcSpeakerPlacement(Conversation conversation, DialogNode node) {
+      if (node == null) return worldConversationPrimaryNpc;
       ulong speakerId = node.SpeakerId != 0 ? node.SpeakerId : conversation?.DefaultSpeakerId ?? 0;
       string fqn = null;
       if (speakerId != 0) {
@@ -587,7 +623,9 @@ namespace PugTools {
     }
 
     private WorldNpcPlacement FindWorldConversationActorPlacement(string actor) {
-      if (String.IsNullOrWhiteSpace(actor) || worldNpcPlacements == null || worldNpcPlacements.Count == 0) return null;
+      if (String.IsNullOrWhiteSpace(actor)) return null;
+      if (WorldConversationPlayerActorName(actor)) return EnsureWorldConversationPlayerPlacement();
+      if (worldNpcPlacements == null || worldNpcPlacements.Count == 0) return null;
       string clean = actor.Trim();
       if (worldConversationPrimaryNpc != null && String.Equals(worldConversationPrimaryNpc.SourceFqn, clean, StringComparison.OrdinalIgnoreCase)) return worldConversationPrimaryNpc;
       WorldNpcPlacement exact = worldNpcPlacements.FirstOrDefault(p => p != null && String.Equals(p.SourceFqn, clean, StringComparison.OrdinalIgnoreCase));

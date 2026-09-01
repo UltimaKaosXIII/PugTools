@@ -103,9 +103,8 @@ namespace PugTools {
     }
 
     private ulong ResolveWorldLoreCodexByLocalizedPlaceableName(object retriever, string sourceFqn) {
-      if (currentDom == null || !(retriever is GomObjectData data)) return 0;
-      Dictionary<string, string> localized = null;
-      try { localized = currentDom.StringTable.TryGetLocalizedStrings(sourceFqn ?? String.Empty, data); } catch { }
+      if (currentDom == null) return 0;
+      Dictionary<string, string> localized = WorldLocAll(retriever);
       if (localized == null || localized.Count == 0) return 0;
 
       // en-us is intentionally first: it is the path known to resolve these objects in the original viewer. The
@@ -277,7 +276,7 @@ namespace PugTools {
             object nameRetriever = WorldCodexDictionaryValue(rawMap, 9583395879878673097UL);
             if (nameRetriever is GomObjectData nameData) {
               AddWorldLoreCodexRetriever(nameData, node.Id, duplicateRetrievers);
-              Dictionary<string, string> localized = currentDom.StringTable.TryGetLocalizedStrings(node.Name, nameData);
+              Dictionary<string, string> localized = WorldLocAll(nameData);
               if (localized != null) foreach (string title in localized.Values) AddWorldLoreCodexCacheKey(title, node.Id, duplicateKeys);
             }
           } catch (Exception ex) {
@@ -302,11 +301,7 @@ namespace PugTools {
     }
 
     private static string WorldLoreCodexRetrieverKey(object retriever) {
-      if (!(retriever is GomObjectData data)) return null;
-      string bucket = WorldInteractionText(WorldInteractionDataValue(data, "strLocalizedTextRetrieverBucket", "4611686093000569993"));
-      ulong stringId = WorldInteractionUnsigned(WorldInteractionDataValue(data, "strLocalizedTextRetrieverStringID", "4611686093000569992"));
-      if (String.IsNullOrWhiteSpace(bucket) || stringId == 0) return null;
-      return bucket.Trim().ToLowerInvariant() + "|" + stringId.ToString(CultureInfo.InvariantCulture);
+      return WorldLocRetrieverKey(retriever);
     }
 
     private void AddWorldLoreCodexCacheKey(string value, ulong id, HashSet<string> duplicateKeys) {
@@ -445,38 +440,15 @@ namespace PugTools {
     }
 
     private static object WorldCodexDictionaryValue(object dictionary, ulong wanted) {
-      if (dictionary is GomObjectData gom) {
-        foreach (KeyValuePair<string, object> pair in gom.Dictionary)
-          if (WorldInteractionUnsigned(pair.Key) == wanted) return pair.Value;
-      }
-      if (dictionary is IDictionary map) {
-        IDictionaryEnumerator it = map.GetEnumerator();
-        while (it.MoveNext()) if (WorldInteractionUnsigned(it.Key) == wanted) return it.Value;
-      }
-      return null;
+      return WorldLocMapValue(dictionary, wanted);
     }
 
     private string WorldCodexLocalizedText(string context, object retriever) {
-      if (!(retriever is GomObjectData data)) return null;
-      try {
-        Dictionary<string, string> localized = currentDom?.StringTable?.TryGetLocalizedStrings(context ?? String.Empty, data);
-        string selected = WorldCodexPickLocalization(localized);
-        if (!String.IsNullOrWhiteSpace(selected)) return selected;
-        return currentDom?.StringTable?.TryGetString(context ?? String.Empty, data);
-      } catch { return null; }
+      return WorldLocText(retriever, context);
     }
 
     private static string WorldCodexPickLocalization(Dictionary<string, string> localized) {
-      if (localized == null || localized.Count == 0) return null;
-      string selected = GomLib.StringTable.SelectedLocalization ?? "enMale";
-      if (localized.TryGetValue(selected, out string exact) && !String.IsNullOrWhiteSpace(exact)) return exact;
-      string prefix = selected.StartsWith("de", StringComparison.OrdinalIgnoreCase) ? "de" :
-        selected.StartsWith("fr", StringComparison.OrdinalIgnoreCase) ? "fr" : "en";
-      foreach (KeyValuePair<string, string> pair in localized)
-        if (pair.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && !String.IsNullOrWhiteSpace(pair.Value)) return pair.Value;
-      foreach (KeyValuePair<string, string> pair in localized)
-        if (!String.IsNullOrWhiteSpace(pair.Value)) return pair.Value;
-      return null;
+      return GomLib.StringTable.SelectLocalizedText(localized);
     }
 
     private static int WorldInteractionInt32(object value) {

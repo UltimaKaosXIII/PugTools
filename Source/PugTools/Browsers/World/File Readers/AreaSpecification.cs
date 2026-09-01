@@ -88,6 +88,14 @@ namespace FileFormats {
     public string Icon { get; set; }
     public string Condition { get; set; }
     public Dictionary<string, string> LocalizedName { get; set; }
+    // Runtime-only metadata used by the World Browser. Authored .not entries leave these empty; synthetic service
+    // markers and quest enrichment fill them after the GOM/NPC/SPN population is loaded. Keeping the metadata on
+    // the shared lightweight note record means the D3D full map and WinForms minimap use identical tooltips/icons.
+    public bool IsSyntheticService { get; set; }
+    public string ServiceKind { get; set; }
+    public List<ulong> QuestIds { get; } = new List<ulong>();
+    public List<string> QuestNames { get; } = new List<string>();
+    public List<string> QuestObjectives { get; } = new List<string>();
     public long WonkaPackageId { get; set; }
     public ulong WonkaDestinationId { get; set; }
     public long AssetId { get; set; }

@@ -55,6 +55,7 @@
     int HasColorLut;
     float MapArtOpacity;
     float ViewerBlueGlow;
+    float4 MapArtTint;
     float4x4 TaaReprojection;
     // xy = inverse render-target size, zw = current sub-pixel jitter in pixel/texture coordinates.
     float4 TaaParams0;
@@ -880,7 +881,7 @@ float4 WaterPS(VSOut i):SV_Target {
     return ApplyFog(float4(color,saturate(alpha)),i);
 }
 
-float4 MapArtPS(VSOut i):SV_Target { float4 c=MapArtMap.Sample(LinearClamp,i.Tex); c.a*=MapArtOpacity; return c; }
+float4 MapArtPS(VSOut i):SV_Target { float4 c=MapArtMap.Sample(LinearClamp,i.Tex); c*=MapArtTint; c.a*=MapArtOpacity; return c; }
 float4 OverlayPS(VSOut i):SV_Target { return OverlayColor; }
 float4 ShadowVS(VSIn v):SV_POSITION { return mul(mul(float4(v.Pos,1),World),ViewProj); }
 float4 InstancedAlphaShadowPS(VSOut i):SV_Target {

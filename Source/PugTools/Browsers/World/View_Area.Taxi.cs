@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -360,6 +360,7 @@ namespace PugTools {
         taxiRouteMapActive = true;
       }
       SetMapOpen(true);
+      PrepareInteractiveTravelMapScope();
       FitTaxiRouteMap();
       if (Window is WorldBrowser browser) {
         browser.SetFullMapActive(true);
@@ -482,8 +483,22 @@ namespace PugTools {
         Vector4 color = colors[colorIndex++ % colors.Length];
         foreach (WorldTaxiRouteInfo leg in TaxiRideLegs(route)) {
           IList<AreaPathPoint> points = leg.Path?.Points; if (points == null || points.Count < 2) continue;
-          var segments = new List<Vector3>((points.Count - 1) * 2);
-          for (int i = 1; i < points.Count; i++) { segments.Add(points[i - 1].Position + Vector3.UnitY * .08f); segments.Add(points[i].Position + Vector3.UnitY * .08f); }
+          // D3D11 LineList is fixed at roughly one screen pixel. Draw five parallel copies in the map plane so the
+          // selected taxi network stays readable over bright terrain/textures, matching the stronger in-game route
+          // emphasis. The offset is converted from pixels to world units and rebuilt when the map zoom changes.
+          float worldPerPixel = Math.Max(mapVisibleWidth / Math.Max(1f, ClientWidth), mapVisibleHeight / Math.Max(1f, ClientHeight));
+          float[] pixelOffsets = { -1.6f, -.8f, 0f, .8f, 1.6f };
+          var segments = new List<Vector3>((points.Count - 1) * 2 * pixelOffsets.Length);
+          for (int i = 1; i < points.Count; i++) {
+            Vector3 a = points[i - 1].Position + Vector3.UnitY * .08f, b = points[i].Position + Vector3.UnitY * .08f;
+            Vector3 dir = b - a;
+            float len = (float)Math.Sqrt(dir.X * dir.X + dir.Z * dir.Z);
+            Vector3 side = len > .0001f ? new Vector3(-dir.Z / len, 0f, dir.X / len) : Vector3.UnitX;
+            foreach (float pixelOffset in pixelOffsets) {
+              Vector3 off = side * (pixelOffset * worldPerPixel);
+              segments.Add(a + off); segments.Add(b + off);
+            }
+          }
           taxiRouteMapGpu.Add(BuildLine(segments, color));
         }
         Vector3 d = TaxiRouteDestination(route) + Vector3.UnitY * .10f;

@@ -15,6 +15,9 @@ using AssetInstance = FileFormats.AssetInstance;
 namespace PugTools {
   public partial class WorldBrowser {
     private volatile string worldImplicitPhaseName = String.Empty;
+    // CLO files are siblings of their appearance GR2s. Keep the parsed asset attached to the shared GR2 object so
+    // cached NPP appearances can cheaply add the same cloth definition to every placement. Simulation is renderer-local.
+    private readonly Dictionary<GR2, WorldNpcClothAsset> worldNpcClothByModel = new Dictionary<GR2, WorldNpcClothAsset>();
 
     // Jedipedia uses a bundled beta/live marker catalogue. PugTools can resolve the live equivalents directly
     // from the selected SWTOR archives; missing beta-only markers fall back to a simple line gizmo in View_AREA.
@@ -112,6 +115,7 @@ namespace PugTools {
     private void LoadWorldNpcPlacements() {
       worldNpcPlacements.Clear();
       worldSpnPlacements.Clear();
+      worldNpcClothByModel.Clear();
       if (area == null || currentDom == null || currentAssets == null) return;
 
       var appearanceCache = new Dictionary<string, List<GR2>>(StringComparer.OrdinalIgnoreCase);
@@ -122,6 +126,7 @@ namespace PugTools {
       var spnDynCache = new Dictionary<string, SpnDynPreviewTemplate>(StringComparer.OrdinalIgnoreCase);
       var animationCache = new Dictionary<string, WorldNpcAnimationClip>(StringComparer.OrdinalIgnoreCase);
       var interactionCache = new Dictionary<string, WorldInteractionInfo>(StringComparer.OrdinalIgnoreCase);
+      var weaponModelCache = new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
       var spawnPointsByParent = BuildSpawnPointIndex();
       var speciesScales = LoadNpcSpeciesScales();
       int failures = 0;
@@ -132,7 +137,7 @@ namespace PugTools {
           string ext = (asset.Extension ?? String.Empty).Trim().ToLowerInvariant();
           try {
             if (ext == "cos") {
-              WorldNpcPlacement placement = ResolveClientOnlyNpc(room, instance, asset, appearanceCache, animationCache);
+              WorldNpcPlacement placement = ResolveClientOnlyNpc(room, instance, asset, appearanceCache, animationCache, weaponModelCache);
               if (placement != null) worldNpcPlacements.Add(placement);
               continue;
             }
@@ -157,7 +162,7 @@ namespace PugTools {
                     npc = currentDom.NpcLoader.Load(entityFqn);
                     npcCache[entityFqn] = npc;
                   }
-                  WorldNpcPlacement spnPlacement = BuildNpcPlacement(room, instance, entityFqn, npc, appearanceCache, speciesScales, idleAnimation, animationCache, interactionCache);
+                  WorldNpcPlacement spnPlacement = BuildNpcPlacement(room, instance, entityFqn, npc, appearanceCache, speciesScales, idleAnimation, animationCache, interactionCache, weaponModelCache);
                   if (spnPlacement != null) {
                     // Jedipedia only resolves pth.* ride routes for placeables. Applying the spawner's path to an NPC
                     // turns platform/elevator metadata into character locomotion and can make a creature race back and
@@ -559,7 +564,7 @@ namespace PugTools {
         hint.Contains("speeder_droid") || hint.Contains("speeder droid");
     }
 
-    private WorldNpcPlacement ResolveClientOnlyNpc(Room room, AssetInstance instance, AreaAsset asset, Dictionary<string, List<GR2>> appearanceCache, Dictionary<string, WorldNpcAnimationClip> animationCache) {
+    private WorldNpcPlacement ResolveClientOnlyNpc(Room room, AssetInstance instance, AreaAsset asset, Dictionary<string, List<GR2>> appearanceCache, Dictionary<string, WorldNpcAnimationClip> animationCache, Dictionary<string, GR2> weaponModelCache) {
       string fqn = (asset.Path ?? String.Empty).Replace('\\', '.').Replace('/', '.').Trim('.');
       if (!fqn.StartsWith("cos.", StringComparison.OrdinalIgnoreCase)) return null;
       GomObject obj = currentDom.GetObject(fqn);
@@ -582,19 +587,22 @@ namespace PugTools {
         bodyType = bodySlot?.BodyType;
       }
       bool clientTaxi = WorldNpcLooksLikeTaxiTerminal(fqn, fqn, null);
+      string idleAnimationName = SpawnerIdleAnimationName(instance);
       var placement = new WorldNpcPlacement {
         Room = room, Instance = instance, SourceFqn = fqn, Name = fqn, Scale = scale, ShowNameplate = false,
         IsTaxiTerminal = clientTaxi,
         Interaction = clientTaxi ? new WorldInteractionInfo { Kind = WorldInteractionKind.Taxi, LegacyHeuristic = true } : null,
-        BodyType = bodyType, Animation = ResolveNpcAnimationClip(null, bodyType, animationCache),
-        AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, fqn)
+        BodyType = bodyType, IdleAnimationName = idleAnimationName, Animation = ResolveNpcAnimationClip(idleAnimationName, bodyType, animationCache),
+        AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, fqn), CombatMode = ResolveNpcCombatMode(idleAnimationName)
       };
       foreach (GR2 model in GetNpcAppearanceModels(appearance, appearanceCache, bodyType)) placement.Models.Add(model);
+      AddNpcClothAssets(placement);
+      AddNpcWeaponAttachments(placement, visual, weaponModelCache);
       placement.Items = ResolveVisualItemNames(visual);
       return placement.Models.Count > 0 ? placement : null;
     }
 
-    private WorldNpcPlacement BuildNpcPlacement(Room room, AssetInstance instance, string sourceFqn, Npc npc, Dictionary<string, List<GR2>> appearanceCache, Dictionary<ulong, float> speciesScales, string idleAnimationName, Dictionary<string, WorldNpcAnimationClip> animationCache, Dictionary<string, WorldInteractionInfo> interactionCache) {
+    private WorldNpcPlacement BuildNpcPlacement(Room room, AssetInstance instance, string sourceFqn, Npc npc, Dictionary<string, List<GR2>> appearanceCache, Dictionary<ulong, float> speciesScales, string idleAnimationName, Dictionary<string, WorldNpcAnimationClip> animationCache, Dictionary<string, WorldInteractionInfo> interactionCache, Dictionary<string, GR2> weaponModelCache) {
       if (npc?.VisualDataList == null || npc.VisualDataList.Count == 0) return null;
       NpcVisualData visual = npc.VisualDataList.FirstOrDefault(x => x != null && !String.IsNullOrWhiteSpace(x.AppearanceFqn));
       if (visual == null) return null;
@@ -605,8 +613,7 @@ namespace PugTools {
         ulong speciesKey = unchecked((ulong)visual.SpeciesScale);
         if (speciesScales.TryGetValue(speciesKey, out float speciesScale) && speciesScale > 0f) scale *= speciesScale;
       }
-      string title = npc.Title;
-      if (npc.LocalizedTitle != null && npc.LocalizedTitle.TryGetValue(GomLib.StringTable.SelectedLocalization, out string localizedTitle) && !String.IsNullOrWhiteSpace(localizedTitle)) title = localizedTitle;
+      string title = LocalizedNpcTitle(npc, sourceFqn);
       string displayName = LocalizedNpcName(npc, sourceFqn);
       // The wearer character spec, not the NPP's authored body type, owns [bt]/[gen].
       // Jedipedia found thousands of appearance/wearer pairs where those differ.
@@ -628,9 +635,12 @@ namespace PugTools {
         Title = title, IsTaxiTerminal = isTaxiTerminal, Interaction = interaction,
         Scale = scale, Items = ResolveVisualItemNames(visual), ShowNameplate = true,
         RepublicReaction = npc.DetFaction?.RepublicReaction, ImperialReaction = npc.DetFaction?.ImperialReaction, HasFactionPackage = npc.DetFaction != null,
-        IdleAnimationName = idleAnimationName, AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn), BodyType = bodyType, Animation = animation
+        IdleAnimationName = idleAnimationName, AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn), BodyType = bodyType, Animation = animation,
+        CombatMode = ResolveNpcCombatMode(idleAnimationName)
       };
       foreach (GR2 model in GetNpcAppearanceModels(appearance, appearanceCache, bodyType)) placement.Models.Add(model);
+      AddNpcClothAssets(placement);
+      AddNpcWeaponAttachments(placement, visual, weaponModelCache);
       return placement.Models.Count > 0 ? placement : null;
     }
 
@@ -657,12 +667,27 @@ namespace PugTools {
           string cleanNetwork = AnimationStem(network);
           var clipCandidates = new[] { AnimationStem(action), AnimationStem(network), AnimationStem(displayName) }
             .Where(x => !String.IsNullOrWhiteSpace(x)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+          // Cheapest case first: the display/action is already the physical JBA name.
           foreach (string clipCandidate in clipCandidates) {
             foreach (NpcAnimationSpec spec in specs) {
               result = TryLoadNpcAnimationClip(spec, clipCandidate, cleanNetwork, displayName);
               if (result != null) break;
             }
             if (result != null) break;
+          }
+
+          // The important Morpheme case: hydAnimationAction / hydAnimationLocoNetwork can name a NETWORK rather than
+          // a clip. Walk that .mph's state machine and blend graph at its authored defaults, then load the JBA it
+          // selects. This replaces the old behaviour where a perfectly valid network name fell through to the generic
+          // standing idle simply because no <network>.jba file exists.
+          if (result == null) {
+            foreach (string networkCandidate in clipCandidates) {
+              foreach (NpcAnimationSpec spec in specs) {
+                result = TryLoadNpcAnimationNetworkRecipe(spec, networkCandidate, displayName);
+                if (result != null) break;
+              }
+              if (result != null) break;
+            }
           }
         }
 
@@ -681,6 +706,41 @@ namespace PugTools {
       }
       if (cache != null) cache[key] = result;
       return result;
+    }
+
+    private WorldNpcAnimationClip TryLoadNpcAnimationNetworkRecipe(NpcAnimationSpec spec, string networkName, string displayName) {
+      if (spec == null || String.IsNullOrWhiteSpace(networkName) || currentAssets == null) return null;
+      string stem = AnimationStem(networkName);
+      if (String.IsNullOrWhiteSpace(stem)) return null;
+
+      var categories = new List<string>();
+      void AddCategory(string category) {
+        if (!String.IsNullOrWhiteSpace(category) && !categories.Contains(category, StringComparer.OrdinalIgnoreCase))
+          categories.Add(category.Trim().ToLowerInvariant());
+      }
+      AddCategory(spec.Category);
+      foreach (string category in new[] { "humanoid", "creature", "droid", "npc", "pet" }) AddCategory(category);
+
+      foreach (string category in categories) {
+        string basePath = "/resources/anim/" + category + "/" + spec.Folder + "/";
+        using File mphFile = currentAssets.FindFile(basePath + stem + ".mph");
+        if (mphFile == null) continue;
+        try {
+          string clipName;
+          using (Stream mphStream = mphFile.OpenCopyInMemory()) using (var mphReader = new BinaryReader(mphStream)) {
+            ViewMPH.MphFileInfo mph = ViewMPH.Parse(mphReader);
+            clipName = AnimationStem(ViewMPH.ResolveInitialAnimation(mph));
+          }
+          if (String.IsNullOrWhiteSpace(clipName)) continue;
+          var exactSpec = new NpcAnimationSpec { Category = category, Folder = spec.Folder, SkeletonPath = spec.SkeletonPath };
+          WorldNpcAnimationClip clip = TryLoadNpcAnimationClip(exactSpec, clipName, stem, displayName);
+          if (clip != null) return clip;
+        }
+        catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("NPC Morpheme recipe failed " + basePath + stem + ".mph: " + ex.Message);
+        }
+      }
+      return null;
     }
 
     private static readonly string[] WorldConversationAnimationNetworks = {
@@ -708,8 +768,8 @@ namespace PugTools {
       return -1;
     }
 
-    private bool TryResolveNpcConversationNetworkClip(string value, NpcAnimationSpec spec, out string clipName, out string networkName) {
-      clipName = null; networkName = null;
+    private bool TryResolveNpcConversationNetworkClip(string value, NpcAnimationSpec spec, out string clipName, out string networkName, out JBARig exactRig) {
+      clipName = null; networkName = null; exactRig = null;
       if (currentAssets == null || spec == null || String.IsNullOrWhiteSpace(value)) return false;
       string[] wanted = value.Split(new[] { '.' }, StringSplitOptions.RemoveEmptyEntries)
         .Select(NormalizeNpcConversationPathSegment).Where(x => x.Length > 0).ToArray();
@@ -723,6 +783,7 @@ namespace PugTools {
       foreach (string category in new[] { "humanoid", "creature", "droid", "npc", "pet" }) AddCategory(category);
 
       string bestClip = null, bestNetwork = null;
+      JBARig bestRig = null;
       int bestLength = Int32.MaxValue;
       foreach (string category in categories) foreach (string network in WorldConversationAnimationNetworks) {
         string basePath = "/resources/anim/" + category + "/" + spec.Folder + "/";
@@ -744,7 +805,9 @@ namespace PugTools {
                 at = where + 1;
               }
               if (!matched || segments.Length >= bestLength) continue;
-              bestClip = AnimationStem(jba); bestNetwork = network; bestLength = segments.Length;
+              string candidateClip = AnimationStem(jba);
+              JBARig candidateRig = BuildNpcConversationExactRig(mph, section, node, candidateClip);
+              bestClip = candidateClip; bestNetwork = network; bestRig = candidateRig; bestLength = segments.Length;
             }
           }
         } catch (Exception ex) {
@@ -752,7 +815,273 @@ namespace PugTools {
         }
       }
       if (String.IsNullOrWhiteSpace(bestClip)) return false;
-      clipName = bestClip; networkName = bestNetwork; return true;
+      clipName = bestClip; networkName = bestNetwork; exactRig = bestRig; return true;
+    }
+
+    // A conversation action names an AnimSource NODE, not merely a JBA filename. The same physical JBA can occur in
+    // an AnimationList more than once with different RigToAnimMap entries. Picking the first filename match is therefore
+    // not authoritative: on Hutta dl_writhe_pain_03, for example, that maps the channel whose translation belongs to
+    // LeftElbow onto Head and the LeftWrist channel onto fc_cheek_left. Jedipedia carries the selected node's exact
+    // boneMappingIndex through mphParseNetworkClips() into mphBuildPoseRig(); preserve that index here as a concrete rig.
+    private static JBARig BuildNpcConversationExactRig(ViewMPH.MphFileInfo mph, ViewMPH.MphSection networkSection,
+        ViewMPH.MphNode node, string clipName) {
+      if (mph == null || networkSection?.Network == null || node == null || node.RigToAnimMap == UInt32.MaxValue) return null;
+      try {
+        ViewMPH.MphSection animationListSection = mph.Sections.FirstOrDefault(x => x.Type == 1 && x.Index == networkSection.Network.AnimationLibrarySectionIndex && x.AnimationList != null);
+        ViewMPH.MphAnimationSet fullSet = animationListSection?.AnimationList?.Sets.FirstOrDefault();
+        if (fullSet == null) return null;
+        ViewMPH.MphSection rigSection = mph.Sections.FirstOrDefault(x => x.Type == 2 && x.Index == fullSet.JointSectionIndex && x.Rig != null);
+        if (rigSection == null) rigSection = mph.Sections.FirstOrDefault(x => x.Type == 2 && x.Rig != null && x.Rig.Bones.Count > 0);
+        ViewMPH.MphSection mapSection = mph.Sections.FirstOrDefault(x => x.Type == 3 && x.Index == node.RigToAnimMap && x.RigMap != null);
+        if (rigSection?.Rig == null || mapSection?.RigMap == null || mapSection.RigMap.Entries.Count == 0) return null;
+
+        int maxAnimationChannel = mapSection.RigMap.Entries.Max(x => (int)x.AnimationChannel);
+        int[] animToRig = Enumerable.Repeat(-1, Math.Max(0, maxAnimationChannel + 1)).ToArray();
+        foreach (ViewMPH.MphRigMapEntry entry in mapSection.RigMap.Entries) {
+          if (entry.AnimationChannel < animToRig.Length) animToRig[entry.AnimationChannel] = entry.RigChannel;
+        }
+        var result = new JBARig { Source = (AnimationStem(clipName) ?? "clip") + "@map#" + node.RigToAnimMap, AnimToRig = animToRig };
+        foreach (ViewMPH.MphBone bone in rigSection.Rig.Bones) {
+          var q = new System.Numerics.Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw);
+          if (q.LengthSquared() > .000001f) q = System.Numerics.Quaternion.Normalize(q); else q = System.Numerics.Quaternion.Identity;
+          result.Bones.Add(new JBARigBone {
+            Name = bone.Name ?? String.Empty,
+            Parent = bone.Parent,
+            BindTranslation = new System.Numerics.Vector3(bone.X, bone.Y, bone.Z),
+            BindRotation = q
+          });
+        }
+        return result;
+      } catch { return null; }
+    }
+
+    // Some authored conversation actions already end in the physical JBA name. In that case there is no dotted
+    // Morpheme node path to preserve, but the AnimationList can still contain the same JBA more than once with
+    // different RigToAnimMap entries. FindRigForClip() necessarily picks the first one; that is not safe for clips
+    // such as dl_writhe_pain_03, where the wrong duplicate maps the LeftElbow channel to Head. The JBA itself gives
+    // us an authoritative discriminator: channels whose translation stride is effectively zero are exported rig
+    // offsets, so the correct mapping is the one whose mapped MPH bone bind translations best match those constants.
+    private bool TryResolveNpcConversationPhysicalClipRig(NpcAnimationSpec spec, string clipName,
+        out string networkName, out JBARig exactRig) {
+      networkName = null; exactRig = null;
+      if (spec == null || currentAssets == null || String.IsNullOrWhiteSpace(clipName)) return false;
+      string wanted = AnimationStem(clipName);
+      if (String.IsNullOrWhiteSpace(wanted)) return false;
+
+      var categories = new List<string>();
+      void AddCategory(string category) {
+        if (!String.IsNullOrWhiteSpace(category) && !categories.Contains(category, StringComparer.OrdinalIgnoreCase))
+          categories.Add(category.Trim().ToLowerInvariant());
+      }
+      AddCategory(spec.Category);
+      foreach (string category in new[] { "humanoid", "creature", "droid", "npc", "pet" }) AddCategory(category);
+
+      JBARig bestRig = null;
+      string bestNetwork = null;
+      string bestBasePath = null;
+      JBAAnimation bestAnimation = null;
+      double bestScore = Double.PositiveInfinity;
+      int bestCompared = -1;
+      int bestMapped = -1;
+
+      foreach (string category in categories) {
+        string basePath = "/resources/anim/" + category + "/" + spec.Folder + "/";
+        JBAAnimation animation = null;
+        using (File jbaFile = currentAssets.FindFile(basePath + wanted + ".jba")) {
+          if (jbaFile == null) continue;
+          try {
+            using Stream jbaStream = jbaFile.OpenCopyInMemory();
+            using var jbaReader = new BinaryReader(jbaStream);
+            animation = JBAReader.Read(jbaReader);
+            if (animation == null || animation.BoneCount <= 0) continue;
+            animation.PrepareSamples();
+          } catch { continue; }
+        }
+
+        foreach (string network in WorldConversationAnimationNetworks.Concat(new[] { "anim_library" })) {
+          using File mphFile = currentAssets.FindFile(basePath + network + ".mph");
+          if (mphFile == null) continue;
+          try {
+            ViewMPH.MphFileInfo mph;
+            using (Stream mphStream = mphFile.OpenCopyInMemory()) using (var mphReader = new BinaryReader(mphStream))
+              mph = ViewMPH.Parse(mphReader);
+            if (mph == null) continue;
+
+            foreach (ViewMPH.MphSection listSection in mph.Sections.Where(x => x.Type == 1 && x.AnimationList != null)) {
+              ViewMPH.MphAnimationList list = listSection.AnimationList;
+              // Jedipedia uses animation-list set 0 as the full humanoid rig. The remaining sets are the LOD ladder
+              // and intentionally drop channels, so they must not compete with the full mapping here.
+              ViewMPH.MphAnimationSet set = list.Sets.FirstOrDefault();
+              if (set == null) continue;
+              foreach (ViewMPH.MphAnimationEntry entry in set.Entries) {
+                if (entry.AnimationIndex >= list.JbaNames.Count ||
+                    !String.Equals(AnimationStem(list.JbaNames[(int)entry.AnimationIndex]), wanted, StringComparison.OrdinalIgnoreCase)) continue;
+                JBARig candidate = BuildNpcConversationRigFromMap(mph, set, entry.BoneMappingIndex, wanted);
+                if (candidate == null) continue;
+                double score = ScoreNpcConversationRigMap(animation, candidate, out int compared, out int mapped);
+                if (Double.IsInfinity(score) || Double.IsNaN(score)) continue;
+                // More constant channels compared is a stronger result. Only use mapped-count as a final tie breaker;
+                // a low-detail/wrong map must never win merely because it happens to bind many arbitrary names.
+                bool better = score + 1e-6 < bestScore ||
+                  (Math.Abs(score - bestScore) <= 1e-6 && compared > bestCompared) ||
+                  (Math.Abs(score - bestScore) <= 1e-6 && compared == bestCompared && mapped > bestMapped);
+                if (!better) continue;
+                candidate.Source = wanted + "@map#" + entry.BoneMappingIndex + "/score=" + score.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+                bestRig = candidate; bestNetwork = network; bestBasePath = basePath; bestAnimation = animation;
+                bestScore = score; bestCompared = compared; bestMapped = mapped;
+              }
+            }
+          } catch { }
+        }
+      }
+
+      if (bestRig == null) return false;
+
+      // A few copied humanoid conversation clips are listed under a RigToAnimMap whose channel order is plainly not
+      // the order carried by the JBA. The failure is unambiguous in the file data: several channels whose translation
+      // is constant (therefore an exported bind offset) land tens of Morpheme units away from the mapped bone's bind.
+      // Yalt's dl_writhe_pain_03 is the concrete case: the LeftElbow-sized channel lands on Head and LeftWrist on a
+      // cheek bone. Do NOT guess another same-name map. Jedipedia's pose path trusts source-bind evidence when deciding
+      // whether a mapping belongs to the clip; for a full 102-channel humanoid JBA the body's own locomotion-idle map
+      // is a safe reference channel order. It is accepted only when it covers the clip and removes every gross bind
+      // mismatch, so ordinary conversation maps never change.
+      int bestGross = CountNpcConversationGrossRigMismatches(bestAnimation, bestRig, 12f, out _, out _);
+      if (bestAnimation != null && bestAnimation.BoneCount >= 90 && bestGross >= 2 && !String.IsNullOrWhiteSpace(bestBasePath)) {
+        JBARig referenceRig = TryNpcConversationReferenceFullRig(bestBasePath, bestAnimation, out string referenceNetwork,
+          out double referenceScore, out int referenceCompared, out int referenceMapped, out int referenceGross);
+        if (referenceRig != null && referenceGross == 0 && referenceMapped >= Math.Max(4, bestAnimation.BoneCount * 3 / 4) &&
+            referenceScore + .000001 < bestScore) {
+          WorldConversationDiagnosticFileWrite(String.Format(System.Globalization.CultureInfo.InvariantCulture,
+            "CNV rig source-bind fallback {0}: {1} gross={2} score={3:0.###} -> {4} gross=0 score={5:0.###}",
+            wanted, bestRig.Source ?? "<rig>", bestGross, bestScore, referenceRig.Source ?? "<reference>", referenceScore));
+          referenceRig.Source = wanted + "@reference:" + (referenceRig.Source ?? "idle");
+          bestRig = referenceRig; bestNetwork = referenceNetwork; bestScore = referenceScore;
+          bestCompared = referenceCompared; bestMapped = referenceMapped;
+        }
+      }
+
+      exactRig = bestRig; networkName = bestNetwork;
+      WorldConversationDiagnosticFileWrite(String.Format(System.Globalization.CultureInfo.InvariantCulture,
+        "CNV physical rig selected {0} -> {1} score={2:0.###} constants={3} mapped={4}",
+        wanted, bestRig.Source ?? "<rig>", bestScore, bestCompared, bestMapped));
+      return true;
+    }
+
+    private JBARig TryNpcConversationReferenceFullRig(string basePath, JBAAnimation animation, out string networkName,
+        out double score, out int compared, out int mapped, out int gross) {
+      networkName = null; score = Double.PositiveInfinity; compared = 0; mapped = 0; gross = Int32.MaxValue;
+      if (String.IsNullOrWhiteSpace(basePath) || animation == null || currentAssets == null) return null;
+      JBARig best = null;
+      // ex_stand_idle_1 is the canonical humanoid rest ordering in current SWTOR; ex_idle_1 covers older folders.
+      foreach (var probe in new[] {
+        new { Network = "humanoid_loco_idle", Clip = "ex_stand_idle_1" },
+        new { Network = "humanoid_loco_idle", Clip = "ex_idle_1" },
+        new { Network = "anim_library", Clip = "ex_stand_idle_1" },
+        new { Network = "anim_library", Clip = "ex_idle_1" }
+      }) {
+        using File mphFile = currentAssets.FindFile(basePath + probe.Network + ".mph");
+        if (mphFile == null) continue;
+        try {
+          JBARig candidate;
+          using (Stream stream = mphFile.OpenCopyInMemory()) using (var reader = new BinaryReader(stream))
+            candidate = MPHAnimationReader.FindRigForClip(reader, probe.Clip);
+          if (candidate == null || candidate.AnimToRig == null) continue;
+          double candidateScore = ScoreNpcConversationRigMap(animation, candidate, out int candidateCompared, out int candidateMapped);
+          int candidateGross = CountNpcConversationGrossRigMismatches(animation, candidate, 12f, out _, out _);
+          if (Double.IsNaN(candidateScore) || Double.IsInfinity(candidateScore)) continue;
+          bool better = candidateGross < gross ||
+            (candidateGross == gross && candidateScore + 1e-6 < score) ||
+            (candidateGross == gross && Math.Abs(candidateScore - score) <= 1e-6 && candidateMapped > mapped);
+          if (!better) continue;
+          candidate.Source = probe.Network + ":" + probe.Clip;
+          best = candidate; networkName = probe.Network; score = candidateScore; compared = candidateCompared;
+          mapped = candidateMapped; gross = candidateGross;
+        } catch { }
+      }
+      return best;
+    }
+
+    private static int CountNpcConversationGrossRigMismatches(JBAAnimation animation, JBARig rig, float threshold,
+        out int compared, out int mapped) {
+      compared = 0; mapped = 0;
+      if (animation == null || rig?.AnimToRig == null || rig.Bones == null || rig.Bones.Count == 0) return Int32.MaxValue;
+      int count = Math.Max(0, animation.BoneCount);
+      if (count == 0) return Int32.MaxValue;
+      var samples = new JBATransform[count];
+      animation.SampleInto(0f, samples);
+      int gross = 0, limit = Math.Min(count, rig.AnimToRig.Length);
+      float threshold2 = threshold * threshold;
+      for (int channel = 0; channel < limit; channel++) {
+        int rigIndex = rig.AnimToRig[channel];
+        if (rigIndex < 0 || rigIndex >= rig.Bones.Count) continue;
+        mapped++;
+        if (!animation.UsesRigBindTranslation(channel) || !samples[channel].HasTranslation) continue;
+        System.Numerics.Vector3 sample = samples[channel].Translation;
+        System.Numerics.Vector3 bind = rig.Bones[rigIndex].BindTranslation;
+        if (!Single.IsFinite(sample.X) || !Single.IsFinite(sample.Y) || !Single.IsFinite(sample.Z) ||
+            !Single.IsFinite(bind.X) || !Single.IsFinite(bind.Y) || !Single.IsFinite(bind.Z)) continue;
+        float dx = sample.X - bind.X, dy = sample.Y - bind.Y, dz = sample.Z - bind.Z;
+        if (dx * dx + dy * dy + dz * dz > threshold2) gross++;
+        compared++;
+      }
+      return gross;
+    }
+
+    private static JBARig BuildNpcConversationRigFromMap(ViewMPH.MphFileInfo mph, ViewMPH.MphAnimationSet set,
+        UInt32 mappingIndex, string clipName) {
+      if (mph == null || set == null || mappingIndex == UInt32.MaxValue) return null;
+      try {
+        ViewMPH.MphSection rigSection = mph.Sections.FirstOrDefault(x => x.Type == 2 && x.Index == set.JointSectionIndex && x.Rig != null);
+        if (rigSection == null) rigSection = mph.Sections.FirstOrDefault(x => x.Type == 2 && x.Rig != null && x.Rig.Bones.Count > 0);
+        ViewMPH.MphSection mapSection = mph.Sections.FirstOrDefault(x => x.Type == 3 && x.Index == mappingIndex && x.RigMap != null);
+        if (rigSection?.Rig == null || mapSection?.RigMap == null || mapSection.RigMap.Entries.Count == 0) return null;
+        int maxAnimationChannel = mapSection.RigMap.Entries.Max(x => (int)x.AnimationChannel);
+        int[] animToRig = Enumerable.Repeat(-1, Math.Max(0, maxAnimationChannel + 1)).ToArray();
+        foreach (ViewMPH.MphRigMapEntry entry in mapSection.RigMap.Entries)
+          if (entry.AnimationChannel < animToRig.Length) animToRig[entry.AnimationChannel] = entry.RigChannel;
+        var result = new JBARig { Source = (AnimationStem(clipName) ?? "clip") + "@map#" + mappingIndex, AnimToRig = animToRig };
+        foreach (ViewMPH.MphBone bone in rigSection.Rig.Bones) {
+          var q = new System.Numerics.Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw);
+          if (q.LengthSquared() > .000001f) q = System.Numerics.Quaternion.Normalize(q); else q = System.Numerics.Quaternion.Identity;
+          result.Bones.Add(new JBARigBone {
+            Name = bone.Name ?? String.Empty, Parent = bone.Parent,
+            BindTranslation = new System.Numerics.Vector3(bone.X, bone.Y, bone.Z), BindRotation = q
+          });
+        }
+        return result;
+      } catch { return null; }
+    }
+
+    private static double ScoreNpcConversationRigMap(JBAAnimation animation, JBARig rig, out int compared, out int mapped) {
+      compared = 0; mapped = 0;
+      if (animation == null || rig?.AnimToRig == null || rig.Bones == null || rig.Bones.Count == 0) return Double.PositiveInfinity;
+      int count = Math.Max(0, animation.BoneCount);
+      if (count == 0) return Double.PositiveInfinity;
+      var samples = new JBATransform[count];
+      animation.SampleInto(0f, samples);
+      double error = 0.0;
+      int limit = Math.Min(count, rig.AnimToRig.Length);
+      for (int channel = 0; channel < limit; channel++) {
+        int rigIndex = rig.AnimToRig[channel];
+        if (rigIndex < 0 || rigIndex >= rig.Bones.Count) continue;
+        mapped++;
+        if (!animation.UsesRigBindTranslation(channel) || !samples[channel].HasTranslation) continue;
+        System.Numerics.Vector3 sample = samples[channel].Translation;
+        System.Numerics.Vector3 bind = rig.Bones[rigIndex].BindTranslation;
+        if (!Single.IsFinite(sample.X) || !Single.IsFinite(sample.Y) || !Single.IsFinite(sample.Z) ||
+            !Single.IsFinite(bind.X) || !Single.IsFinite(bind.Y) || !Single.IsFinite(bind.Z)) continue;
+        double dx = sample.X - bind.X, dy = sample.Y - bind.Y, dz = sample.Z - bind.Z;
+        double distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        // Log-like loss keeps one legitimately retargeted shoulder/root from dominating dozens of exact limb offsets,
+        // while still making Head<-LeftElbow style mismatches overwhelmingly more expensive than the correct map.
+        error += Math.Log(1.0 + distance * distance);
+        compared++;
+      }
+      if (compared < 4) return Double.PositiveInfinity;
+      double mean = error / compared;
+      // A mapping that covers only a tiny part of the JBA is not an alternative full-rig binding.
+      if (mapped < Math.Max(4, count / 4)) mean += 50.0;
+      return mean;
     }
 
     private WorldNpcAnimationClip ResolveNpcConversationAnimationClip(string value, string bodyType,
@@ -791,12 +1120,63 @@ namespace PugTools {
           }
         }
         List<NpcAnimationSpec> specs = ResolveNpcAnimationSpecs(bodyType);
-        // Most authored conversation values are paths THROUGH a Morpheme network, not filenames. Resolve the complete
-        // dotted path first (conversation.jedi.agree_2 -> dl_agree_jedi_2, robodirector.rd3 -> dl_rd_03), exactly as
-        // Jedipedia's mphParseNetworkClips()/viewerNpcAnimNetworkMatch does. Only then fall back to filename spellings.
+        // The authored Morpheme node is more specific than the physical JBA filename because it also selects the
+        // RigToAnimMap. Try that exact node first whenever the path can be resolved. This changes no fallback behavior:
+        // if the node/path cannot be decoded or its map binds nothing, the original P42 direct-JBA path below still wins.
         foreach (NpcAnimationSpec spec in specs) {
-          if (!TryResolveNpcConversationNetworkClip(value, spec, out string networkClip, out string matchedNetwork)) continue;
-          result = TryLoadNpcAnimationClip(spec, networkClip, matchedNetwork, value);
+          if (!TryResolveNpcConversationNetworkClip(value, spec, out string exactClip, out string exactNetwork, out JBARig exactRig) || exactRig == null) continue;
+          result = TryLoadNpcAnimationClip(spec, exactClip, exactNetwork, value, exactRig);
+          if (result != null) break;
+        }
+        // Jedipedia's cheapest physical-file fallback: the final dotted segment is already the physical JBA.
+        // Only when that file is absent do we interpret the complete value as a path through the Morpheme graph.
+        if (result == null && !String.IsNullOrWhiteSpace(leaf)) {
+          // Jedipedia deliberately separates "which conversation name means which physical clip" from "which MPH
+          // mapping poses that clip on this body type". After viewerNpcAnimConversationClip() has answered a physical
+          // leaf it calls the ordinary NPC resolver again. That second lookup is important: hydAnimationInfoPrototype
+          // can name a pose-specific hydAnimationLocoNetwork which is neither one of the generic conversation MPH files
+          // nor anim_library.mph. Loading the JBA directly skipped that authoritative mapping and is exactly how Yalt's
+          // dl_writhe_pain_03 ended up on anim_library map#4013.
+          ResolveNpcAnimationInfo(leaf, out string hydAction, out string hydNetwork);
+          if (!String.IsNullOrWhiteSpace(hydNetwork)) {
+            WorldNpcAnimationClip hydResolved = ResolveNpcAnimationClip(leaf, bodyType, null);
+            // ResolveNpcAnimationClip has an idle safety fallback for ordinary room population. A conversation beat must
+            // not silently turn into that idle when its named clip failed, so only accept a genuine resolution here.
+            string resolvedAction = AnimationStem(hydResolved?.Action);
+            bool idleFallback = String.Equals(resolvedAction, "ex_stand_idle_1", StringComparison.OrdinalIgnoreCase) ||
+                                String.Equals(resolvedAction, "ex_idle_1", StringComparison.OrdinalIgnoreCase);
+            if (hydResolved != null && !idleFallback) {
+              result = hydResolved;
+              WorldConversationDiagnosticFileWrite("CNV hyd mapping selected " + leaf +
+                " action=" + (hydAction ?? "<none>") + " network=" + (hydNetwork ?? "<none>") +
+                " -> " + (hydResolved.Action ?? "<none>") + "/" + (hydResolved.Network ?? "<none>") +
+                " rig=" + (hydResolved.Rig?.Source ?? "<named-jba>"));
+            }
+          }
+
+          // A physical leaf can still be ambiguous in the MPH AnimationList. If hydAnimationInfo had no authoritative
+          // mapping (or could not load it), retain the P52 candidate scorer strictly as a compatibility fallback.
+          foreach (NpcAnimationSpec spec in result == null ? specs : new List<NpcAnimationSpec>()) {
+            if (!TryResolveNpcConversationPhysicalClipRig(spec, leaf, out string physicalNetwork, out JBARig physicalRig)) continue;
+            result = TryLoadNpcAnimationClip(spec, leaf, physicalNetwork, value, physicalRig);
+            if (result != null) break;
+          }
+          if (result == null) {
+            foreach (NpcAnimationSpec spec in specs) {
+              foreach (string network in WorldConversationAnimationNetworks.Concat(new[] { "anim_library" })) {
+                result = TryLoadNpcAnimationClip(spec, leaf, network, value);
+                if (result != null) break;
+              }
+              if (result != null) break;
+            }
+          }
+        }
+        // Most remaining authored conversation values are paths THROUGH a Morpheme network, not filenames. Resolve
+        // every dotted segment in order (conversation.jedi.agree_2 -> dl_agree_jedi_2, robodirector.rd3 -> dl_rd_03)
+        // exactly as Jedipedia's mphParseNetworkClips()/viewerNpcAnimNetworkMatch does.
+        foreach (NpcAnimationSpec spec in result == null ? specs : new List<NpcAnimationSpec>()) {
+          if (!TryResolveNpcConversationNetworkClip(value, spec, out string networkClip, out string matchedNetwork, out JBARig exactRig)) continue;
+          result = TryLoadNpcAnimationClip(spec, networkClip, matchedNetwork, value, exactRig);
           if (result != null) break;
         }
         foreach (string candidate in result == null ? candidates : new List<string>()) {
@@ -1083,7 +1463,7 @@ namespace PugTools {
       return Path.GetFileNameWithoutExtension(name.Trim().Replace('\\', '/')).ToLowerInvariant();
     }
 
-    private WorldNpcAnimationClip TryLoadNpcAnimationClip(NpcAnimationSpec spec, string clipName, string networkName, string displayName) {
+    private WorldNpcAnimationClip TryLoadNpcAnimationClip(NpcAnimationSpec spec, string clipName, string networkName, string displayName, JBARig exactRig = null) {
       if (spec == null || String.IsNullOrWhiteSpace(clipName)) return null;
 
       // Jedipedia probes the character spec's category first and then the other SWTOR animation roots while keeping
@@ -1119,9 +1499,11 @@ namespace PugTools {
           .Take(Math.Min(animation.BoneNames.Count, Math.Max(0, animation.BoneCount)))
           .Any(name => !String.IsNullOrWhiteSpace(name) && !name.StartsWith("bone_", StringComparison.OrdinalIgnoreCase));
 
-        JBARig rig = null;
-        int boundBones = hasNamedChannels ? CountWorldNpcAnimationBindings(animation, null, skeleton) : 0;
+        JBARig rig = exactRig;
+        int boundBones = hasNamedChannels ? CountWorldNpcAnimationBindings(animation, null, skeleton) :
+          (rig != null ? CountWorldNpcAnimationBindings(animation, rig, skeleton) : 0);
         if (boundBones <= 0) {
+          rig = null;
           // Use the small authored network only when its exact RigToAnimMap actually binds this skeleton. If it names
           // the clip but points at a different LOD/rig, keep going to anim_library.mph just like Jedipedia does. The
           // previous code accepted any non-null JBARig and only discovered the zero-bone result later in the renderer.
@@ -1224,21 +1606,31 @@ namespace PugTools {
     }
 
     private string LocalizedNpcName(Npc npc, string fallbackFqn) {
-      if (npc == null) return PrettySpawnName(fallbackFqn);
-      string selected = GomLib.StringTable.SelectedLocalization;
+      // Read the node's language-independent retriever first. NpcLoader is useful for the rest of the template, but a
+      // visible label should not depend on the loader having indexed SelectedLocalization directly.
+      try {
+        GomObject node = currentDom?.GetObject(fallbackFqn);
+        object locMap = WorldInteractionDataValue(node?.Data, "locTextRetrieverMap", "4611686102842470023");
+        string rawName = WorldLocMapText(locMap, WorldLocNameSlot, fallbackFqn);
+        if (IsRealLocalizedName(rawName, fallbackFqn)) return rawName.Trim();
+      } catch { }
+      if (npc == null) return null;
       string localizedNpcName = WorldLocalizedText(npc.LocalizedName, npc.Name);
       if (IsRealLocalizedName(localizedNpcName, fallbackFqn)) return localizedNpcName.Trim();
       if (IsRealLocalizedName(npc.Name, fallbackFqn)) return npc.Name.Trim();
-      try {
-        GomLib.StringTable table = currentDom?.StringTable?.Find("str.npc");
-        if (table != null && npc.NameId != 0) {
-          string fromStrNpc = table.GetText(npc.NameId, fallbackFqn, selected);
-          if (IsRealLocalizedName(fromStrNpc, fallbackFqn)) return fromStrNpc.Trim();
-        }
-      } catch { }
-      // Unlike the initial asynchronous Jedipedia placeholder, this loader has already finished its STB lookup.
-      // If the localized text genuinely does not exist, leave the plate unnamed rather than leaking npc.* internals.
       return null;
+    }
+
+    private string LocalizedNpcTitle(Npc npc, string fallbackFqn) {
+      try {
+        GomObject node = currentDom?.GetObject(fallbackFqn);
+        object locMap = WorldInteractionDataValue(node?.Data, "locTextRetrieverMap", "4611686102842470023");
+        string rawTitle = WorldLocMapText(locMap, WorldLocTitleOrCodexNameSlot, fallbackFqn);
+        if (!String.IsNullOrWhiteSpace(rawTitle)) return rawTitle.Trim();
+      } catch { }
+      if (npc == null) return null;
+      string title = GomLib.StringTable.SelectLocalizedText(npc.LocalizedTitle, npc.Title);
+      return String.IsNullOrWhiteSpace(title) ? null : title.Trim();
     }
 
     private static bool IsRealLocalizedName(string text, string fqn) {
@@ -1301,14 +1693,9 @@ namespace PugTools {
         object rawLocMap = WorldInteractionDataValue(node.Data, "locTextRetrieverMap", "4611686102842470023");
         rawNameRetriever = WorldCodexDictionaryValue(rawLocMap, 15685385242400905286UL);
       }
-      string name = WorldLocalizedText(placeable?.LocalizedName, placeable?.Name);
-      if (!IsRealLocalizedName(name, sourceFqn) && rawNameRetriever != null) {
-        // PlaceableLoader itself indexes LocalizedName[SelectedLocalization] and can throw before filling CodexId/Name
-        // when a DE/FR PLC ships only the opposite gender row. Read the stable locTextRetrieverMap entry directly so
-        // knowledge objects remain name-resolvable even when the high-level Placeable could not be materialized.
-        string rawLocalizedName = WorldCodexLocalizedText(sourceFqn, rawNameRetriever);
-        if (IsRealLocalizedName(rawLocalizedName, sourceFqn)) name = rawLocalizedName;
-      }
+      // Like Jedipedia, resolve the authored (bucket,id) pair before consulting a model's cached localized string.
+      string name = rawNameRetriever == null ? null : WorldLocText(rawNameRetriever, sourceFqn);
+      if (!IsRealLocalizedName(name, sourceFqn)) name = WorldLocalizedText(placeable?.LocalizedName, placeable?.Name);
       if (!IsRealLocalizedName(name, sourceFqn)) name = PrettySpawnName(sourceFqn);
 
       // Tutorial/lore PLCs in a few generations do not expose plcCodexSpec through the normal prototype shape. Their
@@ -1381,6 +1768,8 @@ namespace PugTools {
       if (stateNames.Count == 0) stateNames.Add(null);
 
       var modelByVisual = new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
+      // The same MAG can mean a different Morpheme pose in every dyn state. Cache by visual + authored action rather
+      // than by visual alone, otherwise the first state's clip is incorrectly reused for every later state.
       var animationByVisual = new Dictionary<string, WorldNpcAnimationClip>(StringComparer.OrdinalIgnoreCase);
 
       foreach (string stateName in stateNames) {
@@ -1405,15 +1794,22 @@ namespace PugTools {
             break;
           }
 
+          string animationKey = visual + "|" + (action ?? String.Empty);
           if (!modelByVisual.TryGetValue(visual, out GR2 model)) {
             WorldNpcAnimationClip partAnimation = null;
-            model = isMag ? LoadSpnMag(visual, out partAnimation) : LoadSpnModel(visual);
+            model = isMag ? LoadSpnMag(visual, action, out partAnimation) : LoadSpnModel(visual);
             modelByVisual[visual] = model;
-            if (partAnimation != null) animationByVisual[visual] = partAnimation;
+            if (partAnimation != null) animationByVisual[animationKey] = partAnimation;
             if (model != null && !template.Models.Contains(model)) template.Models.Add(model);
           }
+          else if (isMag && !animationByVisual.ContainsKey(animationKey)) {
+            // The mesh is shared, the pose is not. Re-read only the tiny MAG/MPH metadata for this state's action;
+            // LoadSpnMag returns the same cached GR2 model path but resolves a fresh state-machine recipe.
+            LoadSpnMag(visual, action, out WorldNpcAnimationClip partAnimation);
+            if (partAnimation != null) animationByVisual[animationKey] = partAnimation;
+          }
           if (model == null) continue;
-          animationByVisual.TryGetValue(visual, out WorldNpcAnimationClip animation);
+          animationByVisual.TryGetValue(animationKey, out WorldNpcAnimationClip animation);
           state.Parts.Add(new WorldSpnDynPart {
             Model = model,
             LocalMatrix = SpnDynLocalMatrix(row),
@@ -1581,27 +1977,87 @@ namespace PugTools {
       return SpnDynInteger(rawType, -1) == 5;
     }
 
+    private sealed class SpnMagAamAction {
+      internal readonly Dictionary<string, float> Controls = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+      internal bool Hidden;
+    }
+
     private bool SpnMagActionHidden(string magReference, string action) {
-      if (String.IsNullOrWhiteSpace(magReference) || String.IsNullOrWhiteSpace(action) || currentAssets == null) return false;
+      return ReadSpnMagAamAction(magReference, action)?.Hidden == true;
+    }
+
+    // A dyn state names a Morpheme ACTION, not a JBA. The .aam metadata beside the MAG maps that action to input /
+    // control-parameter values. These values are fed into ViewMPH.ResolveInitialAnimation so the same state machine and
+    // blend switches Jedipedia evaluates decide which clip the object actually holds.
+    private SpnMagAamAction ReadSpnMagAamAction(string magReference, string action) {
+      if (String.IsNullOrWhiteSpace(magReference) || String.IsNullOrWhiteSpace(action) || currentAssets == null) return null;
       try {
         string magPath = NormalizeResourceAssetPath(magReference, null);
         using File file = currentAssets.FindFile(magPath);
-        if (file == null) return false;
+        if (file == null) return null;
         Dictionary<string, string> values;
         using (Stream stream = file.OpenCopyInMemory()) using (var reader = new StreamReader(stream)) values = ParseNpcSpec(reader.ReadToEnd());
-        if (!values.TryGetValue("AnimMetadataFqn", out string metadata) || String.IsNullOrWhiteSpace(metadata)) return false;
+        return ReadSpnMagAamAction(values, action);
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("MAG AAM action failed " + magReference + "/" + action + ": " + ex.Message);
+        return null;
+      }
+    }
+
+    private SpnMagAamAction ReadSpnMagAamAction(Dictionary<string, string> values, string action) {
+      if (values == null || String.IsNullOrWhiteSpace(action) || currentAssets == null) return null;
+      if (!values.TryGetValue("AnimMetadataFqn", out string metadata) || String.IsNullOrWhiteSpace(metadata)) return null;
+      try {
         string metadataPath = NormalizeResourceAssetPath(metadata, null);
         using File metadataFile = currentAssets.FindFile(metadataPath);
-        if (metadataFile == null) return false;
+        if (metadataFile == null) return null;
         string text;
         using (Stream stream = metadataFile.OpenCopyInMemory()) using (var reader = new StreamReader(stream)) text = reader.ReadToEnd();
-        string escaped = System.Text.RegularExpressions.Regex.Escape(action.Trim());
-        var match = System.Text.RegularExpressions.Regex.Match(text,
-          "<action\\s+name=\"" + escaped + "\"[^>]*>([\\s\\S]*?)</action>",
-          System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        return match.Success && System.Text.RegularExpressions.Regex.IsMatch(match.Groups[1].Value,
-          "<sa\\s+path=\"mv_hide\"", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-      } catch { return false; }
+        return ParseSpnMagAamAction(text, action);
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("MAG AAM metadata failed " + metadata + "/" + action + ": " + ex.Message);
+        return null;
+      }
+    }
+
+    private static SpnMagAamAction ParseSpnMagAamAction(string text, string action) {
+      if (String.IsNullOrWhiteSpace(text) || String.IsNullOrWhiteSpace(action)) return null;
+      string escaped = System.Text.RegularExpressions.Regex.Escape(action.Trim());
+      var actionMatch = System.Text.RegularExpressions.Regex.Match(text,
+        "<action\\s+name=\\\"" + escaped + "\\\"[^>]*>([\\s\\S]*?)</action>",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+      if (!actionMatch.Success) return null;
+
+      var inputs = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+      foreach (System.Text.RegularExpressions.Match input in System.Text.RegularExpressions.Regex.Matches(text,
+          "<input\\s+name=\\\"([^\\\"]+)\\\"\\s*>([\\s\\S]*?)</input>",
+          System.Text.RegularExpressions.RegexOptions.IgnoreCase)) {
+        var values = new List<string>();
+        foreach (System.Text.RegularExpressions.Match value in System.Text.RegularExpressions.Regex.Matches(input.Groups[2].Value,
+            "<value\\s+name=\\\"([^\\\"]*)\\\"", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+          values.Add(value.Groups[1].Value);
+        inputs[input.Groups[1].Value.Trim().ToLowerInvariant()] = values;
+      }
+
+      var result = new SpnMagAamAction();
+      result.Hidden = System.Text.RegularExpressions.Regex.IsMatch(actionMatch.Groups[1].Value,
+        "<sa\\s+path=\\\"mv_hide\\\"", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+      foreach (System.Text.RegularExpressions.Match assignment in System.Text.RegularExpressions.Regex.Matches(actionMatch.Groups[1].Value,
+          "<(in|cp)\\s+name=\\\"([^\\\"]+)\\\"\\s+value=\\\"([^\\\"]*)\\\"",
+          System.Text.RegularExpressions.RegexOptions.IgnoreCase)) {
+        string kind = assignment.Groups[1].Value;
+        string name = assignment.Groups[2].Value.Trim().ToLowerInvariant();
+        string value = assignment.Groups[3].Value;
+        if (String.Equals(kind, "cp", StringComparison.OrdinalIgnoreCase)) {
+          if (Single.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float numeric))
+            result.Controls[name] = numeric;
+          continue;
+        }
+        if (!inputs.TryGetValue(name, out List<string> declared)) continue;
+        int index = declared.FindIndex(x => String.Equals(x, value, StringComparison.Ordinal));
+        if (index >= 0) result.Controls[name] = index + 1;
+      }
+      return result;
     }
 
     private static readonly Dictionary<ulong, string> SpnDynLightPropertyNames = new Dictionary<ulong, string> {
@@ -1761,7 +2217,7 @@ namespace PugTools {
       if (String.IsNullOrWhiteSpace(reference) || output == null || !visited.Add(reference)) return;
       string referenceValue = reference.Trim();
       if (referenceValue.EndsWith(".mag", StringComparison.OrdinalIgnoreCase)) {
-        GR2 magModel = LoadSpnMag(referenceValue, out WorldNpcAnimationClip magAnimation);
+        GR2 magModel = LoadSpnMag(referenceValue, null, out WorldNpcAnimationClip magAnimation);
         if (magModel != null && !output.Contains(magModel)) output.Add(magModel);
         if (animation == null && magAnimation != null) animation = magAnimation;
         return;
@@ -1787,7 +2243,7 @@ namespace PugTools {
       }
     }
 
-    private GR2 LoadSpnMag(string magReference, out WorldNpcAnimationClip animation) {
+    private GR2 LoadSpnMag(string magReference, string action, out WorldNpcAnimationClip animation) {
       animation = null;
       try {
         string magPath = NormalizeResourceAssetPath(magReference, null);
@@ -1809,7 +2265,7 @@ namespace PugTools {
             if (i < model.materials.Count) model.materials[i] = material; else model.materials.Add(material);
           }
         }
-        animation = ResolveSpnMagAnimation(values);
+        animation = ResolveSpnMagAnimation(values, action);
         return model;
       } catch (Exception ex) {
         System.Diagnostics.Debug.WriteLine("SPN MAG failed " + magReference + ": " + ex.Message);
@@ -1817,19 +2273,62 @@ namespace PugTools {
       }
     }
 
-    private WorldNpcAnimationClip ResolveSpnMagAnimation(Dictionary<string, string> values) {
+    private WorldNpcAnimationClip ResolveSpnMagAnimation(Dictionary<string, string> values, string action) {
       if (values == null || currentAssets == null) return null;
-      if (!values.TryGetValue("AnimNetworkFolder", out string folder) || String.IsNullOrWhiteSpace(folder)) return null;
-      string prefix = values.TryGetValue("AnimNetworkPrefix", out string authoredPrefix) && !String.IsNullOrWhiteSpace(authoredPrefix) ? authoredPrefix.Trim() : "mags";
-      string relative = folder.Trim().Replace('\\', '/').Trim('/');
-      string mphPath = NormalizeResourceAssetPath(relative + "/" + prefix + ".mph", null);
+
+      string prefix = values.TryGetValue("AnimNetworkPrefix", out string authoredPrefix) && !String.IsNullOrWhiteSpace(authoredPrefix)
+        ? authoredPrefix.Trim() : "mags";
+      string mphPath = null;
+      if (values.TryGetValue("AnimNetworkFolder", out string folder) && !String.IsNullOrWhiteSpace(folder)) {
+        string relative = folder.Trim().Replace('\\', '/').Trim('/');
+        mphPath = NormalizeResourceAssetPath(relative + "/" + prefix + ".mph", null);
+      }
+
+      // Some older MAGs do not carry AnimNetworkFolder. Jedipedia reconstructs the network from the metadata stem and
+      // AnimationSetFolder; keep the same fallback so beta/legacy placeables can still reach their authored graph.
+      Boolean haveNetwork = false;
+      if (!String.IsNullOrWhiteSpace(mphPath)) {
+        using File networkProbe = currentAssets.FindFile(mphPath);
+        haveNetwork = networkProbe != null;
+      }
+      if (!haveNetwork &&
+          values.TryGetValue("AnimationSetFolder", out string setFolder) && !String.IsNullOrWhiteSpace(setFolder) &&
+          values.TryGetValue("Metadata", out string metadataName) && !String.IsNullOrWhiteSpace(metadataName)) {
+        string stem = Path.GetFileName(metadataName.Trim().Replace('\\', '/'));
+        stem = System.Text.RegularExpressions.Regex.Replace(stem, "^aam_", String.Empty, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        stem = System.Text.RegularExpressions.Regex.Replace(stem, "_\\d+(?:\\.\\d+)*\\.xml$", String.Empty, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        string relative = setFolder.Trim().Replace('\\', '/').Trim('/');
+        relative = System.Text.RegularExpressions.Regex.Replace(relative, "^art/dynamic/morpheme/", "anim/", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        mphPath = NormalizeResourceAssetPath(relative + "/" + stem + ".mph", null);
+        prefix = stem;
+      }
+      if (String.IsNullOrWhiteSpace(mphPath)) return null;
       using File mphFile = currentAssets.FindFile(mphPath);
       if (mphFile == null) return null;
 
-      List<string> candidates;
-      using (Stream mphStream = mphFile.OpenCopyInMemory()) using (var mphReader = new BinaryReader(mphStream))
-        candidates = MPHAnimationReader.FindIdleClipNames(mphReader);
-      if (candidates == null || candidates.Count == 0) return null;
+      var candidates = new List<string>();
+      void AddCandidate(string name) {
+        string stem = AnimationStem(name);
+        if (!String.IsNullOrWhiteSpace(stem) && !candidates.Contains(stem, StringComparer.OrdinalIgnoreCase)) candidates.Add(stem);
+      }
+
+      // First choice: the actual Morpheme graph under the AAM controls authored by this dyn state. The old heuristic
+      // list is retained only after this exact graph walk, so malformed/unknown networks remain backwards compatible.
+      try {
+        SpnMagAamAction aam = ReadSpnMagAamAction(values, action);
+        using Stream mphStream = mphFile.OpenCopyInMemory();
+        using var mphReader = new BinaryReader(mphStream);
+        ViewMPH.MphFileInfo mph = ViewMPH.Parse(mphReader);
+        AddCandidate(ViewMPH.ResolveInitialAnimation(mph, aam?.Controls));
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("MAG Morpheme recipe failed " + mphPath + "/" + (action ?? "<default>") + ": " + ex.Message);
+      }
+      try {
+        using Stream mphStream = mphFile.OpenCopyInMemory();
+        using var mphReader = new BinaryReader(mphStream);
+        foreach (string fallback in MPHAnimationReader.FindIdleClipNames(mphReader)) AddCandidate(fallback);
+      } catch { }
+      if (candidates.Count == 0) return null;
 
       int slash = mphPath.LastIndexOf('/');
       string directory = slash >= 0 ? mphPath.Substring(0, slash + 1) : "/resources/";
@@ -1857,7 +2356,14 @@ namespace PugTools {
           string stem = Path.GetFileNameWithoutExtension(modelSpec.Trim().Replace('\\', '/')).ToLowerInvariant();
           skeleton = LoadNpcAnimationSkeleton("/resources/art/dynamic/spec/" + stem + "_skeleton.gr2");
         }
-        return new WorldNpcAnimationClip { DisplayName = clipName, Action = clipName, Network = prefix, Animation = jba, Rig = rig, Skeleton = skeleton };
+        return new WorldNpcAnimationClip {
+          DisplayName = clipName,
+          Action = String.IsNullOrWhiteSpace(action) ? clipName : action,
+          Network = prefix,
+          Animation = jba,
+          Rig = rig,
+          Skeleton = skeleton
+        };
       }
       return null;
     }
@@ -1882,6 +2388,98 @@ namespace PugTools {
       } catch (Exception ex) {
         System.Diagnostics.Debug.WriteLine("SPN placeable model failed " + modelReference + ": " + ex.Message);
         return null;
+      }
+    }
+
+    // Jedipedia does not use the visual field (melee/ranged) as the final mode classifier. Some NPCs carry ranged
+    // weapons in a melee field; the equipped item's own itmSlotTypes is authoritative. The visual field remains the
+    // fallback and still decides which hand the weapon belongs to.
+    private int ResolveNpcWeaponItemMode(Item item, int fallback) {
+      if (item?.Slots == null) return fallback;
+      foreach (SlotType slot in item.Slots) {
+        switch (slot) {
+          case SlotType.EquipHumanMainHand:
+          case SlotType.EquipHumanOffHand:
+          case SlotType.EquipHumanCustomMelee:
+            return 2;
+          case SlotType.EquipHumanRanged:
+          case SlotType.EquipHumanRangedPrimary:
+          case SlotType.EquipHumanRangedSecondary:
+          case SlotType.EquipHumanRangedTertiary:
+          case SlotType.EquipHumanCustomRanged:
+            return 3;
+        }
+      }
+      return fallback;
+    }
+
+    private int ResolveNpcCombatMode(string idleAnimationName) {
+      if (String.IsNullOrWhiteSpace(idleAnimationName) || currentDom == null) return 1;
+      try {
+        GomObject packages = currentDom.GetObject("npcIdlePackagePrototype");
+        var packageMap = packages?.Data.ValueOrDefault<Dictionary<object, object>>("npcIdlePackageMap", null);
+        if (packageMap == null) return 1;
+        foreach (var pair in packageMap) {
+          if (!String.Equals(pair.Key?.ToString(), idleAnimationName, StringComparison.OrdinalIgnoreCase)) continue;
+          if (pair.Value is not GomObjectData row) return 1;
+          object raw = row.ValueOrDefault<object>("npcIdlePackageWeaponMode", null);
+          if (raw is ScriptEnum script) {
+            string text = script.ToString();
+            if (text.IndexOf("Melee", StringComparison.OrdinalIgnoreCase) >= 0) return 2;
+            if (text.IndexOf("Ranged", StringComparison.OrdinalIgnoreCase) >= 0) return 3;
+            if (text.IndexOf("Unarmed", StringComparison.OrdinalIgnoreCase) >= 0) return 4;
+            return 1;
+          }
+          long value = WonkInt64(raw);
+          // Raw enum values in serialized GOM are normally 1..4 here. Keep only the known staCombatMode range.
+          return value >= 1 && value <= 4 ? (int)value : 1;
+        }
+      } catch { }
+      return 1;
+    }
+
+    private void AddNpcWeaponAttachments(WorldNpcPlacement placement, NpcVisualData visual, Dictionary<string, GR2> modelCache) {
+      if (placement == null || visual == null) return;
+      AddNpcWeaponAttachment(placement, visual.MeleeWepId, 2, "rightweapon", modelCache);
+      AddNpcWeaponAttachment(placement, visual.MeleeOffWepId, 2, "leftweapon", modelCache);
+      AddNpcWeaponAttachment(placement, visual.RangedWepId, 3, "rightweapon", modelCache);
+      AddNpcWeaponAttachment(placement, visual.RangedOffWepId, 3, "leftweapon", modelCache);
+    }
+
+    private void AddNpcWeaponAttachments(WorldNpcPlacement placement, GomObjectData visual, Dictionary<string, GR2> modelCache) {
+      if (placement == null || visual == null) return;
+      AddNpcWeaponAttachment(placement, visual.ValueOrDefault<ulong>("npcTemplateVisualDataMeleeWeapon", 0), 2, "rightweapon", modelCache);
+      AddNpcWeaponAttachment(placement, visual.ValueOrDefault<ulong>("npcTemplateVisualDataMeleeOffWeapon", 0), 2, "leftweapon", modelCache);
+      AddNpcWeaponAttachment(placement, visual.ValueOrDefault<ulong>("npcTemplateVisualDataRangedWeapon", 0), 3, "rightweapon", modelCache);
+      AddNpcWeaponAttachment(placement, visual.ValueOrDefault<ulong>("npcTemplateVisualDataRangedOffWeapon", 0), 3, "leftweapon", modelCache);
+    }
+
+    private void AddNpcWeaponAttachment(WorldNpcPlacement placement, ulong itemId, int fallbackMode, string boneName, Dictionary<string, GR2> modelCache) {
+      if (placement == null || itemId == 0 || currentDom == null || currentAssets == null) return;
+      try {
+        Item item = currentDom.ItemLoader.Load(itemId);
+        WeaponAppearance appearance = item?.WeaponApp;
+        string modelPath = appearance?.Model;
+        if (String.IsNullOrWhiteSpace(modelPath)) modelPath = item?.Model;
+        if (String.IsNullOrWhiteSpace(modelPath) || !modelPath.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) return;
+        string normalized = NormalizeResourceAssetPath(modelPath, null);
+        if (!modelCache.TryGetValue(normalized, out GR2 model)) {
+          using File file = currentAssets.FindFile(normalized);
+          if (file == null) { modelCache[normalized] = null; return; }
+          using Stream stream = file.OpenCopyInMemory();
+          using var br = new BinaryReader(stream);
+          model = new GR2(br, normalized.Split('/').Last(), materials) { transformMatrix = Matrix.Identity };
+          modelCache[normalized] = model;
+        }
+        if (model == null) return;
+        placement.Weapons.Add(new WorldNpcWeaponAttachment {
+          ItemId = itemId,
+          Model = model,
+          BoneName = boneName,
+          WeaponMode = ResolveNpcWeaponItemMode(item, fallbackMode)
+        });
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("NPC weapon appearance failed " + itemId + ": " + ex.Message);
       }
     }
 
@@ -1980,15 +2578,42 @@ namespace PugTools {
             GR2 attached = new GR2(abr, attachPath.Split('/', '\\').Last());
             attached.materials = model.materials;
             attached.transformMatrix = Matrix.Scaling(new Vector3(1f, 1f, 1f));
+            RegisterNpcClothAsset(attached, attachPath);
             model.attachedModels.Add(attached);
           }
         }
         model.transformMatrix = Matrix.Scaling(new Vector3(1f, 1f, 1f));
+        RegisterNpcClothAsset(model, modelPath);
         return model;
       } catch (Exception ex) {
         System.Diagnostics.Debug.WriteLine("NPC appearance part failed " + modelPath + ": " + ex.Message);
         return null;
       }
+    }
+
+    private void RegisterNpcClothAsset(GR2 model, string modelPath) {
+      if (model == null || String.IsNullOrWhiteSpace(modelPath) || currentAssets == null || worldNpcClothByModel.ContainsKey(model)) return;
+      string normalized = modelPath.Replace('\\', '/');
+      int dot = normalized.LastIndexOf('.');
+      string clothPath = (dot >= 0 ? normalized.Substring(0, dot) : normalized) + ".clo";
+      if (!clothPath.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase)) clothPath = "/resources" + (clothPath.StartsWith("/") ? clothPath : "/" + clothPath);
+      try {
+        using File file = currentAssets.FindFile(clothPath);
+        if (file == null) return;
+        using Stream stream = file.OpenCopyInMemory();
+        ViewCLO.CloInfo parsed = ViewCLO.Parse(stream);
+        if (parsed?.Bones == null || parsed.Particles == null || parsed.Bones.Count == 0 || parsed.Particles.Count != parsed.Bones.Count) return;
+        worldNpcClothByModel[model] = new WorldNpcClothAsset { Model = model, SourcePath = clothPath, Cloth = parsed };
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("NPC CLO failed " + clothPath + ": " + ex.Message);
+      }
+    }
+
+    private void AddNpcClothAssets(WorldNpcPlacement placement) {
+      if (placement?.Models == null || placement.Models.Count == 0) return;
+      foreach (GR2 model in placement.Models)
+        if (model != null && worldNpcClothByModel.TryGetValue(model, out WorldNpcClothAsset cloth) && cloth != null && !placement.ClothAssets.Contains(cloth))
+          placement.ClothAssets.Add(cloth);
     }
 
     private GR2_Material RegisterNpcMaterial(string baseMaterial, string palette1, string palette2, NpcAppearance appearance, string slot, int index) {

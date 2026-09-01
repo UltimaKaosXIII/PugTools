@@ -199,16 +199,8 @@ namespace PugTools {
     }
 
     private static string WorldLocalizedText(Dictionary<string, string> localized, string fallback) {
-      string locale = GomLib.StringTable.SelectedLocalization ?? "enMale";
-      if (localized != null) {
-        if (localized.TryGetValue(locale, out string exact) && !String.IsNullOrWhiteSpace(exact)) return exact.Trim();
-        string language = locale.Length >= 2 ? locale.Substring(0, 2) : locale;
-        string close = localized.FirstOrDefault(x => x.Key.StartsWith(language, StringComparison.OrdinalIgnoreCase) && !String.IsNullOrWhiteSpace(x.Value)).Value;
-        if (!String.IsNullOrWhiteSpace(close)) return close.Trim();
-        string any = localized.Values.FirstOrDefault(x => !String.IsNullOrWhiteSpace(x));
-        if (!String.IsNullOrWhiteSpace(any)) return any.Trim();
-      }
-      return String.IsNullOrWhiteSpace(fallback) ? null : fallback.Trim();
+      string text = GomLib.StringTable.SelectLocalizedText(localized, fallback);
+      return String.IsNullOrWhiteSpace(text) ? null : text.Trim();
     }
 
     private static object WorldInteractionDataValue(GomObjectData data, string name, string numericName) {

@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
+using FileFormats;
 using SlimDX;
 using SlimDX.Direct3D11;
 using SlimDX.DXGI;
@@ -33,6 +34,9 @@ namespace PugTools {
       public object Owner;
       public WorldInteractionInfo Interaction;
       public Vector3 Anchor;
+      // Full world-space attachment frame for the authored FXSPEC. NPC effects use the literal NamePlate bone;
+      // legacy/static sprite fallbacks intentionally continue to use Anchor instead.
+      public Matrix? FxFrame;
       public Vector3 Screen;
       public Vector4 VisibilitySample;
       public float ScreenYOffset;
@@ -93,7 +97,13 @@ namespace PugTools {
             anchor = new Vector3(world.M41, world.M42 + 1.4f, world.M43);
             testPoint = anchor + new Vector3(0f, NpcNameplateTestLift, 0f);
           }
-          AddWorldInteractionIconEntry(entries, placement, placement.Interaction, anchor, testPoint, -24f,
+          Matrix? fxFrame = null;
+          if (placement.OverheadIconLocalFrame.HasValue) {
+            Matrix localFrame = placement.OverheadIconLocalFrame.Value;
+            Matrix.Multiply(ref localFrame, ref world, out Matrix attachedFrame);
+            if (NpcFinite(attachedFrame)) fxFrame = attachedFrame;
+          }
+          AddWorldInteractionIconEntry(entries, placement, placement.Interaction, anchor, testPoint, -24f, fxFrame,
             labelViewProj, depthViewProj, width, height);
         }
       }
@@ -115,7 +125,17 @@ namespace PugTools {
           if (dyn != null && dyn.Hidden) continue;
           Vector3 anchor;
           Vector3 testPoint;
-          if (TrySpnReceiverSphere(placement, world, dyn, out Vector3 center, out float radius)) {
+          Matrix? fxFrame = null;
+          // Placeables have no literal NamePlate bone. Keep this isolated from the NPC path: synthesize the same
+          // top attachment frame Jedipedia uses for bindpoints/mission boards, then let the authored FXSPEC apply
+          // its local offsets relative to that frame. No NPC skeleton/nameplate state is touched here.
+          if (TryWorldOverheadTopFrame(placement, dyn, world, out Matrix topFrame)) {
+            fxFrame = topFrame;
+            anchor = new Vector3(topFrame.M41, topFrame.M42, topFrame.M43);
+            Vector3 up = Vector3.TransformNormal(new Vector3(0f, 0f, -1f), topFrame);
+            if (up.LengthSquared() > .000001f) up.Normalize(); else up = Vector3.UnitY;
+            testPoint = anchor + up * NpcNameplateTestLift;
+          } else if (TrySpnReceiverSphere(placement, world, dyn, out Vector3 center, out float radius)) {
             float above = Math.Max(.3f, radius * .85f);
             anchor = center + new Vector3(0f, above, 0f);
             testPoint = center + new Vector3(0f, Math.Max(above, radius + NpcNameplateTestLift), 0f);
@@ -123,7 +143,7 @@ namespace PugTools {
             anchor = new Vector3(world.M41, world.M42 + 1.1f, world.M43);
             testPoint = anchor + new Vector3(0f, NpcNameplateTestLift, 0f);
           }
-          AddWorldInteractionIconEntry(entries, placement, placement.Interaction, anchor, testPoint, 0f,
+          AddWorldInteractionIconEntry(entries, placement, placement.Interaction, anchor, testPoint, 0f, fxFrame,
             labelViewProj, depthViewProj, width, height);
         }
       }
@@ -144,20 +164,78 @@ namespace PugTools {
           if (npcNameplateHasVisibility && !npcNameplateVisible.Contains(npcOwner)) continue;
         } else if (useOcclusion && !worldInteractionIconVisible.Contains(entry.Owner)) continue;
         bool drawn = false;
+        bool runtimeHandled = false;
         if (TryWorldInteractionOriginalFxSpec(entry.Interaction, out string fxSpecPath)) {
-          List<WorldOverheadSprite> sprites = ResolveWorldOverheadSprites(fxSpecPath);
-          if (sprites != null) foreach (WorldOverheadSprite sprite in sprites.Take(6))
-            drawn |= DrawWorldInteractionSpriteAt(sprite, entry.Anchor, entry.ScreenYOffset, labelViewProj, width, height);
+          // Primary path: the same authored FXSPEC -> PRT runtime model Jedipedia uses. The old static sprite
+          // extraction below is now only a compatibility fallback for malformed/legacy specs the structured host
+          // cannot own yet (GRANNY/FXSPEC child particle types, unusual beta marshal layouts, etc.).
+          runtimeHandled = TryDrawWorldInteractionFxPlayer(entry, fxSpecPath, labelViewProj, out bool runtimeDrawn);
+          drawn |= runtimeDrawn;
+          if (!runtimeHandled) {
+            List<WorldOverheadSprite> sprites = ResolveWorldOverheadSprites(fxSpecPath);
+            if (sprites != null) foreach (WorldOverheadSprite sprite in sprites.Take(6))
+              drawn |= DrawWorldInteractionSpriteAt(sprite, entry.Anchor, entry.ScreenYOffset, labelViewProj, width, height);
+          }
         }
-        // Older/beta clients can genuinely lack one of the canonical FX resources. Quest/taxi/bindpoint still get a
-        // visible bundled SWTOR map marker in that exceptional case, but never synthesize service glyphs such as '$'.
-        if (!drawn && TryWorldInteractionBundledFallbackTexture(entry.Interaction, out string textureKey))
+        // Older/beta clients can genuinely lack one of the canonical FX resources. Quest/taxi/bindpoint and mailbox
+        // interactions still get a visible bundled SWTOR marker in that exceptional case; no generic text/service
+        // glyphs such as '$' are synthesized.
+        if (!drawn && !runtimeHandled && TryWorldInteractionBundledFallbackTexture(entry.Interaction, out string textureKey))
           DrawWorldInteractionTextureAt(textureKey, entry.Anchor, entry.ScreenYOffset, labelViewProj, width, height);
       }
     }
 
+    private static bool TryWorldOverheadExpandBounds(GR2 model, Matrix localMatrix, ref bool have,
+        ref Vector3 min, ref Vector3 max) {
+      GR2_Bounding_Box box = model?.globalBox;
+      if (box == null) return false;
+      Vector3 lo = new Vector3(box.minX, box.minY, box.minZ);
+      Vector3 hi = new Vector3(box.maxX, box.maxY, box.maxZ);
+      if (!IsFinite(lo) || !IsFinite(hi)) return false;
+      for (int ix = 0; ix < 2; ix++) for (int iy = 0; iy < 2; iy++) for (int iz = 0; iz < 2; iz++) {
+        Vector3 point = new Vector3(ix == 0 ? lo.X : hi.X, iy == 0 ? lo.Y : hi.Y, iz == 0 ? lo.Z : hi.Z);
+        point = Vector3.TransformCoordinate(point, localMatrix);
+        if (!IsFinite(point)) continue;
+        if (!have) { min = max = point; have = true; }
+        else {
+          min.X = Math.Min(min.X, point.X); min.Y = Math.Min(min.Y, point.Y); min.Z = Math.Min(min.Z, point.Z);
+          max.X = Math.Max(max.X, point.X); max.Y = Math.Max(max.Y, point.Y); max.Z = Math.Max(max.Z, point.Z);
+        }
+      }
+      return have;
+    }
+
+    private static bool TryWorldOverheadTopFrame(WorldSpnPlacement placement, WorldSpnDynState dyn, Matrix world,
+        out Matrix frame) {
+      frame = Matrix.Identity;
+      if (placement == null) return false;
+      bool have = false;
+      Vector3 min = Vector3.Zero, max = Vector3.Zero;
+      if (dyn != null) {
+        if (dyn.Hidden) return false;
+        foreach (WorldSpnDynPart part in dyn.Parts)
+          if (part?.Model != null) TryWorldOverheadExpandBounds(part.Model, part.LocalMatrix, ref have, ref min, ref max);
+      } else if (placement.Models != null) {
+        foreach (GR2 model in placement.Models)
+          if (model != null) TryWorldOverheadExpandBounds(model, Matrix.Identity, ref have, ref min, ref max);
+      }
+      if (!have) return false;
+
+      // Row-vector equivalent of Jedipedia's synthetic placeable NamePlate frame:
+      // X stays X, local Y becomes +Z and local -Z becomes +Y.
+      Matrix local = Matrix.Identity;
+      local.M11 = 1f; local.M12 = 0f; local.M13 = 0f;
+      local.M21 = 0f; local.M22 = 0f; local.M23 = 1f;
+      local.M31 = 0f; local.M32 = -1f; local.M33 = 0f;
+      local.M41 = (min.X + max.X) * .5f;
+      local.M42 = max.Y;
+      local.M43 = (min.Z + max.Z) * .5f;
+      Matrix.Multiply(ref local, ref world, out frame);
+      return NpcFinite(frame);
+    }
+
     private void AddWorldInteractionIconEntry(List<WorldInteractionIconEntry> entries, object owner,
-        WorldInteractionInfo interaction, Vector3 anchor, Vector3 testPoint, float screenYOffset,
+        WorldInteractionInfo interaction, Vector3 anchor, Vector3 testPoint, float screenYOffset, Matrix? fxFrame,
         Matrix labelViewProj, Matrix depthViewProj, int width, int height) {
       if (entries == null || owner == null || interaction == null || !IsFinite(anchor) || !IsFinite(testPoint)) return;
       Vector3 screen = Vector3.Project(anchor, 0f, 0f, width, height, 0f, 1f, labelViewProj);
@@ -168,6 +246,7 @@ namespace PugTools {
         Owner = owner,
         Interaction = interaction,
         Anchor = anchor,
+        FxFrame = fxFrame,
         Screen = screen,
         ScreenYOffset = screenYOffset,
         VisibilitySample = new Vector4(
@@ -649,6 +728,11 @@ namespace PugTools {
         case WorldInteractionKind.MissionBoard: textureKey = "quest"; return true;
         case WorldInteractionKind.Taxi: textureKey = "taxi"; return true;
         case WorldInteractionKind.QuickTravel: textureKey = "bindpoint"; return true;
+        // Mailboxes expose their service through plcUtilityType=9. Jedipedia renders the authored envelope effect from
+        // the mailbox dyn row; PugTools does not yet preserve dyn FXSPEC rows, so use the bundled SWTOR mailbox
+        // map-note artwork as the world-space overhead marker. It follows the same visibility/occlusion rules as the
+        // other interaction icons above and therefore disappears behind walls together with the placeable.
+        case WorldInteractionKind.Mailbox: textureKey = "mailbox"; return true;
         default: return false;
       }
     }

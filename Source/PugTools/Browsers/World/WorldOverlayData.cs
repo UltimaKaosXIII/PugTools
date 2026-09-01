@@ -60,6 +60,24 @@ namespace PugTools {
     public SlimDX.Matrix Rotation { get; set; } = SlimDX.Matrix.Identity;
   }
 
+
+  internal sealed class WorldNpcClothAsset {
+    // The GR2 whose skinned mesh consumes the CLO particle bones. Parsed data is shared by every placement wearing
+    // the appearance part; simulation state remains placement-local in View_AREA.
+    public GR2 Model { get; set; }
+    public string SourcePath { get; set; }
+    public ViewCLO.CloInfo Cloth { get; set; }
+  }
+
+  internal sealed class WorldNpcWeaponAttachment {
+    public GR2 Model { get; set; }
+    // Canonical rig bone name used by SWTOR/Jedipedia for held weapons.
+    public string BoneName { get; set; }
+    // staCombatMode: 1=None, 2=Melee, 3=Ranged, 4=Unarmed.
+    public int WeaponMode { get; set; }
+    public ulong ItemId { get; set; }
+  }
+
   internal sealed class WorldNpcPlacement {
     public FileFormats.Room Room { get; set; }
     public FileFormats.AssetInstance Instance { get; set; }
@@ -81,6 +99,10 @@ namespace PugTools {
     // Temporary authored conversation animation. The world conversation player owns this override and clears it
     // when a line/player session ends; normal idle/locomotion animation remains untouched underneath.
     public WorldNpcAnimationClip ConversationAnimation { get; set; }
+    // FaceFX is a placement-local overlay on top of the Morpheme/JBA pose. It is intentionally not stored on the
+    // shared animation clip: two actors can play the same body clip while only the speaking placement has a face.
+    public WorldNpcFaceFxClip ConversationFaceFx { get; set; }
+    public float ConversationFaceFxStart { get; set; }
     public float ConversationAnimationStart { get; set; }
     public float ConversationAnimationOffset { get; set; }
     public float ConversationAnimationSpeed { get; set; } = 1f;
@@ -88,6 +110,9 @@ namespace PugTools {
     // Temporary staging overrides owned by the conversation player. They are restored when playback stops.
     public SlimDX.Matrix? ConversationWorld { get; set; }
     public bool ConversationHidden { get; set; }
+    // Conversation previews synthesize the local player even though no AREA AssetInstance exists for them. The
+    // renderer treats this placement like an ordinary animated NPC, but skips authored-instance/dPVS gates.
+    public bool ConversationVirtual { get; set; }
     // Optional locomotion clips resolved from the body type's Morpheme/anim_library network. A routed NPC should not
     // slide through the world while its skeleton keeps playing the idle pose.
     public WorldNpcAnimationClip WalkAnimation { get; set; }
@@ -95,6 +120,10 @@ namespace PugTools {
     public bool ShowNameplate { get; set; }
     public float Scale { get; set; } = 1f;
     public SlimDX.Vector3? NameplateLocal { get; set; }
+    // Exact literal NamePlate bone frame used by authored overhead FXSPEC effects. Unlike the text nameplate anchor,
+    // this must preserve bone orientation: SWTOR marker specs commonly offset along local -Z, which the NamePlate
+    // frame rotates into viewer-up. Keeping it separate prevents attach_nameplate text priorities from moving FX.
+    public SlimDX.Matrix? OverheadIconLocalFrame { get; set; }
     // spnEntityList is a list of alternatives, not a group. All alternatives share one clock and only the selected
     // slot is drawn. Keeping this on the placement lets NPC and PLC alternatives use the same deterministic logic.
     public int VariantIndex { get; set; }
@@ -105,7 +134,21 @@ namespace PugTools {
     public FileFormats.AreaPath Route { get; set; }
     public int TraversalStyle { get; set; } = 1;
     public readonly List<WorldSpawnPointPose> SpawnPoints = new List<WorldSpawnPointPose>();
+    // Weapon geometry is not part of the skinned appearance mesh. It is a rigid child of LeftWeapon/RightWeapon and
+    // is gated by the placement's current combat mode, exactly like Jedipedia's merged npcWeapon meshes.
+    public int CombatMode { get; set; } = 1;
+    public readonly List<WorldNpcWeaponAttachment> Weapons = new List<WorldNpcWeaponAttachment>();
+    // Shared parsed CLO assets. Each wearer gets its own Verlet state in the renderer.
+    public readonly List<WorldNpcClothAsset> ClothAssets = new List<WorldNpcClothAsset>();
     public readonly List<GR2> Models = new List<GR2>();
+  }
+
+  internal sealed class WorldNpcFaceFxClip {
+    public ViewFXA.FxaInfo Actor { get; set; }
+    public ViewFXE.Animation Animation { get; set; }
+    // Prepared once when the clip is assembled. Face graph evaluation is then only array math in the render loop.
+    public readonly Dictionary<string, int> NodeByName = new Dictionary<string, int>(System.StringComparer.OrdinalIgnoreCase);
+    public readonly Dictionary<string, ViewFXA.Bone> BoneByName = new Dictionary<string, ViewFXA.Bone>(System.StringComparer.OrdinalIgnoreCase);
   }
 
   internal sealed class WorldNpcAnimationClip {

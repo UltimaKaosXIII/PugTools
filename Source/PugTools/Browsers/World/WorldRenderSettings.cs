@@ -67,11 +67,22 @@
     public bool ShowMapIconBindpoints { get; set; } = false;
     public bool ShowMapIconMapLinks { get; set; } = false;
     public bool ShowMapIconQuests { get; set; } = false;
+    public bool ShowMapIconExplorationQuests { get; set; } = false;
     public bool ShowMapIconTaxi { get; set; } = false;
+    public bool ShowMapIconVendors { get; set; } = false;
+    public bool ShowMapIconClassTrainers { get; set; } = false;
+    public bool ShowMapIconCrewTrainers { get; set; } = false;
+    public bool ShowMapIconResources { get; set; } = false;
+    public bool ShowMapIconMailboxes { get; set; } = false;
+    public bool ShowMapIconEnhancementStations { get; set; } = false;
+    public bool ShowMapIconCargoHold { get; set; } = false;
+    public bool ShowMapIconGalacticMarket { get; set; } = false;
     public bool ShowMapIconWonkavator { get; set; } = false;
     public bool ShowMapIconOther { get; set; } = false;
     public bool AnyMapIconEnabled => ShowMapIconBindpoints || ShowMapIconMapLinks || ShowMapIconQuests ||
-      ShowMapIconTaxi || ShowMapIconWonkavator || ShowMapIconOther;
+      ShowMapIconExplorationQuests || ShowMapIconTaxi || ShowMapIconVendors || ShowMapIconClassTrainers ||
+      ShowMapIconCrewTrainers || ShowMapIconResources || ShowMapIconMailboxes || ShowMapIconEnhancementStations ||
+      ShowMapIconCargoHold || ShowMapIconGalacticMarket || ShowMapIconWonkavator || ShowMapIconOther;
     public bool EnablePostProcessing { get; set; } = true;
     public bool EnableLocalLights { get; set; } = true;
     public bool EnableRoomVisibility { get; set; } = false;

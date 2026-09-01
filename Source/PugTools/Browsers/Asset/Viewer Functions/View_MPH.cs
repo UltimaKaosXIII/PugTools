@@ -52,6 +52,30 @@ namespace PugTools {
       internal readonly Dictionary<String, String> Fields = new Dictionary<String, String>();
       internal readonly List<UInt32> Flow = new List<UInt32>();
       internal readonly List<UInt32> Control = new List<UInt32>();
+
+      // Typed runtime fields used by the World Browser's lightweight Morpheme evaluator. Keeping them beside the
+      // inspector data means the Asset Browser and the runtime decode the exact same graph instead of maintaining two
+      // subtly different MPH parsers.
+      internal Single DefaultValue;
+      internal UInt32 AnimationEntry = UInt32.MaxValue;
+      internal String AnimationName;
+      internal UInt32 RigToAnimMap = UInt32.MaxValue;
+      internal UInt32 To = UInt32.MaxValue;
+      internal UInt32 WeightControl = UInt32.MaxValue;
+      internal UInt32 Operation;
+      internal Single Constant0;
+      internal readonly List<Single> Weights = new List<Single>();
+      internal MphStateMachine StateMachine;
+    }
+
+    internal sealed class MphStateMachine {
+      internal UInt32 DefaultState;
+      internal readonly List<MphState> States = new List<MphState>();
+    }
+
+    internal sealed class MphState {
+      internal UInt32 Node;
+      internal readonly List<UInt32> Exits = new List<UInt32>();
     }
 
     internal sealed class MphAnimationList {
@@ -406,89 +430,130 @@ namespace PugTools {
 
       switch (node.Type) {
         case 20:
-          node.Fields["Default value"] = F(0).ToString("0.#######", CultureInfo.InvariantCulture);
+          node.DefaultValue = F(0);
+          node.Fields["Default value"] = node.DefaultValue.ToString("0.#######", CultureInfo.InvariantCulture);
           break;
         case 104: {
           UInt32 animIndex = U(0);
+          node.AnimationEntry = animIndex;
           node.Fields["Animation entry"] = animIndex.ToString(CultureInfo.InvariantCulture);
           node.Fields["Has event track"] = ((end - start) >= (is64 ? 88 : 72)).ToString();
           String name = ResolveAnimationName(animationList, animIndex, out UInt32 mapping);
+          node.AnimationName = name;
+          node.RigToAnimMap = mapping;
           if (!String.IsNullOrWhiteSpace(name)) node.Fields["JBA"] = name + ".jba";
           if (mapping != UInt32.MaxValue) node.Fields["RigToAnimMap"] = mapping.ToString(CultureInfo.InvariantCulture);
           break;
         }
         case 402:
         case 401:
+          node.To = U(1);
           node.Fields["From"] = FormatNodeRef(U(0));
-          node.Fields["To"] = FormatNodeRef(U(1));
+          node.Fields["To"] = FormatNodeRef(node.To);
           if (node.Type == 402) node.Fields["Duration"] = F(2).ToString("0.###", CultureInfo.InvariantCulture) + " s";
-          flow(U(0)); flow(U(1));
+          flow(U(0)); flow(node.To);
           break;
         case 107:
         case 101:
           flow(U(0)); flow(U(1));
-          ctrl(U(2) & 0xFFFF);
-          node.Fields["Weight control"] = FormatNodeRef(U(2) & 0xFFFF);
+          node.WeightControl = U(2) & 0xFFFF;
+          ctrl(node.WeightControl);
+          node.Fields["Weight control"] = FormatNodeRef(node.WeightControl);
           break;
         case 109:
           flow(U(0)); ctrl(U(1) & 0xFFFF);
           break;
         case 111:
           ctrl(U(0) & 0xFFFF); ctrl(U(1) & 0xFFFF);
-          node.Fields["Operation"] = ArithmeticOperationName(U(2));
+          node.Operation = U(2);
+          node.Fields["Operation"] = ArithmeticOperationName(node.Operation);
           break;
         case 112:
           ctrl(U(0) & 0xFFFF);
-          node.Fields["Operation"] = U(1).ToString(CultureInfo.InvariantCulture);
+          node.Operation = U(1);
+          node.Constant0 = F(2);
+          node.Fields["Operation"] = node.Operation.ToString(CultureInfo.InvariantCulture);
           node.Fields["Constants"] = F(2).ToString("0.####", CultureInfo.InvariantCulture) + ", " + F(3).ToString("0.####", CultureInfo.InvariantCulture);
           break;
         case 108: {
-          ctrl(U(1) & 0xFFFF);
-          UInt32 count = U(3);
+          node.WeightControl = U(1) & 0xFFFF;
+          ctrl(node.WeightControl);
+          UInt32 count = Math.Min(U(3), numNodes);
           node.Fields["Sources"] = count.ToString(CultureInfo.InvariantCulture);
-          for (UInt32 i = 0; i < count && 4U + 2U * i < (UInt32)words; i++) flow(U(4 + checked((Int32)(2U * i))));
+          for (UInt32 i = 0; i < count && 5U + 2U * i < (UInt32)words; i++) {
+            flow(U(4 + checked((Int32)(2U * i))));
+            node.Weights.Add(F(5 + checked((Int32)(2U * i))));
+          }
           break;
         }
         case 102: {
-          ctrl(U(4) & 0xFFFF);
-          UInt32 count = U(6);
+          node.WeightControl = U(4) & 0xFFFF;
+          ctrl(node.WeightControl);
+          UInt32 count = Math.Min(U(6), numNodes);
           node.Fields["Sources"] = count.ToString(CultureInfo.InvariantCulture);
-          for (UInt32 i = 0; i < count && 7U + 2U * i < (UInt32)words; i++) flow(U(7 + checked((Int32)(2U * i))));
+          for (UInt32 i = 0; i < count && 8U + 2U * i < (UInt32)words; i++) {
+            flow(U(7 + checked((Int32)(2U * i))));
+            node.Weights.Add(F(8 + checked((Int32)(2U * i))));
+          }
           break;
         }
         case 198:
         case 199: {
-          ctrl(U(9) & 0xFFFF);
-          UInt32 count = U(10);
+          node.WeightControl = U(9) & 0xFFFF;
+          ctrl(node.WeightControl);
+          UInt32 count = Math.Min(U(10), numNodes);
           node.Fields["Sources"] = count.ToString(CultureInfo.InvariantCulture);
           Int32 baseWord = node.Type == 199 ? 12 : 11;
-          for (UInt32 i = 0; i < count && (Int64)baseWord + 2L * i < words; i++) flow(U(baseWord + checked((Int32)(2U * i))));
+          for (UInt32 i = 0; i < count && (Int64)baseWord + 1L + 2L * i < words; i++) {
+            flow(U(baseWord + checked((Int32)(2U * i))));
+            node.Weights.Add(F(baseWord + checked((Int32)(2U * i)) + 1));
+          }
           break;
         }
         case 10:
           node.Fields["Default state"] = U(0).ToString(CultureInfo.InvariantCulture);
           node.Fields["State count"] = U(1).ToString(CultureInfo.InvariantCulture);
-          DecodeStateMachineRefs(br, node, numNodes, is64);
+          node.StateMachine = DecodeStateMachine(br, node, numNodes, is64);
           break;
       }
     }
 
-    private static void DecodeStateMachineRefs(BinaryReader br, MphNode node, UInt32 numNodes, Boolean is64) {
+    private static MphStateMachine DecodeStateMachine(BinaryReader br, MphNode node, UInt32 numNodes, Boolean is64) {
       Int64 start = node.PayloadStart;
       Int64 end = node.PayloadEnd;
       Int64 len = end - start;
-      if (len < (is64 ? 32 : 20)) return;
-      UInt32 numStates = ReadUInt32At(br, start + 4);
+      if (len < (is64 ? 32 : 20)) return null;
+
+      MphStateMachine result = new MphStateMachine {
+        DefaultState = ReadUInt32At(br, start)
+      };
+      UInt32 numStates = Math.Min(ReadUInt32At(br, start + 4), 8192);
       UInt32 stateDefsPtr = ReadUInt32At(br, start + 8);
       Int64 stateBase = stateDefsPtr >= 8 ? start + stateDefsPtr - 8 : -1;
       Int32 stride = is64 ? 32 : 20;
-      if (stateBase < start || stateBase >= end) return;
-      UInt32 cap = Math.Min(numStates, 8192);
-      for (UInt32 i = 0; i < cap; i++) {
+      Int32 transitionStride = is64 ? 16 : 12;
+      if (stateBase < start || stateBase >= end) return result;
+
+      for (UInt32 i = 0; i < numStates; i++) {
         Int64 p = stateBase + i * (Int64)stride;
         if (p < start || p + 4 > end) break;
-        AddNodeRef(node.Flow, ReadUInt32At(br, p), numNodes);
+        MphState state = new MphState { Node = ReadUInt32At(br, p) };
+        AddNodeRef(node.Flow, state.Node, numNodes);
+
+        Int64 transitionCountPos = p + (is64 ? 16 : 12);
+        Int64 transitionOffsetPos = p + (is64 ? 24 : 16);
+        if (transitionOffsetPos + 4 <= end) {
+          UInt32 numTransitions = Math.Min(ReadUInt32At(br, transitionCountPos), 512);
+          UInt32 transitionsOffset = ReadUInt32At(br, transitionOffsetPos);
+          for (UInt32 t = 0; t < numTransitions; t++) {
+            Int64 record = p + transitionsOffset + t * (Int64)transitionStride;
+            if (record < start || record + 4 > end) break;
+            state.Exits.Add(ReadUInt32At(br, record));
+          }
+        }
+        result.States.Add(state);
       }
+      return result;
     }
 
     private static String ResolveAnimationName(MphAnimationList list, UInt32 entryIndex, out UInt32 mapping) {
@@ -502,6 +567,176 @@ namespace PugTools {
       }
       if (entryIndex < list.JbaNames.Count) return list.JbaNames[(Int32)entryIndex];
       return null;
+    }
+
+    /// <summary>
+    /// Evaluate the authored default pose of the first playable Morpheme network. This mirrors Jedipedia's
+    /// mphParseIdleRecipe(): settle a type-10 state machine, evaluate its control-parameter driven blends/switches,
+    /// and return the animation node carrying the greatest weight. AAM values can override control-parameter nodes.
+    /// </summary>
+    internal static String ResolveInitialAnimation(MphFileInfo info, IReadOnlyDictionary<String, Single> controls = null) {
+      if (info == null) return null;
+      foreach (MphSection section in info.Sections) {
+        MphNetwork network = section.Network;
+        if (section.Type != 0 || network == null || network.Nodes.Count == 0) continue;
+        MphNode chosen = ResolveInitialAnimationNode(network, controls);
+        if (chosen != null && !String.IsNullOrWhiteSpace(chosen.AnimationName)) return chosen.AnimationName;
+      }
+      return null;
+    }
+
+    internal static MphNode ResolveInitialAnimationNode(MphNetwork network, IReadOnlyDictionary<String, Single> controls = null) {
+      if (network == null || network.Nodes.Count == 0) return null;
+      Dictionary<UInt32, MphNode> byIndex = network.Nodes
+        .GroupBy(x => x.Index).ToDictionary(x => x.Key, x => x.First());
+      MphNode Node(UInt32 index) {
+        if (byIndex.TryGetValue(index, out MphNode exact)) return exact;
+        return index < network.Nodes.Count ? network.Nodes[(Int32)index] : null;
+      }
+
+      MphNode root = MorphemeNetworkRoot(network, Node);
+      if (root == null) return network.Nodes.FirstOrDefault(x => x.Type == 104 && !String.IsNullOrWhiteSpace(x.AnimationName));
+      UInt32 start = root.Index;
+      if (root.Type == 10 && root.StateMachine != null) {
+        UInt32 settled = MorphemeSettleStateMachine(root.StateMachine, Node);
+        if (settled != UInt32.MaxValue) start = settled;
+      }
+
+      Dictionary<UInt32, Single> weights = new Dictionary<UInt32, Single>();
+      HashSet<UInt32> visitStack = new HashSet<UInt32>();
+      HashSet<UInt32> scalarStack = new HashSet<UInt32>();
+
+      Single Scalar(UInt32 index) {
+        MphNode node = Node(index);
+        if (node == null || !scalarStack.Add(index)) return 0F;
+        try {
+          if (node.Type == 20) {
+            String key = MorphemeControlParameterKey(node.Name);
+            if (controls != null && !String.IsNullOrWhiteSpace(key) && controls.TryGetValue(key, out Single authored)) return authored;
+            return node.DefaultValue;
+          }
+          if (node.Type == 111) {
+            Single a = node.Control.Count > 0 ? Scalar(node.Control[0]) : 0F;
+            Single b = node.Control.Count > 1 ? Scalar(node.Control[1]) : 0F;
+            return node.Operation switch {
+              0 => a * b,
+              1 => a + b,
+              2 => Math.Abs(b) > 0.000001F ? a / b : 0F,
+              _ => a - b
+            };
+          }
+          if (node.Type == 112) {
+            Single a = node.Control.Count > 0 ? Scalar(node.Control[0]) : 0F;
+            return node.Operation == 0 ? a * node.Constant0 : a;
+          }
+          return 0F;
+        }
+        finally { scalarStack.Remove(index); }
+      }
+
+      void Visit(UInt32 index, Single weight) {
+        if (!(weight > 0.000001F)) return;
+        MphNode node = Node(index);
+        if (node == null || !visitStack.Add(index)) return;
+        try {
+          if (node.Type == 104) {
+            weights[index] = weights.TryGetValue(index, out Single existing) ? existing + weight : weight;
+            return;
+          }
+          if (node.Type == 10 && node.StateMachine != null) {
+            MphState state = MorphemeState(node.StateMachine, node.StateMachine.DefaultState);
+            if (state != null) Visit(state.Node, weight);
+            return;
+          }
+          if (node.Type == 401 || node.Type == 402) {
+            if (node.To != UInt32.MaxValue) Visit(node.To, weight);
+            return;
+          }
+          if (node.Type == 101 || node.Type == 107) {
+            Single blend = Math.Max(0F, Math.Min(1F, Scalar(node.WeightControl)));
+            if (node.Flow.Count > 0) Visit(node.Flow[0], weight * (1F - blend));
+            if (node.Flow.Count > 1) Visit(node.Flow[1], weight * blend);
+            return;
+          }
+          if (node.Type == 108 || node.Type == 102 || node.Type == 198 || node.Type == 199) {
+            if (node.Flow.Count == 0) return;
+            Single value = Scalar(node.WeightControl);
+            // BlendN without authored positions defaults to source zero; Switch without positions treats the control
+            // as an integer source. This distinction is present in Morpheme and is significant for a few MAG graphs.
+            Int32 best = (node.Type == 198 || node.Type == 199) && node.Weights.Count == 0 ? (Int32)Math.Round(value) : 0;
+            if (node.Weights.Count > 0) {
+              Int32 count = Math.Min(node.Flow.Count, node.Weights.Count);
+              for (Int32 i = 1; i < count; i++)
+                if (Math.Abs(node.Weights[i] - value) < Math.Abs(node.Weights[best] - value)) best = i;
+            }
+            best = Math.Max(0, Math.Min(node.Flow.Count - 1, best));
+            Visit(node.Flow[best], weight);
+            return;
+          }
+          if (node.Flow.Count > 0) {
+            Single each = weight / node.Flow.Count;
+            foreach (UInt32 child in node.Flow) Visit(child, each);
+          }
+        }
+        finally { visitStack.Remove(index); }
+      }
+
+      Visit(start, 1F);
+      MphNode choice = null;
+      Single bestWeight = -1F;
+      foreach (KeyValuePair<UInt32, Single> pair in weights) {
+        if (pair.Value <= bestWeight) continue;
+        MphNode node = Node(pair.Key);
+        if (node == null || String.IsNullOrWhiteSpace(node.AnimationName)) continue;
+        choice = node; bestWeight = pair.Value;
+      }
+      return choice ?? network.Nodes.FirstOrDefault(x => x.Type == 104 && !String.IsNullOrWhiteSpace(x.AnimationName));
+    }
+
+    private static MphNode MorphemeNetworkRoot(MphNetwork network, Func<UInt32, MphNode> nodeAt) {
+      Dictionary<UInt32, Int32> incoming = new Dictionary<UInt32, Int32>();
+      foreach (MphNode node in network.Nodes) incoming[node.Index] = 0;
+      foreach (MphNode node in network.Nodes) {
+        foreach (UInt32 child in node.Flow) if (nodeAt(child) != null) incoming[child] = incoming.TryGetValue(child, out Int32 nFlow) ? nFlow + 1 : 1;
+        foreach (UInt32 child in node.Control) if (nodeAt(child) != null) incoming[child] = incoming.TryGetValue(child, out Int32 nControl) ? nControl + 1 : 1;
+      }
+      MphNode root = network.Nodes.FirstOrDefault(x => incoming.TryGetValue(x.Index, out Int32 n) && n == 0 && x.Type == 10);
+      if (root != null) return root;
+      return network.Nodes.FirstOrDefault(x => incoming.TryGetValue(x.Index, out Int32 n) && n == 0 && !MorphemeControlNode(x.Type))
+        ?? network.Nodes.FirstOrDefault();
+    }
+
+    private static Boolean MorphemeControlNode(UInt32 type) => type == 20 || type == 111 || type == 112;
+
+    private static UInt32 MorphemeSettleStateMachine(MphStateMachine machine, Func<UInt32, MphNode> nodeAt) {
+      if (machine == null || machine.States.Count == 0) return UInt32.MaxValue;
+      Dictionary<UInt32, UInt32> stateByNode = new Dictionary<UInt32, UInt32>();
+      for (UInt32 i = 0; i < machine.States.Count; i++) if (!stateByNode.ContainsKey(machine.States[(Int32)i].Node)) stateByNode[machine.States[(Int32)i].Node] = i;
+      HashSet<UInt32> seen = new HashSet<UInt32>();
+      UInt32 current = machine.DefaultState < machine.States.Count ? machine.DefaultState : 0;
+      while (current < machine.States.Count && seen.Add(current)) {
+        MphState state = machine.States[(Int32)current];
+        MphNode node = nodeAt(state.Node);
+        UInt32 next = UInt32.MaxValue;
+        if (node != null && (node.Type == 401 || node.Type == 402) && node.To != UInt32.MaxValue) {
+          if (!stateByNode.TryGetValue(node.To, out next)) next = UInt32.MaxValue;
+        }
+        else if (state.Exits.Count > 0) next = state.Exits[0];
+        if (next >= machine.States.Count) break;
+        current = next;
+      }
+      return current < machine.States.Count ? machine.States[(Int32)current].Node : UInt32.MaxValue;
+    }
+
+    private static MphState MorphemeState(MphStateMachine machine, UInt32 index) =>
+      machine != null && index < machine.States.Count ? machine.States[(Int32)index] : null;
+
+    private static String MorphemeControlParameterKey(String name) {
+      if (String.IsNullOrWhiteSpace(name)) return String.Empty;
+      String[] pieces = name.Split('|');
+      String tail = pieces.Length > 0 ? pieces[pieces.Length - 1] : name;
+      if (tail.StartsWith("input_", StringComparison.OrdinalIgnoreCase)) tail = tail.Substring(6);
+      return tail.Trim().ToLowerInvariant();
     }
 
     internal static ArrayList BuildTree(MphFileInfo info, String sourcePath) {

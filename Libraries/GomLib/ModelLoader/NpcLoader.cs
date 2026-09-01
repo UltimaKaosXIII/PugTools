@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -125,7 +125,7 @@ namespace GomLib.ModelLoader {
       //npc.Name = _dom.stringTable.TryGetString(npc.Fqn, nameLookupData);
       npc.LocalizedName = _dom.StringTable.TryGetLocalizedStrings(npc.Fqn, nameLookupData);
       Normalize.Dictionary(npc.LocalizedName, npc.Fqn);
-      npc.Name = npc.LocalizedName[GomLib.StringTable.SelectedLocalization];
+      npc.Name = GomLib.StringTable.SelectLocalizedText(npc.LocalizedName, npc.Fqn);
 
       if (textLookup.ContainsKey(TitleLookupKey)) {
         var titleLookupData = (GomObjectData)textLookup[TitleLookupKey];

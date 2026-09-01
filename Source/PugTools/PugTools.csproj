@@ -41,6 +41,7 @@
 		<Content Include="Shaders\GR2.fx" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Shaders\World.fx" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Resources\WorldMapIcons\*.png" CopyToOutputDirectory="PreserveNewest" />
+		<Content Include="Resources\WorldMapBackground.png" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\packed_codebooks.bin" Condition="Exists('Tools\packed_codebooks.bin')" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\packed_codebooks_aoTuV_603.bin" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Tools\spn-legacy-v1.bin" CopyToOutputDirectory="PreserveNewest" />
@@ -122,10 +123,12 @@
 		<Copy SourceFiles="$(ProjectDir)Shaders\World.fx" DestinationFolder="$(BinDir)Shaders" />
 
 		<MakeDir Condition="!Exists('$(BinDir)Resources\WorldMapIcons')" Directories="$(BinDir)Resources\WorldMapIcons" />
+		<MakeDir Condition="!Exists('$(BinDir)Resources')" Directories="$(BinDir)Resources" />
 		<ItemGroup>
 			<WorldMapIcons Include="$(ProjectDir)Resources\WorldMapIcons\*.png" />
 		</ItemGroup>
 		<Copy SourceFiles="@(WorldMapIcons)" DestinationFolder="$(BinDir)Resources\WorldMapIcons" SkipUnchangedFiles="true" />
+		<Copy SourceFiles="$(ProjectDir)Resources\WorldMapBackground.png" DestinationFolder="$(BinDir)Resources" SkipUnchangedFiles="true" />
 
 		<Copy SourceFiles="$(ProjectDir)WorldAreaNames.xml" DestinationFolder="$(BinDir)" SkipUnchangedFiles="true" />
 

@@ -45,7 +45,7 @@ namespace PugTools {
       public void Dispose(){ReleaseTextures();}
     }
     private sealed class MapArtGpu : IDisposable {
-      public Buffer Buffer; public int Count; public ShaderResourceView Texture; public string Name;
+      public Buffer Buffer; public int Count; public ShaderResourceView Texture; public string Name; public bool Root;
       public void Dispose(){Buffer?.Dispose();Buffer=null;Texture=null;}
     }
     private sealed class MapNoteIconGpu : IDisposable {
@@ -455,6 +455,10 @@ namespace PugTools {
     private readonly List<LineGpu> mapNoteFallbackGpu = new List<LineGpu>();
     private readonly List<MapArtGpu> mapArtGpu = new List<MapArtGpu>();
     private bool mapArtPrepared;
+    private bool miniMapCaptureRendering;
+    private Buffer mapBackdropBuffer;
+    private ShaderResourceView mapBackdropTexture;
+    private bool mapBackdropLoadAttempted;
     private readonly Dictionary<string,MapNoteIconGpu> mapNoteIconGpu = new Dictionary<string,MapNoteIconGpu>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<GR2_Material,long> materialLastUseFrame = new Dictionary<GR2_Material,long>();
     private readonly HashSet<GR2> modelGeometryPrepared = new HashSet<GR2>();
@@ -1403,17 +1407,21 @@ namespace PugTools {
       Vector3 q=Vector3.Cross(t,edge1);float v=Vector3.Dot(direction,q)*invDet;if(v<0f||u+v>1f)return false;float d=Vector3.Dot(edge2,q)*invDet;if(d<epsilon)return false;distance=d;return true;
     }
 
-    public void RequestMiniMapSnapshot(){
-      miniMapCaptureRequested=true;
-    }
+    public void RequestMiniMapSnapshot(){ RequestMiniMapSnapshot(true); }
 
     public void RequestMapTeleport(float worldX,float worldZ){
       float y;
-      if(!TrySampleMapHeight(worldX,worldZ,out y))y=Math.Max(boundsMin.Y+2f,Math.Min(boundsMax.Y+2f,camera.Position.Y));
+      bool sampled = mapOpen && !InteractiveMapIsWorldScope
+        ? TrySampleInteractiveMapHeight(worldX,worldZ,out y)
+        : TrySampleMapHeight(worldX,worldZ,out y);
+      if(!sampled)y=Math.Max(boundsMin.Y+2f,Math.Min(boundsMax.Y+2f,camera.Position.Y));
       camera.Position=new Vector3(worldX,y+MapTeleportClearance,worldZ);
       currentCameraRoom=FindCameraRoom(camera.Position);
       InvalidateTemporalHistory();
-      if(Window is WorldBrowser browser)browser.SetStatusLabel(string.Format(System.Globalization.CultureInfo.InvariantCulture,"Teleported to {0:0}, {1:0}, {2:0}",worldX*10f,worldZ*10f,y*10f));
+      if(Window is WorldBrowser browser){
+        browser.SetStatusLabel(string.Format(System.Globalization.CultureInfo.InvariantCulture,"Teleported to {0:0}, {1:0}, {2:0}",worldX*10f,worldZ*10f,y*10f));
+        browser.RefreshMiniMapForCamera();
+      }
     }
 
     public void GetMapPose(out float x,out float z,out float lookX,out float lookZ){
@@ -1431,6 +1439,7 @@ namespace PugTools {
       ReleaseTaxiRouteMapGpu();
       foreach(GR2_Material material in worldOwnedMaterials)ReleaseOwnedMaterial(material);
       ReleaseJedipediaFeatureGpu();
+      mapBackdropBuffer?.Dispose();mapBackdropBuffer=null;mapBackdropTexture?.Dispose();mapBackdropTexture=null;mapBackdropLoadAttempted=false;
       foreach(var g in terrainGpu.Values)g.Dispose();terrainGpu.Clear();foreach(var g in terrainIndexCache.Values)g.Dispose();terrainIndexCache.Clear(); foreach(var g in waterGpu.Values)g.Dispose();waterGpu.Clear(); foreach(var g in roadGpu)g.Dispose();roadGpu.Clear();foreach(var g in mapNoteFallbackGpu)g.Dispose();mapNoteFallbackGpu.Clear();foreach(var g in mapArtGpu)g.Dispose();mapArtGpu.Clear();mapArtPrepared=false;foreach(var g in mapNoteIconGpu.Values)g.Dispose();mapNoteIconGpu.Clear();materialLastUseFrame.Clear();modelGeometryPrepared.Clear();modelGeometryLastUseFrame.Clear();worldRenderFrame=0;Release(ref selectedWorldBoxBuffer);ClearWorldModelSelection();
       foreach(var list in dynamicDetailGpu.Values)foreach(var g in list)g.Dispose();dynamicDetailGpu.Clear();
       foreach(var list in dynamicDetailMeshBatches.Values)foreach(var g in list)g.Dispose();dynamicDetailMeshBatches.Clear();
@@ -1610,7 +1619,8 @@ namespace PugTools {
       // rendered removes a large amount of per-frame transform/CPU-skin work without changing the normal 3D view;
       // elapsed time is absolute, so followers immediately resume at the correct pose after the map closes.
       if(!mapOpen&&!captureMiniMap)UpdatePathFollowers(elapsed);
-      if(captureMiniMap){miniMapCaptureRequested=false;ResetMapCamera();}
+      if(captureMiniMap){miniMapCaptureRequested=false;miniMapCaptureRendering=true;PrepareMiniMapCaptureScope();}
+      else miniMapCaptureRendering=false;
       if(mapOpen||captureMiniMap){
         s=s.Clone();
         s.Mode=WorldRenderMode.Map;
@@ -1642,9 +1652,15 @@ namespace PugTools {
         // The interactive M map now keeps the user's map-note layer and renders original game symbols. A generated
         // minimap snapshot stays symbol-free because the WinForms overlay paints the same icons live on top of it.
         s.ShowMapNotes=mapOpen&&requestedMapNotes;
-        // Jedipedia's M map is a render of the actual terrain/world layout. Authored 2D map art remains
-        // available through the explicit toolbar Map mode, but does not cover the interactive M map.
-        s.ShowMapArt=false;
+        // The interactive map can now switch between PugTools' top-down world render and the original SWTOR
+        // authored page.  In original-art mode keep the same world-coordinate overlay layer (notes, taxi routes,
+        // player marker), but suppress the generated geometry under it rather than compositing the two maps.
+        bool originalInteractiveMap=mapOpen&&InteractiveMapOriginalArtActive;
+        bool originalMiniMap=captureMiniMap&&MiniMapOriginalArtActive;
+        s.ShowMapArt=originalInteractiveMap||originalMiniMap;
+        // Keep the generated top-down map underneath the authored SWTOR page. The original DDS is opaque inside its
+        // own page bounds, while the surrounding viewport now shows the normal PugTools map instead of a flat fog /
+        // clear colour. This also makes letterboxed/narrow submaps feel like part of the same map rather than a card.
       }
       Room cameraRoom=FindCameraRoom(camera.Position);
       // A streamed interior can be known from conservative placement bounds before its collision floor is indexed.
@@ -1711,6 +1727,7 @@ namespace PugTools {
       var clear=new Color4(env.FogColorSky.W,env.FogColorSky.X,env.FogColorSky.Y,env.FogColorSky.Z);
       ImmediateContext.ClearRenderTargetView(target,clear);ImmediateContext.ClearDepthStencilView(DepthStencilView,DepthStencilClearFlags.Depth|DepthStencilClearFlags.Stencil,1,0);
       ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
+      if(mapOpen)DrawMapBackdrop(viewProj);
       fx.SetViewProj(viewProj);fx.SetCamera(cam);fx.SetEnvironment(env,s.EnableLighting,s.EnableFog,shadows,s.ViewDistanceScale);fx.SetHeightRange(boundsMin.Y,boundsMax.Y);fx.SetPlaceableBlueGlow(false);
       ShaderResourceView illum=LoadTexture(env.IlluminationMap);fx.SetIllumination(illum);fx.SetScrolling(env,elapsed,LoadTexture(env.ScrollingTexture),LoadTexture(env.ScrollingMask));
       var maps=shadowMaps.Select(x=>x?.DepthMapSRV).ToArray();fx.SetShadows(shadowMatrices,maps,shadowDistances,shadows);fx.ClearLocalLights();currentLocalLightSelection=LocalLightSelection.Empty;lastLocalLightCount=0;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
@@ -1775,6 +1792,7 @@ namespace PugTools {
         } else snapshot?.Dispose();
         // Do not present the temporary top-down render. The next render iteration immediately draws the
         // normal camera again, so opening/refreshing the minimap never flashes a full-screen map.
+        miniMapCaptureRendering=false;
         return;
       }
       if(makeScreenshot){MakeScreenshot(ImageFileFormat.Jpg);makeScreenshot=false;}
@@ -5163,11 +5181,54 @@ namespace PugTools {
       EffectTechnique tech=s.Mode==WorldRenderMode.Wireframe?fx.Wire:fx.Water;tech.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.DrawIndexed(inst.numFaces,0,0);
     }
 
+    private void EnsureMapBackdropResources(){
+      if(mapBackdropLoadAttempted)return;mapBackdropLoadAttempted=true;
+      try{
+        string path=Path.Combine(AppContext.BaseDirectory,"Resources","WorldMapBackground.png");
+        if(!System.IO.File.Exists(path))return;
+        using var stream=System.IO.File.OpenRead(path);
+        mapBackdropTexture=ShaderResourceView.FromStream(Device,stream,(int)stream.Length);
+        var bd=new BufferDescription(PosNormalTexTan.Stride*6,ResourceUsage.Dynamic,BindFlags.VertexBuffer,CpuAccessFlags.Write,ResourceOptionFlags.None,0);
+        mapBackdropBuffer=new Buffer(Device,bd);
+      }catch(Exception ex){System.Diagnostics.Debug.WriteLine("Map backdrop load failed: "+ex.Message);}
+    }
+
+    private void DrawMapBackdrop(Matrix vp){
+      EnsureMapBackdropResources();
+      if(mapBackdropTexture==null||mapBackdropBuffer==null)return;
+      float left=mapCenter.X-mapVisibleWidth*.5f,right=mapCenter.X+mapVisibleWidth*.5f;
+      float top=mapCenter.Y-mapVisibleHeight*.5f,bottom=mapCenter.Y+mapVisibleHeight*.5f;
+      float y=boundsMin.Y-20f;var n=new Vector3(0,1,0);var t=new Vector3(1,0,0);
+      var v=new[]{
+        new PosNormalTexTan(new Vector3(left,y,bottom),n,new Vector2(0,1),t),
+        new PosNormalTexTan(new Vector3(right,y,bottom),n,new Vector2(1,1),t),
+        new PosNormalTexTan(new Vector3(right,y,top),n,new Vector2(1,0),t),
+        new PosNormalTexTan(new Vector3(left,y,bottom),n,new Vector2(0,1),t),
+        new PosNormalTexTan(new Vector3(right,y,top),n,new Vector2(1,0),t),
+        new PosNormalTexTan(new Vector3(left,y,top),n,new Vector2(0,0),t)
+      };
+      try{
+        DataBox mapped=ImmediateContext.MapSubresource(mapBackdropBuffer,MapMode.WriteDiscard,SlimDX.Direct3D11.MapFlags.None);
+        mapped.Data.WriteRange(v);ImmediateContext.UnmapSubresource(mapBackdropBuffer,0);
+        ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(mapBackdropBuffer,PosNormalTexTan.Stride,0));
+        fx.SetWorld(Matrix.Identity);fx.SetViewProj(vp);fx.SetMapArt(mapBackdropTexture,1f);
+        fx.MapArt.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(6,0);fx.ClearMapArt();
+      }catch(Exception ex){System.Diagnostics.Debug.WriteLine("Map backdrop draw failed: "+ex.Message);}
+    }
+
     private void DrawMapArt(Matrix vp){
       if(!mapArtPrepared)BuildMapArt();
       if(mapArtGpu.Count==0)return;
       ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;fx.SetWorld(Matrix.Identity);fx.SetViewProj(vp);
-      foreach(var g in mapArtGpu){if(g.Texture==null||g.Buffer==null)continue;fx.SetMapArt(g.Texture,.82f);ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(g.Buffer,PosNormalTexTan.Stride,0));fx.MapArt.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(g.Count,0);}
+      IEnumerable<MapArtGpu> draw=mapArtGpu;float opacity=.82f;
+      if(mapOpen&&InteractiveMapOriginalArtActive){
+        string selected=InteractiveMapIsWorldScope?InteractiveMapWorldName:InteractiveMapAreaName;
+        draw=draw.Where(g=>String.Equals(g.Name,selected,StringComparison.OrdinalIgnoreCase));opacity=1f;
+      }else if(miniMapCaptureRendering&&MiniMapOriginalArtActive){
+        string selected=MiniMapIsWorldScope?MiniMapWorldName:MiniMapAreaName;
+        draw=draw.Where(g=>String.Equals(g.Name,selected,StringComparison.OrdinalIgnoreCase));opacity=1f;
+      }else draw=draw.Where(g=>g.Root);
+      foreach(var g in draw){if(g.Texture==null||g.Buffer==null)continue;fx.SetMapArt(g.Texture,opacity);ImmediateContext.InputAssembler.SetVertexBuffers(0,new VertexBufferBinding(g.Buffer,PosNormalTexTan.Stride,0));fx.MapArt.GetPassByIndex(0).Apply(ImmediateContext);ImmediateContext.Draw(g.Count,0);}
       fx.ClearMapArt();
     }
 
@@ -5847,11 +5908,23 @@ namespace PugTools {
     private static string MapNoteIconKey(string icon){
       if(String.IsNullOrWhiteSpace(icon))return null;
       string value=icon.Trim().ToLowerInvariant();
-      if(value.Contains("bind"))return "bindpoint";
-      if(value.Contains("maplink")||value=="defaultmaplink")return "maplink";
+      if(value.Contains("bind")||value.Contains("quicktravel"))return "bindpoint";
+      if(value.Contains("maplink")||value.Contains("map_link")||value.Contains("exit")||value=="defaultmaplink")return "maplink";
+      if(value.Contains("explorationquest")||value.Contains("questarc"))return "explorationquest";
       if(value.Contains("quest"))return "quest";
       if(value.Contains("taxi"))return "taxi";
+      if(value.Contains("vendor"))return "vendor";
+      if(value.Contains("crewtrainer")||value.Contains("professiontrainer"))return "crewtrainer";
+      if(value.Contains("classtrainer")||value=="trainer")return "classtrainer";
+      if(value.Contains("resource")||value.Contains("harvest"))return "resource";
+      if(value.Contains("mail"))return "mailbox";
+      if(value.Contains("enhancement")||value.Contains("modification"))return "enhancement";
+      if(value.Contains("guildbank"))return "guildbank";
+      if(value.Contains("bank")||value.Contains("cargohold"))return "bank";
+      if(value.Contains("auction")||value.Contains("galacticmarket"))return "auction";
+      if(value.Contains("missionboard"))return "missionboard";
       if(value.Contains("wonka")||value.Contains("elevator")||value.Contains("lift"))return "wonkavator";
+      if(value=="defaulticon"||value=="default")return "default";
       return null;
     }
 
@@ -5861,8 +5934,17 @@ namespace PugTools {
       switch(key){
         case "bindpoint": return s.ShowMapIconBindpoints;
         case "maplink": return s.ShowMapIconMapLinks;
-        case "quest": return s.ShowMapIconQuests;
+        case "quest": case "missionboard": return s.ShowMapIconQuests;
+        case "explorationquest": return s.ShowMapIconExplorationQuests;
         case "taxi": return s.ShowMapIconTaxi;
+        case "vendor": return s.ShowMapIconVendors;
+        case "classtrainer": return s.ShowMapIconClassTrainers;
+        case "crewtrainer": return s.ShowMapIconCrewTrainers;
+        case "resource": return s.ShowMapIconResources;
+        case "mailbox": return s.ShowMapIconMailboxes;
+        case "enhancement": return s.ShowMapIconEnhancementStations;
+        case "bank": case "guildbank": return s.ShowMapIconCargoHold;
+        case "auction": return s.ShowMapIconGalacticMarket;
         case "wonkavator": return s.ShowMapIconWonkavator;
         default: return s.ShowMapIconOther;
       }
@@ -5873,6 +5955,8 @@ namespace PugTools {
         case "maplink": return new Size(24,26);
         case "quest": return new Size(23,23);
         case "wonkavator": return new Size(24,34);
+        case "explorationquest": case "vendor": case "classtrainer": case "crewtrainer": case "resource":
+        case "mailbox": case "enhancement": case "bank": case "guildbank": case "auction": case "missionboard": return new Size(24,24);
         default: return new Size(20,20);
       }
     }
@@ -5887,10 +5971,16 @@ namespace PugTools {
       if(!mapNoteIconGpu.TryGetValue(key,out MapNoteIconGpu gpu)){
         string file=MapNoteIconFileName(key);
         string path=Path.Combine(AppContext.BaseDirectory,"Resources","WorldMapIcons",file??String.Empty);
-        if(!File.Exists(path))return null;
         try{
-          using Stream stream=File.OpenRead(path);
-          gpu=new MapNoteIconGpu{Key=key,Texture=ShaderResourceView.FromStream(Device,stream,(int)stream.Length)};
+          if(File.Exists(path)){
+            using Stream stream=File.OpenRead(path);
+            gpu=new MapNoteIconGpu{Key=key,Texture=ShaderResourceView.FromStream(Device,stream,(int)stream.Length)};
+          } else {
+            using Bitmap generated=WorldMapIconFactory.Create(key);
+            if(generated==null)return null;
+            using var memory=new MemoryStream();generated.Save(memory,System.Drawing.Imaging.ImageFormat.Png);memory.Position=0;
+            gpu=new MapNoteIconGpu{Key=key,Texture=ShaderResourceView.FromStream(Device,memory,(int)memory.Length)};
+          }
           mapNoteIconGpu[key]=gpu;
         }catch(Exception ex){System.Diagnostics.Debug.WriteLine("Map-note icon load failed "+path+": "+ex.Message);return null;}
       }
@@ -5902,6 +5992,18 @@ namespace PugTools {
         gpu.Buffer=new Buffer(Device,bd){DebugName="World map note icons "+key};gpu.Capacity=capacity;
       }
       return gpu;
+    }
+
+    private static bool MapNoteIconNeedsHorizontalFlip(string key) {
+      if(String.IsNullOrWhiteSpace(key)) return false;
+      // These classes are drawn locally by WorldMapIconFactory rather than coming from SWTOR's authored PNG set.
+      // Their bitmap orientation is already screen-space; the D3D map quad otherwise mirrors them on X.
+      switch(key.ToLowerInvariant()) {
+        case "explorationquest": case "vendor": case "classtrainer": case "crewtrainer": case "resource":
+        case "mailbox": case "enhancement": case "bank": case "guildbank": case "auction": case "missionboard":
+        case "default": return true;
+        default: return false;
+      }
     }
 
     private void DrawMapNoteIcons(Matrix vp,WorldRenderSettings s){
@@ -5935,12 +6037,14 @@ namespace PugTools {
           if(String.Equals(group.Key,"maplink",StringComparison.OrdinalIgnoreCase))angle-=note.Rotation.Y*(float)Math.PI/180f;
           float c=(float)Math.Cos(angle),sn=(float)Math.Sin(angle);
           Vector2 tl=RotateMapIconOffset(-hx,hz,c,sn),tr=RotateMapIconOffset(hx,hz,c,sn),br=RotateMapIconOffset(hx,-hz,c,sn),bl=RotateMapIconOffset(-hx,-hz,c,sn);
-          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tl.X,y,p.Z+tl.Y),normal,new Vector2(0,0),tangent);
-          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tr.X,y,p.Z+tr.Y),normal,new Vector2(1,0),tangent);
-          verts[o++]=new PosNormalTexTan(new Vector3(p.X+br.X,y,p.Z+br.Y),normal,new Vector2(1,1),tangent);
-          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tl.X,y,p.Z+tl.Y),normal,new Vector2(0,0),tangent);
-          verts[o++]=new PosNormalTexTan(new Vector3(p.X+br.X,y,p.Z+br.Y),normal,new Vector2(1,1),tangent);
-          verts[o++]=new PosNormalTexTan(new Vector3(p.X+bl.X,y,p.Z+bl.Y),normal,new Vector2(0,1),tangent);
+          bool flipX=MapNoteIconNeedsHorizontalFlip(group.Key);
+          float u0=flipX?1f:0f,u1=flipX?0f:1f;
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tl.X,y,p.Z+tl.Y),normal,new Vector2(u0,0),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tr.X,y,p.Z+tr.Y),normal,new Vector2(u1,0),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+br.X,y,p.Z+br.Y),normal,new Vector2(u1,1),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+tl.X,y,p.Z+tl.Y),normal,new Vector2(u0,0),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+br.X,y,p.Z+br.Y),normal,new Vector2(u1,1),tangent);
+          verts[o++]=new PosNormalTexTan(new Vector3(p.X+bl.X,y,p.Z+bl.Y),normal,new Vector2(u0,1),tangent);
         }
         try{
           DataBox mapped=ImmediateContext.MapSubresource(gpu.Buffer,MapMode.WriteDiscard,SlimDX.Direct3D11.MapFlags.None);
@@ -5957,10 +6061,10 @@ namespace PugTools {
     private void BuildMapArt(){
       if(mapArtPrepared)return;mapArtPrepared=true;
       if(area?.MapPages==null||area.MapPages.Count==0)return;
+      // Keep every authored page resident.  The ordinary explicit Map-art layer below still draws only roots; the
+      // interactive M map selects exactly one root/child page so SWTOR submaps can be shown without overlap.
       var pages=area.MapPages.Where(p=>p.HasImage&&!string.IsNullOrWhiteSpace(p.ImagePath)).ToList();
-      // Most SWTOR areas contain a root map plus zoomed child pages. Showing both at once causes
-      // duplicate artwork, so prefer root pages and fall back to all pages where no root is authored.
-      var roots=pages.Where(p=>p.ParentId==0).ToList();if(roots.Count>0)pages=roots;
+      bool hasRoot=pages.Any(p=>p.ParentId==0);
       foreach(AreaMapPage page in pages){
         ShaderResourceView texture=LoadTexture(page.ImagePath,true);if(texture==null)continue;
         float minX=Math.Min(page.Min.X,page.Max.X),maxX=Math.Max(page.Min.X,page.Max.X);
@@ -5970,16 +6074,18 @@ namespace PugTools {
         // so north/up in the authored _r.dds page remains up on screen.
         float y=boundsMax.Y+2f;
         var n=new Vector3(0,1,0);var t=new Vector3(1,0,0);
+        // SWTOR's _r.dds pages arrive vertically inverted relative to this top-down world quad. Flip V only --
+        // X/world alignment is already correct and map-note/taxi overlays remain in world coordinates.
         var v=new[]{
-          new PosNormalTexTan(new Vector3(minX,y,maxZ),n,new Vector2(0,0),t),
-          new PosNormalTexTan(new Vector3(maxX,y,maxZ),n,new Vector2(1,0),t),
-          new PosNormalTexTan(new Vector3(maxX,y,minZ),n,new Vector2(1,1),t),
-          new PosNormalTexTan(new Vector3(minX,y,maxZ),n,new Vector2(0,0),t),
-          new PosNormalTexTan(new Vector3(maxX,y,minZ),n,new Vector2(1,1),t),
-          new PosNormalTexTan(new Vector3(minX,y,minZ),n,new Vector2(0,1),t)
+          new PosNormalTexTan(new Vector3(minX,y,maxZ),n,new Vector2(0,1),t),
+          new PosNormalTexTan(new Vector3(maxX,y,maxZ),n,new Vector2(1,1),t),
+          new PosNormalTexTan(new Vector3(maxX,y,minZ),n,new Vector2(1,0),t),
+          new PosNormalTexTan(new Vector3(minX,y,maxZ),n,new Vector2(0,1),t),
+          new PosNormalTexTan(new Vector3(maxX,y,minZ),n,new Vector2(1,0),t),
+          new PosNormalTexTan(new Vector3(minX,y,minZ),n,new Vector2(0,0),t)
         };
         var bd=new BufferDescription(PosNormalTexTan.Stride*v.Length,ResourceUsage.Immutable,BindFlags.VertexBuffer,CpuAccessFlags.None,ResourceOptionFlags.None,0);using var ds=new DataStream(v,false,false);
-        mapArtGpu.Add(new MapArtGpu{Buffer=new Buffer(Device,ds,bd),Count=v.Length,Texture=texture,Name=page.MapName});
+        mapArtGpu.Add(new MapArtGpu{Buffer=new Buffer(Device,ds,bd),Count=v.Length,Texture=texture,Name=page.MapName,Root=!hasRoot||page.ParentId==0});
       }
     }
     private LineGpu BuildLine(IEnumerable<Vector3> points,Vector4 color){var positions=points.ToArray();var verts=positions.Select(p=>new PosNormalTexTan(p,new Vector3(0,1,0),Vector2.Zero,new Vector3(1,0,0))).ToArray();Vector3 min=new Vector3(float.MaxValue,float.MaxValue,float.MaxValue),max=new Vector3(float.MinValue,float.MinValue,float.MinValue);foreach(Vector3 p in positions)Expand(ref min,ref max,p);Vector3 center=positions.Length>0?(min+max)*.5f:Vector3.Zero;float radius=positions.Length>0?(max-min).Length()*.5f:0f;var bd=new BufferDescription(PosNormalTexTan.Stride*verts.Length,ResourceUsage.Immutable,BindFlags.VertexBuffer,CpuAccessFlags.None,ResourceOptionFlags.None,0);using var ds=new DataStream(verts,false,false);return new LineGpu{Buffer=new Buffer(Device,ds,bd),Count=verts.Length,Color=color,Center=center,Radius=radius};}
@@ -6179,9 +6285,7 @@ namespace PugTools {
     public void SetMapShowEntireArea(bool showEntireArea){
       mapShowEntireArea=showEntireArea;
       if(mapOpen){
-        ApplyMapExtentSelection();
-        mapCenter=new Vector2((mapExtentMinX+mapExtentMaxX)*.5f,(mapExtentMinZ+mapExtentMaxZ)*.5f);
-        mapZoom=1f;UpdateMapCamera();
+        ApplyInteractiveMapScopeExtents(true);
         if(Window is WorldBrowser browser)browser.SetStatusLabel(showEntireArea||!mapHasClusterExtent
           ?"Map extent: entire area"
           :"Map extent: main area (isolated outliers cropped)");
@@ -6193,8 +6297,9 @@ namespace PugTools {
       float aspect=Math.Max(.1f,ClientWidth/(float)Math.Max(1,ClientHeight));
       // Recalculate the fit height every update. This makes 1x an actual "fit whole map" zoom even after the
       // World Browser, splitter or toolbar changes the render-panel aspect ratio while M is open.
-      float worldWidth=Math.Max(10f,(mapExtentMaxX-mapExtentMinX)*1.08f);
-      float worldHeight=Math.Max(10f,(mapExtentMaxZ-mapExtentMinZ)*1.08f);
+      float mapPadding=mapOpen&&InteractiveMapOriginalArtActive?1f:1.08f;
+      float worldWidth=Math.Max(10f,(mapExtentMaxX-mapExtentMinX)*mapPadding);
+      float worldHeight=Math.Max(10f,(mapExtentMaxZ-mapExtentMinZ)*mapPadding);
       mapBaseHeight=Math.Max(worldHeight,worldWidth/aspect);
       mapVisibleHeight=Math.Max(2f,mapBaseHeight*Math.Max(MapMinZoom,Math.Min(MapMaxZoom,mapZoom)));
       mapVisibleWidth=Math.Max(2f,mapVisibleHeight*aspect);
@@ -6210,10 +6315,12 @@ namespace PugTools {
       mapProj=Matrix.OrthoRH(mapVisibleWidth,mapVisibleHeight,.1f,Math.Max(100f,y-boundsMin.Y+200f));
     }
 
+    public void CloseInteractiveMap(){ SetMapOpen(false); }
+
     private void SetMapOpen(bool open){
       if(mapOpen==open){if(!open){CloseTaxiRouteMapState();CloseQuickTravelMapState();}return;}
       mapOpen=open;mapPointerDown=false;mapPointerDragged=false;
-      if(open)ResetMapCamera();else {CloseTaxiRouteMapState();CloseQuickTravelMapState();}
+      if(open){ResetMapCamera();SelectDefaultInteractiveMapScope();}else {CloseTaxiRouteMapState();CloseQuickTravelMapState();}
       InvalidateTemporalHistory();
       if(Window is WorldBrowser browser){
         browser.SetFullMapActive(open);
@@ -6256,6 +6363,7 @@ namespace PugTools {
       Vector2 before=MapWorldAtScreen(p);
       float factor=(float)Math.Exp(-delta*0.0015f);
       mapZoom=Math.Max(MapMinZoom,Math.Min(MapMaxZoom,mapZoom*factor));
+      if(taxiRouteMapActive)taxiRouteMapGpuDirty=true;
       UpdateMapCamera();
       Vector2 after=MapWorldAtScreen(p);
       mapCenter+=before-after;
@@ -6293,7 +6401,14 @@ namespace PugTools {
     private void TeleportFromMap(Point p){
       Vector2 world=MapWorldAtScreen(p);
       float y;
-      if(!TrySampleMapHeight(world.X,world.Y,out y))y=Math.Max(boundsMin.Y+2f,Math.Min(boundsMax.Y+2f,camera.Position.Y));
+      bool sampled = !InteractiveMapIsWorldScope
+        ? TrySampleInteractiveMapHeight(world.X,world.Y,out y)
+        : TrySampleMapHeight(world.X,world.Y,out y);
+      if(!sampled){
+        // If an authored area page has a vertical volume but no height-map sample at this exact X/Z, preserve the
+        // current floor rather than jumping to an unrelated surface above it.
+        y=Math.Max(boundsMin.Y+2f,Math.Min(boundsMax.Y+2f,camera.Position.Y-MapTeleportClearance));
+      }
       camera.Position=new Vector3(world.X,y+MapTeleportClearance,world.Y);
       currentCameraRoom=null;
       if(Window is WorldBrowser browser){
@@ -6315,6 +6430,7 @@ namespace PugTools {
       if(e.Button==MouseButtons.Right)orthographicPanning=false;
       if(mapOpen&&e.Button==MouseButtons.Left&&mapPointerDown){
         bool click=!mapPointerDragged;mapPointerDown=false;
+        bool wasDrag=mapPointerDragged;mapPointerDragged=false;
         if(click){
           if(IsTaxiRouteMapActive){
             if(TryPickTaxiRouteOnMap(e.Location,out WorldTaxiRouteInfo pickedRoute) && Window is WorldBrowser taxiBrowser){
@@ -6324,7 +6440,35 @@ namespace PugTools {
             WorldQuickTravelTerminal terminal=QuickTravelTerminalAtMapPoint(e.Location);
             if(terminal!=null)TeleportQuickTravel(terminal);
             else if(Window is WorldBrowser quickMapBrowser)quickMapBrowser.SetStatusLabel("Quick travel: click a bindpoint destination; drag to pan, wheel to zoom, Esc/M to close.");
-          } else TeleportFromMap(e.Location);
+          } else {
+            AreaMapNote clickedNote=HitTestFullMapNote(e.Location);
+            if(clickedNote!=null&&Window is WorldBrowser mapClickBrowser){
+              if(mapClickBrowser.TryOpenTaxiMapForMapNote(clickedNote)){
+                mapClickBrowser.UpdateWorldMapNoteToolTip(null,Point.Empty);
+              }else if(mapClickBrowser.TryOpenWonkavatorForMapNote(clickedNote,true)){
+                mapClickBrowser.UpdateWorldMapNoteToolTip(null,Point.Empty);
+              }else if(mapClickBrowser.TryOpenMapLinkForMapNote(clickedNote,false)){
+                mapClickBrowser.UpdateWorldMapNoteToolTip(null,Point.Empty);
+              }else{
+                string clickedKey=MapNoteIconKey(clickedNote.Icon);
+                bool questPin=String.Equals(clickedKey,"quest",StringComparison.OrdinalIgnoreCase)||
+                  String.Equals(clickedKey,"explorationquest",StringComparison.OrdinalIgnoreCase)||
+                  String.Equals(clickedKey,"missionboard",StringComparison.OrdinalIgnoreCase)||
+                  String.Equals(clickedNote.Condition,"Quest",StringComparison.OrdinalIgnoreCase);
+                if(questPin){
+                  // A quest symbol is an information surface, never a teleport target. Even if this client build lacks
+                  // the reverse quest link, consume the click so a failed details lookup cannot warp the camera.
+                  if(!mapClickBrowser.TryShowWorldMapQuestDetails(clickedNote))
+                    mapClickBrowser.SetStatusLabel("Quest information is not available for this map symbol in the local client data.");
+                  mapClickBrowser.UpdateWorldMapNoteToolTip(clickedNote,e.Location);
+                }else TeleportFromMap(e.Location);
+              }
+            }else TeleportFromMap(e.Location);
+          }
+        } else if(wasDrag && Window is WorldBrowser hoverBrowser && !IsTaxiRouteMapActive && !IsQuickTravelMapActive) {
+          // A finished pan is immediately hoverable again. Previously mapPointerDragged stayed true forever, so
+          // OnMouseMove skipped all map-note hit tests after the first drag until the map was closed/reopened.
+          hoverBrowser.UpdateWorldMapNoteToolTip(HitTestFullMapNote(e.Location),e.Location);
         }
       }
     }
@@ -6355,7 +6499,11 @@ namespace PugTools {
           }
           else {
             Vector2 world=MapWorldAtScreen(e.Location);
-            string heightText=TrySampleMapHeight(world.X,world.Y,out float mapY)
+            float mapY;
+            bool haveMapY=!InteractiveMapIsWorldScope
+              ? TrySampleInteractiveMapHeight(world.X,world.Y,out mapY)
+              : TrySampleMapHeight(world.X,world.Y,out mapY);
+            string heightText=haveMapY
               ? ", "+Math.Round(mapY*10f).ToString(System.Globalization.CultureInfo.InvariantCulture)
               : String.Empty;
             // Match Jedipedia's map readout: display X/Y are world X/Z ×10, followed by the sampled surface Z.

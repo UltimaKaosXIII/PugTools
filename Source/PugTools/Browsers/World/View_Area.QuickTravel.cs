@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
@@ -45,6 +45,7 @@ namespace PugTools {
       }
 
       SetMapOpen(true);
+      PrepareInteractiveTravelMapScope();
       FitQuickTravelMap();
       if (Window is WorldBrowser browser) {
         browser.SetFullMapActive(true);

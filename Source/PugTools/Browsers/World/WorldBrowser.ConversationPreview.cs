@@ -180,10 +180,10 @@ namespace PugTools {
             object textMap = WorldInteractionDataValue(data, "locTextRetrieverMap", "4611686102842470023");
             GomObjectData textData = WorldConversationMapValueById(textMap, nodeId) as GomObjectData;
             if (textData != null) {
-              node.Stb = WorldInteractionText(WorldInteractionDataValue(textData, "strLocalizedTextRetrieverBucket", null));
-              try { node.Text = currentDom.StringTable.TryGetString(result.Fqn, textData); } catch { }
-              try { node.LocalizedText = currentDom.StringTable.TryGetLocalizedStrings(result.Fqn, textData); } catch { }
-              try { node.LocalizedOptionText = currentDom.StringTable.TryGetLocalizedOptionStrings(result.Fqn, textData); } catch { }
+              if (TryWorldLocEntry(textData, out GomLib.StringTable.LocEntry locEntry)) node.Stb = locEntry.Bucket;
+              node.Text = WorldLocText(textData, result.Fqn);
+              node.LocalizedText = WorldLocAll(textData);
+              node.LocalizedOptionText = WorldLocAll(textData, true);
             }
             result.DialogNodes.Add(node);
             result.NodeLookup[node.NodeId] = node;
@@ -531,11 +531,20 @@ namespace PugTools {
       if (worldConversationSpeakerNames.TryGetValue(id, out string cached)) return cached;
 
       string label = null;
+      // Jedipedia resolves speaker labels from the raw retriever pair, not from whichever localized name happened to
+      // be materialized by a model loader. This also survives a sparse selected gender row in DE/FR.
       try {
-        GameObject speaker = currentDom?.ConversationLoader.LoadSpeaker(id);
-        if (speaker is Npc npc) label = !String.IsNullOrWhiteSpace(npc.Name) ? npc.Name : npc.Fqn;
-        else if (speaker is Placeable plc) label = !String.IsNullOrWhiteSpace(plc.Name) ? plc.Name : plc.Fqn;
-        else if (speaker != null) label = speaker.Fqn;
+        GomObject rawSpeaker = currentDom?.GetObject(id);
+        object locMap = WorldInteractionDataValue(rawSpeaker?.Data, "locTextRetrieverMap", "4611686102842470023");
+        label = WorldLocMapText(locMap, WorldLocNameSlot, rawSpeaker?.Name);
+      } catch { }
+      try {
+        if (String.IsNullOrWhiteSpace(label)) {
+          GameObject speaker = currentDom?.ConversationLoader.LoadSpeaker(id);
+          if (speaker is Npc npc) label = !String.IsNullOrWhiteSpace(npc.Name) ? npc.Name : npc.Fqn;
+          else if (speaker is Placeable plc) label = !String.IsNullOrWhiteSpace(plc.Name) ? plc.Name : plc.Fqn;
+          else if (speaker != null) label = speaker.Fqn;
+        }
       } catch { }
       if (String.IsNullOrWhiteSpace(label)) {
         try { label = currentDom?.GetObject(id)?.Name; } catch { }
