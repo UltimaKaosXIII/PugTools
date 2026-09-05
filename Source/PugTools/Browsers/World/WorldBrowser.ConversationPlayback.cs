@@ -32,7 +32,17 @@ namespace PugTools {
     private Conversation worldConversationPlaybackConversation;
     private DialogNode worldConversationPlaybackNode;
     private WorldNpcPlacement worldConversationPrimaryNpc;
+    // The clicked/started-on body stands in for at most one speaker the AREA itself never placed. Current Jedipedia
+    // does this to avoid synthesizing a duplicate character beside the NPC that launched the conversation.
+    private string worldConversationPrimaryStandInFqn;
     private WorldNpcPlacement worldConversationPlayerNpc;
+    private readonly Dictionary<string, WorldNpcPlacement> worldConversationCastNpcs =
+      new Dictionary<string, WorldNpcPlacement>(StringComparer.OrdinalIgnoreCase);
+    // Some Hydra Play VFX actors are cinematic marker NPCs rather than characters the scene should visibly spawn.
+    // Jedipedia gives those actors a transform-only anchor at their staging mark; keep the same host so effects can
+    // be stopped by actor later without introducing a placeholder body into the shot.
+    private readonly Dictionary<string, WorldNpcPlacement> worldConversationVfxAnchors =
+      new Dictionary<string, WorldNpcPlacement>(StringComparer.OrdinalIgnoreCase);
     private WaveOutEvent worldConversationWaveOut;
     private System.Windows.Forms.Timer worldConversationAdvanceTimer;
     private int worldConversationPlaybackSerial;
@@ -68,6 +78,7 @@ namespace PugTools {
       EnsureWorldConversationPlaybackForm();
       StopWorldConversationPlayback(false);
       worldConversationPrimaryNpc = primaryNpc;
+      worldConversationPrimaryStandInFqn = null;
       worldConversationPlaybackConversation = conversation;
       worldConversationPlaybackForm.Text = "Conversation — " + (conversation.Fqn ?? "(unnamed)");
       worldConversationPlaybackStatus.Text = "Preparing conversation…";
@@ -543,7 +554,11 @@ namespace PugTools {
       ClearWorldConversationStaging();
       panelRender?.ClearWorldConversationCamera(true);
       panelRender?.ClearWorldConversationSubtitle();
-      panelRender?.SetWorldConversationVirtualPlayer(null);
+      panelRender?.ClearWorldConversationFx();
+      panelRender?.ClearWorldConversationVirtualActors();
+      worldConversationCastNpcs.Clear();
+      worldConversationVfxAnchors.Clear();
+      worldConversationPrimaryStandInFqn = null;
       worldConversationPlaybackNode = null;
       if (worldConversationPlaybackChoices != null) worldConversationPlaybackChoices.Controls.Clear();
       if (worldConversationPlaybackNext != null) worldConversationPlaybackNext.Enabled = false;
@@ -562,7 +577,12 @@ namespace PugTools {
       ClearWorldConversationStaging();
       panelRender?.ClearWorldConversationCamera(true);
       panelRender?.ClearWorldConversationSubtitle();
-      panelRender?.SetWorldConversationVirtualPlayer(null);
+      panelRender?.ClearWorldConversationFx();
+      panelRender?.ClearWorldConversationVirtualActors();
+      worldConversationPlayerNpc = null;
+      worldConversationCastNpcs.Clear();
+      worldConversationVfxAnchors.Clear();
+      worldConversationPrimaryStandInFqn = null;
       worldConversationPlaybackStatus.Text = status;
       worldConversationPlaybackNext.Enabled = false;
       worldConversationPlaybackChoices.Controls.Clear();
@@ -599,7 +619,12 @@ namespace PugTools {
     }
 
     private void ClearWorldConversationStaging() {
-      foreach (WorldNpcPlacement placement in worldConversationStagedNpcs.ToArray()) panelRender?.ClearWorldConversationActorState(placement);
+      foreach (WorldNpcPlacement placement in worldConversationStagedNpcs.ToArray()) {
+        // A preview-built body has no authored AREA transform to restore. Jedipedia leaves its last scene placement
+        // standing until the next staging/beat moves it, and simply removes the body when the preview ends.
+        if (placement?.ConversationVirtual == true) continue;
+        panelRender?.ClearWorldConversationActorState(placement);
+      }
       worldConversationStagedNpcs.Clear();
     }
 
@@ -614,20 +639,30 @@ namespace PugTools {
       ulong speakerId = node.SpeakerId != 0 ? node.SpeakerId : conversation?.DefaultSpeakerId ?? 0;
       string fqn = null;
       if (speakerId != 0) {
-        try { fqn = currentDom?.GetObject(speakerId)?.Name; } catch { }
+        try { fqn = WorldResolveGomObject(speakerId)?.Name; } catch { }
+        if (String.IsNullOrWhiteSpace(fqn) && WorldUsesLegacyContent)
+          fqn = WorldLegacyPrototypeName(speakerId, null);
         if (String.IsNullOrWhiteSpace(fqn)) {
           try { fqn = currentDom?.ConversationLoader.LoadSpeaker(speakerId)?.Fqn; } catch { }
         }
       }
-      return FindWorldConversationActorPlacement(fqn);
+      WorldNpcPlacement placement = FindWorldConversationActorPlacement(fqn);
+      if (placement != null) return placement;
+      if (worldConversationPrimaryNpc != null && !String.IsNullOrWhiteSpace(fqn)) {
+        if (String.IsNullOrWhiteSpace(worldConversationPrimaryStandInFqn)) worldConversationPrimaryStandInFqn = fqn.Trim();
+        if (String.Equals(worldConversationPrimaryStandInFqn, fqn.Trim(), StringComparison.OrdinalIgnoreCase)) return worldConversationPrimaryNpc;
+      }
+      return EnsureWorldConversationCastPlacement(fqn);
     }
 
     private WorldNpcPlacement FindWorldConversationActorPlacement(string actor) {
       if (String.IsNullOrWhiteSpace(actor)) return null;
       if (WorldConversationPlayerActorName(actor)) return EnsureWorldConversationPlayerPlacement();
-      if (worldNpcPlacements == null || worldNpcPlacements.Count == 0) return null;
       string clean = actor.Trim();
-      if (worldConversationPrimaryNpc != null && String.Equals(worldConversationPrimaryNpc.SourceFqn, clean, StringComparison.OrdinalIgnoreCase)) return worldConversationPrimaryNpc;
+      if (worldConversationCastNpcs.TryGetValue(clean, out WorldNpcPlacement cast)) return cast;
+      if (worldConversationPrimaryNpc != null && (String.Equals(worldConversationPrimaryNpc.SourceFqn, clean, StringComparison.OrdinalIgnoreCase) ||
+          String.Equals(worldConversationPrimaryStandInFqn, clean, StringComparison.OrdinalIgnoreCase))) return worldConversationPrimaryNpc;
+      if (worldNpcPlacements == null || worldNpcPlacements.Count == 0) return null;
       WorldNpcPlacement exact = worldNpcPlacements.FirstOrDefault(p => p != null && String.Equals(p.SourceFqn, clean, StringComparison.OrdinalIgnoreCase));
       if (exact != null) return exact;
       string leaf = clean;
@@ -643,8 +678,8 @@ namespace PugTools {
       var result = new List<WorldConversationCinematicAction>();
       if (conversation == null || currentDom == null || nodeId == 0) return result;
       try {
-        GomObject raw = conversation.Id != 0 ? currentDom.GetObject(conversation.Id) : null;
-        if (raw == null && !String.IsNullOrWhiteSpace(conversation.Fqn)) raw = currentDom.GetObject(conversation.Fqn);
+        GomObject raw = conversation.Id != 0 ? WorldResolveGomObject(conversation.Id) : null;
+        if (raw == null && !String.IsNullOrWhiteSpace(conversation.Fqn)) raw = WorldResolveGomObject(conversation.Fqn);
         if (raw?.Data == null) return result;
 
         var toolbox = new Dictionary<ulong, string>();
@@ -652,6 +687,8 @@ namespace PugTools {
         foreach (KeyValuePair<object, object> pair in WorldConversationMapEntries(rawToolbox)) {
           ulong id = WorldInteractionUnsigned(pair.Key);
           GomObjectData data = WorldConversationFirstObjectData(pair.Value, false);
+          if (WorldUsesLegacyContent && (data == null || WorldInteractionDataValue(data, "hydFQN", "4611686027152384722") == null))
+            data = WorldConversationFindObjectDataWithField(pair.Value, "hydFQN", "4611686027152384722");
           if (id == 0 || data == null) continue;
           string fqn = WorldInteractionText(WorldInteractionDataValue(data, "hydFQN", "4611686027152384722"));
           if (!String.IsNullOrWhiteSpace(fqn)) toolbox[id] = fqn;
@@ -661,6 +698,8 @@ namespace PugTools {
         object rawDialogs = WorldInteractionDataValue(raw.Data, "cnvTreeDialogNodes_Prototype", "4611686050212071021");
         foreach (KeyValuePair<object, object> pair in WorldConversationMapEntries(rawDialogs)) {
           GomObjectData candidate = WorldConversationFirstObjectData(pair.Value, false);
+          if (WorldUsesLegacyContent && (candidate == null || WorldInteractionDataValue(candidate, "cnvNodeNumber", "4611686019044571365") == null))
+            candidate = WorldConversationFindObjectDataWithField(pair.Value, "cnvNodeNumber", "4611686019044571365");
           if (candidate == null) continue;
           long id = WonkInt64(WorldInteractionDataValue(candidate, "cnvNodeNumber", "4611686019044571365"));
           if (id == 0) id = WonkInt64(pair.Key);
@@ -677,6 +716,8 @@ namespace PugTools {
         GomObjectData firstVariant = null;
         foreach (object cinematicRaw in variants) {
           GomObjectData candidate = WorldConversationFirstObjectData(cinematicRaw, false);
+          if (WorldUsesLegacyContent && (candidate == null || WorldInteractionDataValue(candidate, "hydActionBlocks", "4611686026567369455") == null))
+            candidate = WorldConversationFindObjectDataWithField(cinematicRaw, "hydActionBlocks", "4611686026567369455");
           if (candidate == null) continue;
           if (firstVariant == null) firstVariant = candidate;
           GomObjectData condition = WorldConversationFirstObjectData(
@@ -693,11 +734,15 @@ namespace PugTools {
         float beatTime = 0f;
         foreach (object blockRaw in WorldInteractionListEntries(WorldInteractionDataValue(selectedVariant, "hydActionBlocks", "4611686026567369455"))) {
           GomObjectData block = WorldConversationFirstObjectData(blockRaw, false);
+          if (WorldUsesLegacyContent && (block == null || WorldInteractionDataValue(block, "hydActions", "4611686026567774554") == null))
+            block = WorldConversationFindObjectDataWithField(blockRaw, "hydActions", "4611686026567774554");
           if (block == null) continue;
           object rawBeatTime = WorldInteractionDataValue(block, "hydTime", "4611686026643586509");
           if (rawBeatTime != null) beatTime = Math.Max(0f, SpnDynNumber(rawBeatTime, beatTime));
           foreach (object actionRaw in WorldInteractionListEntries(WorldInteractionDataValue(block, "hydActions", "4611686026567774554"))) {
             GomObjectData action = WorldConversationFirstObjectData(actionRaw, false);
+            if (WorldUsesLegacyContent && (action == null || WorldInteractionDataValue(action, "hydAction", "4611686026567774112") == null))
+              action = WorldConversationFindObjectDataWithField(actionRaw, "hydAction", "4611686026567774112");
             if (action == null) continue;
             string type = WorldInteractionText(WorldInteractionDataValue(action, "hydAction", "4611686026567774112"));
             string value = WorldInteractionText(WorldInteractionDataValue(action, "hydValue", "4611686026567774127"));

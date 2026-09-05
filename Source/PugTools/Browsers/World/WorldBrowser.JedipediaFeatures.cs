@@ -48,16 +48,15 @@ namespace PugTools {
     private string ResolveWorldImplicitPhaseName(ulong areaId) {
       if (currentDom == null || areaId == 0) return String.Empty;
       try {
-        GomObject prototype = currentDom.GetObject("phsInstanceDataPrototype");
+        GomObject prototype = WorldResolveGomObject("phsInstanceDataPrototype");
         if (prototype == null) return String.Empty;
 
-        object mapObject = null;
-        if (!prototype.Data.Dictionary.TryGetValue("phsDataImplicitAreaMap", out mapObject))
-          prototype.Data.Dictionary.TryGetValue("4611686102770270021", out mapObject);
-        if (!(mapObject is System.Collections.IDictionary phaseMap)) return String.Empty;
+        Dictionary<object, object> phaseMap = WorldInteractionMap(
+          WorldInteractionDataValue(prototype.Data, "phsDataImplicitAreaMap", "4611686102770270021"));
+        if (phaseMap == null) return String.Empty;
 
         object phaseReference = null;
-        foreach (System.Collections.DictionaryEntry entry in phaseMap) {
+        foreach (KeyValuePair<object, object> entry in phaseMap) {
           if (!TryPhaseId(entry.Key, out ulong mappedArea) || mappedArea != areaId) continue;
           phaseReference = entry.Value;
           break;
@@ -71,7 +70,7 @@ namespace PugTools {
           phaseReference = phaseTextId;
         }
         if (!TryPhaseId(phaseReference, out ulong phaseId) || phaseId == 0) return String.Empty;
-        GomObject phaseNode = currentDom.GetObject(phaseId);
+        GomObject phaseNode = WorldResolveGomObject(phaseId);
         return PhaseDisplayName(phaseNode?.Name);
       } catch (Exception ex) {
         System.Diagnostics.Debug.WriteLine("Implicit phase lookup failed for area " + areaId + ": " + ex.Message);
@@ -158,11 +157,25 @@ namespace PugTools {
               if (String.IsNullOrWhiteSpace(entityFqn)) continue;
               try {
                 if (entityFqn.StartsWith("npc.", StringComparison.OrdinalIgnoreCase)) {
+                  GomObject npcNode = null;
                   if (!npcCache.TryGetValue(entityFqn, out Npc npc)) {
-                    npc = currentDom.NpcLoader.Load(entityFqn);
+                    npcNode = WorldResolveGomObject(entityFqn);
+                    try {
+                      npc = npcNode != null ? currentDom.NpcLoader.Load(npcNode) : currentDom.NpcLoader.Load(entityFqn);
+                    } catch (Exception ex) when (WorldUsesLegacyContent) {
+                      // Some RED/HE32 npcTemplate revisions predate fields expected by the current model loader.
+                      // Let the raw legacy reader below recover the visual/service data instead. Retail exceptions
+                      // are deliberately not swallowed here and retain the established outer error handling.
+                      System.Diagnostics.Debug.WriteLine("Legacy NPC model loader failed " + entityFqn + ": " + ex.Message);
+                      npc = null;
+                    }
                     npcCache[entityFqn] = npc;
                   }
                   WorldNpcPlacement spnPlacement = BuildNpcPlacement(room, instance, entityFqn, npc, appearanceCache, speciesScales, idleAnimation, animationCache, interactionCache, weaponModelCache);
+                  if (spnPlacement == null && WorldUsesLegacyContent) {
+                    if (npcNode == null) npcNode = WorldResolveGomObject(entityFqn);
+                    spnPlacement = BuildLegacyNpcPlacement(room, instance, entityFqn, npcNode, appearanceCache, speciesScales, idleAnimation, animationCache, interactionCache, weaponModelCache);
+                  }
                   if (spnPlacement != null) {
                     // Jedipedia only resolves pth.* ride routes for placeables. Applying the spawner's path to an NPC
                     // turns platform/elevator metadata into character locomotion and can make a creature race back and
@@ -246,8 +259,8 @@ namespace PugTools {
     private Dictionary<ulong, float> LoadNpcSpeciesScales() {
       var result = new Dictionary<ulong, float>();
       try {
-        GomObject table = currentDom?.GetObject("chrSpeciesScalePrototype");
-        var lookup = table?.Data.ValueOrDefault<Dictionary<object, object>>("chrSpeciesScaleLookup", null);
+        GomObject table = WorldResolveGomObject("chrSpeciesScalePrototype");
+        var lookup = WorldInteractionMap(WorldInteractionDataValue(table?.Data, "chrSpeciesScaleLookup", "4611686068921131192"));
         if (lookup == null) return result;
         foreach (var pair in lookup) {
           try {
@@ -272,13 +285,58 @@ namespace PugTools {
           string overrideTag = rawTag.ToString().Replace("\0", String.Empty).Trim();
           if (!String.IsNullOrWhiteSpace(overrideTag)) tag = overrideTag;
         }
-        Encounter enc = currentDom.EncounterLoader.Load(encounterFqn);
-        if (enc?.Spawners == null) return null;
+        Encounter enc = null;
+        GomObject encounterNode = WorldResolveGomObject(encounterFqn);
+        try { enc = encounterNode != null ? currentDom.EncounterLoader.Load(encounterNode.Id) : currentDom.EncounterLoader.Load(encounterFqn); } catch { }
         string key = (tag ?? String.Empty).Trim().ToLowerInvariant();
-        return enc.Spawners.TryGetValue(key, out string fqn) ? fqn : null;
+        if (enc?.Spawners != null && enc.Spawners.TryGetValue(key, out string fqn) && !String.IsNullOrWhiteSpace(fqn)) return fqn;
+
+        // Keep the established EncounterLoader as the first path.  RED/HE32 encounters can be present by folded id
+        // while their class/name metadata is too old for that loader, so only then read the authored id->FQN table
+        // directly.  This is read-only and does not change how a normal 64-bit encounter is materialized.
+        if (WorldUsesLegacyContent && encounterNode?.Data != null) {
+          string legacy = ResolveLegacyEncounterSpawnerFqn(encounterNode, tag);
+          if (!String.IsNullOrWhiteSpace(legacy)) return legacy;
+        }
+        return null;
       }
       string standalone = path.Replace('\\', '.').Trim('.');
       return standalone.StartsWith("spn.", StringComparison.OrdinalIgnoreCase) ? standalone : null;
+    }
+
+    private string ResolveLegacyEncounterSpawnerFqn(GomObject encounterNode, string tag) {
+      if (encounterNode?.Data == null) return null;
+      string wanted = (tag ?? String.Empty).Trim();
+      object raw = WorldInteractionDataValue(encounterNode.Data, "spnEncounterSpawnerIdsToFqns", "4611686034963770041");
+      Dictionary<object, object> map = WorldInteractionMap(raw);
+      if (map == null) return null;
+
+      foreach (KeyValuePair<object, object> pair in map) {
+        string key = pair.Key?.ToString()?.Trim();
+        if (!String.IsNullOrWhiteSpace(wanted) && !String.Equals(key, wanted, StringComparison.OrdinalIgnoreCase)) continue;
+        string resolved = ResolveGomReferenceName(pair.Value);
+        if (!String.IsNullOrWhiteSpace(resolved)) return resolved;
+      }
+
+      // A handful of prototype revisions wrap each entry in object-data.  Use field-name hints only on the legacy
+      // branch; exact modern table handling above remains untouched.
+      foreach (KeyValuePair<object, object> pair in map) {
+        if (pair.Value is not GomObjectData row) continue;
+        string rowTag = null;
+        string rowSpawner = null;
+        foreach (KeyValuePair<string, object> field in row.Dictionary) {
+          string fieldName = field.Key ?? String.Empty;
+          if (rowTag == null && (fieldName.IndexOf("tag", StringComparison.OrdinalIgnoreCase) >= 0 ||
+              fieldName.IndexOf("index", StringComparison.OrdinalIgnoreCase) >= 0))
+            rowTag = WorldInteractionText(field.Value);
+          if (rowSpawner == null && (fieldName.IndexOf("spawner", StringComparison.OrdinalIgnoreCase) >= 0 ||
+              fieldName.IndexOf("fqn", StringComparison.OrdinalIgnoreCase) >= 0))
+            rowSpawner = ResolveGomReferenceName(field.Value);
+        }
+        if (!String.IsNullOrWhiteSpace(rowSpawner) && (String.IsNullOrWhiteSpace(wanted) ||
+            String.Equals(rowTag, wanted, StringComparison.OrdinalIgnoreCase))) return rowSpawner;
+      }
+      return null;
     }
 
     private sealed class SpawnerPreviewInfo {
@@ -304,16 +362,16 @@ namespace PugTools {
       // Jedipedia deliberately stops its compatibility snapshot at the spawner boundary so npc/plc/dyn/npp
       // still resolve from the actually selected beta archives. Do the same here.
       GomObject spawner = null;
-      try { spawner = currentDom.GetObject(spnFqn); } catch { }
+      try { spawner = WorldResolveGomObject(spnFqn); } catch { }
 
       if (spawner != null) {
-        var list = spawner.Data.ValueOrDefault<List<object>>("spnEntityList", null);
-        if (list != null) {
+        List<object> list = WorldInteractionListEntries(WorldInteractionDataValue(spawner.Data, "spnEntityList", "4611686029875809984"));
+        if (list.Count > 0) {
           bool firstResolvedRow = true;
           var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
           foreach (object entry in list) {
             if (entry is not GomObjectData row) continue;
-            object entityReference = row.ValueOrDefault<object>("spnEntityFqn", null) ?? row.ValueOrDefault<object>("spnEntityId", null);
+            object entityReference = WorldInteractionDataValue(row, "spnEntityFqn", "4611686335039500012") ?? WorldInteractionDataValue(row, "spnEntityId", "4611686063308331194");
             string resolved = ResolveGomReferenceName(entityReference);
             if (String.IsNullOrWhiteSpace(resolved)) continue;
             if (seen.Add(resolved)) result.EntityFqns.Add(resolved);
@@ -321,8 +379,8 @@ namespace PugTools {
             // spnEntityList is alternatives rather than a group. Jedipedia uses the FIRST readable row for the route.
             if (firstResolvedRow) {
               firstResolvedRow = false;
-              var paths = row.ValueOrDefault<List<object>>("spnPathList", null);
-              if (paths != null) foreach (object pathReference in paths) {
+              List<object> paths = WorldInteractionListEntries(WorldInteractionDataValue(row, "spnPathList", "4611686029875809136"));
+              if (paths.Count > 0) foreach (object pathReference in paths) {
                 string path = ResolveGomReferenceName(pathReference);
                 if (String.IsNullOrWhiteSpace(path) || path.StartsWith("pth.generic.", StringComparison.OrdinalIgnoreCase)) continue;
                 result.PathFqn = path;
@@ -480,26 +538,32 @@ namespace PugTools {
       if (rawValue is string text) {
         string trimmed = text.Trim();
         if (trimmed.Length == 0) return null;
-        if (!UInt64.TryParse(trimmed, out ulong numericText)) return trimmed;
-        try { return currentDom.GetObject(numericText)?.Name ?? trimmed; } catch { return trimmed; }
+        if (!UInt64.TryParse(trimmed, out ulong numericText)) {
+          string normalized = WorldNormalizePrototypeReference(trimmed);
+          return String.IsNullOrWhiteSpace(normalized) ? trimmed : normalized;
+        }
+        try {
+          GomObject resolved = WorldResolveGomObject(numericText);
+          return resolved?.Name ?? WorldLegacyPrototypeName(numericText) ?? trimmed;
+        } catch { return WorldLegacyPrototypeName(numericText) ?? trimmed; }
       }
+      ulong id = 0;
       try {
-        if (!TryUnsignedGomId(rawValue, out ulong id)) return rawValue.ToString()?.Trim();
-        return currentDom.GetObject(id)?.Name;
-      } catch { return null; }
+        if (!TryUnsignedGomId(rawValue, out id)) return rawValue.ToString()?.Trim();
+        return WorldResolveGomObject(id)?.Name ?? WorldLegacyPrototypeName(id);
+      } catch { return WorldLegacyPrototypeName(id); }
     }
 
     private int ResolveSpnTraversalStyle(string pathFqn) {
       if (String.IsNullOrWhiteSpace(pathFqn)) return 1;
       try {
-        GomObject pathNode = currentDom.GetObject(pathFqn);
+        GomObject pathNode = WorldResolveGomObject(pathFqn);
         // GomLib stores script-enum payloads as ScriptEnum and deliberately zero-bases ScriptEnum.Value while
         // decoding them (see DomEnum.ValueString/ScriptEnum). SWTOR's pthTraversalStyle itself is 1-based:
         // 1 Forward, 2 Reverse, 3 Patrol, 4 Circuit, 5 Random. Treating ScriptEnum as an ordinary integer made
         // Patrol unreadable and silently fell back to Forward, which is the characteristic "ride one way, snap
         // back to the start" behaviour seen on elevators.
-        object raw = pathNode?.Data.ValueOrDefault<object>("pthTraversalStyle", null)
-          ?? pathNode?.Data.ValueOrDefault<object>("4611686030387597023", null);
+        object raw = WorldInteractionDataValue(pathNode?.Data, "pthTraversalStyle", "4611686030387597023");
         if (raw == null) return 1;
 
         if (raw is ScriptEnum scriptEnum) {
@@ -567,20 +631,29 @@ namespace PugTools {
     private WorldNpcPlacement ResolveClientOnlyNpc(Room room, AssetInstance instance, AreaAsset asset, Dictionary<string, List<GR2>> appearanceCache, Dictionary<string, WorldNpcAnimationClip> animationCache, Dictionary<string, GR2> weaponModelCache) {
       string fqn = (asset.Path ?? String.Empty).Replace('\\', '.').Replace('/', '.').Trim('.');
       if (!fqn.StartsWith("cos.", StringComparison.OrdinalIgnoreCase)) return null;
-      GomObject obj = currentDom.GetObject(fqn);
+      GomObject obj = WorldResolveGomObject(fqn);
       if (obj == null) return null;
-      GomObjectData visual = obj.Data.ValueOrDefault<GomObjectData>("cosVisualData", null);
+      GomObjectData visual = WorldInteractionDataValue(obj.Data, "cosVisualData", "4611686133738205043") as GomObjectData;
       if (visual == null) return null;
-      ulong appearanceId = visual.ValueOrDefault<ulong>("npcTemplateVisualDataAppearance", 0);
+      ulong appearanceId = WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataAppearance", "4611686063308331199"));
       if (appearanceId == 0) return null;
-      GomObject appearanceObj = currentDom.GetObject(appearanceId);
+      GomObject appearanceObj = WorldResolveGomObject(appearanceId);
       if (appearanceObj == null) return null;
-      NpcAppearance appearance = currentDom.AppearanceLoader.Load(appearanceObj.Name) as NpcAppearance;
+      NpcAppearance appearance = null;
+      // Preserve the live path first.  Old client-only COS records can point at an NPP that exists by id but has no
+      // registered FQN; only the legacy branch retries the same loader with the resolved object/name hint.
+      try {
+        if (!String.IsNullOrWhiteSpace(appearanceObj.Name)) appearance = currentDom.AppearanceLoader.Load(appearanceObj.Name) as NpcAppearance;
+      } catch { }
+      if (appearance == null && WorldUsesLegacyContent) {
+        appearanceObj = WorldResolveGomObject(appearanceId, "npp") ?? appearanceObj;
+        try { appearance = currentDom.AppearanceLoader.Load(appearanceObj) as NpcAppearance; } catch { }
+      }
       if (appearance == null) return null;
-      float scale = visual.ValueOrDefault<float>("cosTemplateVisualDataScale", 1f);
-      if (!(scale > 0)) scale = visual.ValueOrDefault<float>("npcTemplateVisualDataScaleAdjustment", 1f);
+      float scale = SpnDynNumber(WorldInteractionDataValue(visual, "cosTemplateVisualDataScale", "4611686134214345041"), 1f);
+      if (!(scale > 0)) scale = SpnDynNumber(WorldInteractionDataValue(visual, "npcTemplateVisualDataScaleAdjustment", "4611686053557231194"), 1f);
       if (!(scale > 0)) scale = 1f;
-      string bodyType = visual.ValueOrDefault<string>("npcTemplateVisualDataCharSpec", null);
+      string bodyType = WorldInteractionText(WorldInteractionDataValue(visual, "npcTemplateVisualDataCharSpec", "4611686053557231192"));
       if (String.IsNullOrWhiteSpace(bodyType)) bodyType = appearance.BodyType;
       if (String.IsNullOrWhiteSpace(bodyType) && appearance.AppearanceSlotMap != null) {
         AppSlot bodySlot = appearance.AppearanceSlotMap.Values.Where(x => x != null).SelectMany(x => x).FirstOrDefault(x => x != null && !String.IsNullOrWhiteSpace(x.BodyType));
@@ -642,6 +715,72 @@ namespace PugTools {
       AddNpcClothAssets(placement);
       AddNpcWeaponAttachments(placement, visual, weaponModelCache);
       return placement.Models.Count > 0 ? placement : null;
+    }
+
+    private WorldNpcPlacement BuildLegacyNpcPlacement(Room room, AssetInstance instance, string sourceFqn, GomObject npcNode,
+        Dictionary<string, List<GR2>> appearanceCache, Dictionary<ulong, float> speciesScales, string idleAnimationName,
+        Dictionary<string, WorldNpcAnimationClip> animationCache, Dictionary<string, WorldInteractionInfo> interactionCache,
+        Dictionary<string, GR2> weaponModelCache) {
+      if (!WorldUsesLegacyContent || npcNode?.Data == null) return null;
+
+      List<object> visualRows = WorldInteractionListEntries(
+        WorldInteractionDataValue(npcNode.Data, "npcVisualDataList", "4611686053557231201"));
+      GomObjectData visual = visualRows.OfType<GomObjectData>().FirstOrDefault();
+      if (visual == null) return null;
+
+      object appearanceReference = WorldInteractionDataValue(visual, "npcTemplateVisualDataAppearance", "4611686063308331199");
+      ulong appearanceId = WorldInteractionUnsigned(appearanceReference);
+      string appearanceFqn = ResolveGomReferenceName(appearanceReference);
+      GomObject appearanceNode = null;
+      if (appearanceId != 0) appearanceNode = WorldResolveGomObject(appearanceId, null);
+      if (appearanceNode == null && !String.IsNullOrWhiteSpace(appearanceFqn)) appearanceNode = WorldResolveGomObject(appearanceFqn);
+      if (appearanceNode != null && String.IsNullOrWhiteSpace(appearanceNode.Name) && !String.IsNullOrWhiteSpace(appearanceFqn))
+        appearanceNode.Name = appearanceFqn;
+
+      NpcAppearance appearance = null;
+      try { if (appearanceNode != null && !String.IsNullOrWhiteSpace(appearanceNode.Name)) appearance = currentDom.AppearanceLoader.Load(appearanceNode) as NpcAppearance; }
+      catch (Exception ex) { System.Diagnostics.Debug.WriteLine("Legacy NPC appearance failed " + sourceFqn + ": " + ex.Message); }
+
+      float scale = SpnDynNumber(WorldInteractionDataValue(visual, "npcTemplateVisualDataScaleAdjustment", "4611686053557231194"), 1f);
+      if (!(scale > 0f)) scale = 1f;
+      long speciesId = WonkInt64(WorldInteractionDataValue(visual, "npcTemplateVisualDataSpecieScale", "4611686068921131191"));
+      if (speciesId != 0 && speciesScales != null && speciesScales.TryGetValue(unchecked((ulong)speciesId), out float speciesScale) && speciesScale > 0f)
+        scale *= speciesScale;
+
+      string bodyType = WorldInteractionText(WorldInteractionDataValue(visual, "npcTemplateVisualDataCharSpec", "4611686053557231192"));
+      if (String.IsNullOrWhiteSpace(bodyType)) bodyType = appearance?.BodyType;
+      if (String.IsNullOrWhiteSpace(bodyType) && appearance?.AppearanceSlotMap != null) {
+        AppSlot bodySlot = appearance.AppearanceSlotMap.Values.Where(x => x != null).SelectMany(x => x)
+          .FirstOrDefault(x => x != null && !String.IsNullOrWhiteSpace(x.BodyType));
+        bodyType = bodySlot?.BodyType;
+      }
+
+      string displayName = LocalizedNpcName(null, sourceFqn);
+      if (!IsRealLocalizedName(displayName, sourceFqn)) displayName = PrettySpawnName(sourceFqn);
+      string title = LocalizedNpcTitle(null, sourceFqn);
+      WorldInteractionInfo interaction = ResolveWorldNpcInteraction(sourceFqn, null, interactionCache);
+      bool isTaxiTerminal = interaction?.Kind == WorldInteractionKind.Taxi;
+      if (!isTaxiTerminal && WorldNpcLooksLikeTaxiTerminal(sourceFqn, displayName, title)) {
+        interaction = new WorldInteractionInfo { Kind = WorldInteractionKind.Taxi, LegacyHeuristic = true };
+        isTaxiTerminal = true;
+        if (interactionCache != null) interactionCache["npc|" + sourceFqn] = interaction;
+      }
+
+      var placement = new WorldNpcPlacement {
+        Room = room, Instance = instance, SourceFqn = sourceFqn, Name = displayName, Title = title,
+        IsTaxiTerminal = isTaxiTerminal, Interaction = interaction, Scale = scale, ShowNameplate = true,
+        Items = ResolveVisualItemNames(visual), IdleAnimationName = idleAnimationName,
+        AnimationPhase = StableAnimationPhase(instance?.ID ?? 0, sourceFqn), BodyType = bodyType,
+        Animation = ResolveNpcAnimationClip(idleAnimationName, bodyType, animationCache),
+        CombatMode = ResolveNpcCombatMode(idleAnimationName)
+      };
+      if (appearance != null) foreach (GR2 model in GetNpcAppearanceModels(appearance, appearanceCache, bodyType)) placement.Models.Add(model);
+      AddNpcClothAssets(placement);
+      AddNpcWeaponAttachments(placement, visual, weaponModelCache);
+
+      // Keep service/conversation NPCs even when a beta NPP itself is missing or too old for AppearanceLoader.  The
+      // overhead icon and map marker have a placement-space fallback and are more useful than silently dropping the NPC.
+      return placement.Models.Count > 0 || placement.Interaction != null ? placement : null;
     }
 
     private sealed class NpcAnimationSpec {
@@ -1330,10 +1469,10 @@ namespace PugTools {
       network = null;
       if (String.IsNullOrWhiteSpace(displayName)) return;
       try {
-        GomObject hyd = currentDom.GetObject("hydAnimationInfoPrototype");
+        GomObject hyd = WorldResolveGomObject("hydAnimationInfoPrototype");
         if (hyd != null) {
-          var byDisplay = hyd.Data.ValueOrDefault<Dictionary<object, object>>("hydAnimationByDisplayName", null);
-          var animations = hyd.Data.ValueOrDefault<Dictionary<object, object>>("hydAnimations", null);
+          var byDisplay = WorldInteractionMap(WorldInteractionDataValue(hyd.Data, "hydAnimationByDisplayName", "4611686102762170021"));
+          var animations = WorldInteractionMap(WorldInteractionDataValue(hyd.Data, "hydAnimations", "4611686046888970051"));
           object animationId = null;
           if (byDisplay != null) {
             foreach (var pair in byDisplay) {
@@ -1342,28 +1481,28 @@ namespace PugTools {
           }
           GomObjectData row = FindAnimationRow(animations, animationId);
           if (row != null) {
-            action = row.ValueOrDefault<string>("hydAnimationAction", null);
-            network = row.ValueOrDefault<string>("hydAnimationLocoNetwork", null);
+            action = WorldInteractionText(WorldInteractionDataValue(row, "hydAnimationAction", "4611686046888970046"));
+            network = WorldInteractionText(WorldInteractionDataValue(row, "hydAnimationLocoNetwork", "4611686059390932433"));
           }
         }
 
         // spnNpcIdleAnimationName may also name an npcIdlePackage rather than hydAnimationByDisplayName directly.
         if (String.IsNullOrWhiteSpace(action)) {
-          GomObject packages = currentDom.GetObject("npcIdlePackagePrototype");
-          var packageMap = packages?.Data.ValueOrDefault<Dictionary<object, object>>("npcIdlePackageMap", null);
+          GomObject packages = WorldResolveGomObject("npcIdlePackagePrototype");
+          var packageMap = WorldInteractionMap(WorldInteractionDataValue(packages?.Data, "npcIdlePackageMap", "4611686054906631197"));
           if (packageMap != null) {
             object packageObject = null;
             foreach (var pair in packageMap) {
               if (String.Equals(pair.Key?.ToString(), displayName, StringComparison.OrdinalIgnoreCase)) { packageObject = pair.Value; break; }
             }
             if (packageObject is GomObjectData packageRow) {
-              object animationId = packageRow.ValueOrDefault<object>("npcIdlePackageAnim", null);
-              GomObject idleHyd = currentDom.GetObject("hydAnimationInfoPrototype");
-              var animations = idleHyd?.Data.ValueOrDefault<Dictionary<object, object>>("hydAnimations", null);
+              object animationId = WorldInteractionDataValue(packageRow, "npcIdlePackageAnim", "4611686054906631193");
+              GomObject idleHyd = WorldResolveGomObject("hydAnimationInfoPrototype");
+              var animations = WorldInteractionMap(WorldInteractionDataValue(idleHyd?.Data, "hydAnimations", "4611686046888970051"));
               GomObjectData animationRow = FindAnimationRow(animations, animationId);
               if (animationRow != null) {
-                action = animationRow.ValueOrDefault<string>("hydAnimationAction", null);
-                network = animationRow.ValueOrDefault<string>("hydAnimationLocoNetwork", null);
+                action = WorldInteractionText(WorldInteractionDataValue(animationRow, "hydAnimationAction", "4611686046888970046"));
+                network = WorldInteractionText(WorldInteractionDataValue(animationRow, "hydAnimationLocoNetwork", "4611686059390932433"));
               } else if (animationId != null) action = animationId.ToString();
             }
           }
@@ -1609,7 +1748,7 @@ namespace PugTools {
       // Read the node's language-independent retriever first. NpcLoader is useful for the rest of the template, but a
       // visible label should not depend on the loader having indexed SelectedLocalization directly.
       try {
-        GomObject node = currentDom?.GetObject(fallbackFqn);
+        GomObject node = WorldResolveGomObject(fallbackFqn);
         object locMap = WorldInteractionDataValue(node?.Data, "locTextRetrieverMap", "4611686102842470023");
         string rawName = WorldLocMapText(locMap, WorldLocNameSlot, fallbackFqn);
         if (IsRealLocalizedName(rawName, fallbackFqn)) return rawName.Trim();
@@ -1623,7 +1762,7 @@ namespace PugTools {
 
     private string LocalizedNpcTitle(Npc npc, string fallbackFqn) {
       try {
-        GomObject node = currentDom?.GetObject(fallbackFqn);
+        GomObject node = WorldResolveGomObject(fallbackFqn);
         object locMap = WorldInteractionDataValue(node?.Data, "locTextRetrieverMap", "4611686102842470023");
         string rawTitle = WorldLocMapText(locMap, WorldLocTitleOrCodexNameSlot, fallbackFqn);
         if (!String.IsNullOrWhiteSpace(rawTitle)) return rawTitle.Trim();
@@ -1653,6 +1792,7 @@ namespace PugTools {
       public readonly List<GR2> Models = new List<GR2>();
       public readonly List<WorldSpnDynState> States = new List<WorldSpnDynState>();
       public readonly List<WorldSpnDynLight> Lights = new List<WorldSpnDynLight>();
+      public readonly List<WorldSpnFxPart> Effects = new List<WorldSpnFxPart>();
     }
 
     private WorldSpnPlacement BuildSpnPlaceablePlacement(Room room, AssetInstance instance, string sourceFqn,
@@ -1660,8 +1800,11 @@ namespace PugTools {
         Dictionary<string, SpnDynPreviewTemplate> dynCache, Dictionary<string, WorldInteractionInfo> interactionCache) {
       Placeable placeable = null;
       GomObject node = null;
-      try { placeable = currentDom.PlaceableLoader.Load(sourceFqn); } catch { }
-      try { node = currentDom.GetObject(sourceFqn); } catch { }
+      try {
+        node = WorldResolveGomObject(sourceFqn);
+        placeable = node != null ? currentDom.PlaceableLoader.Load(node) : currentDom.PlaceableLoader.Load(sourceFqn);
+      } catch { }
+      if (node == null) try { node = WorldResolveGomObject(sourceFqn); } catch { }
 
       SpnDynPreviewTemplate dynTemplate = null;
       if (dynCache != null && dynCache.TryGetValue(sourceFqn, out SpnDynPreviewTemplate cachedDyn)) dynTemplate = cachedDyn;
@@ -1675,7 +1818,7 @@ namespace PugTools {
       // legacy prototype cannot be fully materialized by the high-level loader.
       const ulong quickTravelAbility = 16140902321107152398UL;
       ulong rawAbility = 0;
-      try { rawAbility = node?.Data.ValueOrDefault<ulong>("plcAbilitySpecOnUse", 0) ?? 0; } catch { }
+      try { rawAbility = WorldInteractionUnsigned(WorldInteractionDataValue(node?.Data, "plcAbilitySpecOnUse", "4611686061870631204")); } catch { }
       bool isQuickTravel = placeable?.Category == PlaceableCategory.Bindpoint ||
         placeable?.AbilitySpecOnUseId == quickTravelAbility || rawAbility == quickTravelAbility;
       WorldInteractionInfo interaction = ResolveWorldPlaceableInteraction(sourceFqn, placeable, node, isQuickTravel, interactionCache);
@@ -1721,7 +1864,7 @@ namespace PugTools {
       if ((loaded == null || loaded.Count == 0) && (dynTemplate == null || dynTemplate.Lights.Count == 0) && interaction == null) return null;
 
       long wonkaPackageId = interaction?.WonkaPackageId ?? (placeable?.WonkaPackageId ?? 0);
-      if (wonkaPackageId == 0) wonkaPackageId = WonkInt64(node?.Data.ValueOrDefault<object>("wnkPackageID", null));
+      if (wonkaPackageId == 0) wonkaPackageId = WonkInt64(WorldInteractionDataValue(node?.Data, "wnkPackageID", "4611686061108531204"));
       bool blueGlow = SpnPlaceableHasBlueGlow(placeable, node);
       // A dyn row's Usable bit says WHICH part of an already-interactive plc receives the click; it does not make a
       // shared dyn assembly interactive on its own. Jedipedia applies the same parent gate. Without it, reused dyn
@@ -1743,26 +1886,40 @@ namespace PugTools {
       if (dynTemplate != null) {
         foreach (WorldSpnDynState state in dynTemplate.States) placement.DynStates.Add(state);
         foreach (WorldSpnDynLight light in dynTemplate.Lights) placement.DynLights.Add(light);
+        // Effects need a per-placement identity because the renderer's running FXSPEC player is keyed by owner. The
+        // preview template is shared by every placement of a PLC, so retaining its WorldSpnFxPart objects directly
+        // would accidentally make all copies share one particle clock.
+        foreach (WorldSpnFxPart source in dynTemplate.Effects) {
+          if (source == null) continue;
+          var effect = new WorldSpnFxPart { Path = source.Path, LocalMatrix = source.LocalMatrix };
+          foreach (var pair in source.StateVisibility) effect.StateVisibility[pair.Key] = pair.Value;
+          placement.DynEffects.Add(effect);
+        }
       }
+      // Jedipedia also appends plcUsableVFX at the placeable origin even when plcModel is a plain GR2/MAG. Numeric
+      // leftovers ("1", "104") are explicitly not effects; a real value looks like a resource path.
+      string usableFx = CleanGomString(WorldInteractionDataValue(node?.Data, "plcUsableVFX", "4611686034963470113"));
+      if (!String.IsNullOrWhiteSpace(usableFx) && (usableFx.IndexOf('/') >= 0 || usableFx.IndexOf('\\') >= 0))
+        placement.DynEffects.Add(new WorldSpnFxPart { Path = NormalizeSpnFxSpecPath(usableFx), LocalMatrix = Matrix.Identity });
       return placement;
     }
 
     private SpnDynPreviewTemplate BuildSpnDynPreviewTemplate(Placeable placeable, GomObject plcNode) {
       if (plcNode == null) return null;
-      string modelReference = plcNode.Data.ValueOrDefault<string>("plcModel", null);
+      string modelReference = WorldInteractionText(WorldInteractionDataValue(plcNode.Data, "plcModel", "4611686019112067712"));
       if (String.IsNullOrWhiteSpace(modelReference)) modelReference = placeable?.Model;
       if (String.IsNullOrWhiteSpace(modelReference) || modelReference.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase) ||
           modelReference.EndsWith(".mag", StringComparison.OrdinalIgnoreCase)) return null;
 
       string dynFqn = modelReference.Trim().Replace('/', '.').Replace('\\', '.').Trim('.');
       GomObject dynNode = null;
-      try { dynNode = currentDom.GetObject(dynFqn); } catch { }
+      try { dynNode = WorldResolveGomObject(dynFqn); } catch { }
       if (dynNode == null) return null;
-      var rows = dynNode.Data.ValueOrDefault<List<object>>("dynObjectDataList", null)
-        ?? dynNode.Data.ValueOrDefault<List<object>>("dynVisualList", null);
-      if (rows == null || rows.Count == 0) return null;
+      List<object> rows = WorldInteractionListEntries(WorldInteractionDataValue(dynNode.Data, "dynObjectDataList", "4611686038108070010"));
+      if (rows.Count == 0) rows = WorldInteractionListEntries(WorldInteractionDataValue(dynNode.Data, "dynVisualList", null));
+      if (rows.Count == 0) return null;
 
-      string startState = CleanGomString(plcNode.Data.ValueOrDefault<object>("plcdynStartState", null));
+      string startState = CleanGomString(WorldInteractionDataValue(plcNode.Data, "plcdynStartState", "4611686038497270000"));
       var template = new SpnDynPreviewTemplate { StartState = startState };
       List<string> stateNames = SpnDynStateNames(dynNode, rows, startState);
       if (stateNames.Count == 0) stateNames.Add(null);
@@ -1776,16 +1933,22 @@ namespace PugTools {
         var state = new WorldSpnDynState { Name = stateName };
         for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++) {
           if (rows[rowIndex] is not GomObjectData row) continue;
-          string visual = CleanGomString(row.ValueOrDefault<object>("dynVisualFqn", null));
+          string visual = CleanGomString(WorldInteractionDataValue(row, "dynVisualFqn", "4611686038125770001"));
           if (String.IsNullOrWhiteSpace(visual) || SpnDynVisualHidden(row, visual) || SpnDynRowIsLight(row, visual)) continue;
+          bool isFx = visual.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase);
           bool isMag = visual.EndsWith(".mag", StringComparison.OrdinalIgnoreCase);
-          if (!isMag && !visual.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
+          if (!isFx && !isMag && !visual.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)) continue;
 
           Dictionary<string, GomObjectData> rowStates = SpnDynRowStates(dynNode, row, rowIndex);
+          if (isFx) {
+            // Effects are collected once below after the state table is complete. Doing it here would create one
+            // duplicate WorldSpnFxPart for every state in which the row is visited.
+            continue;
+          }
           if (!SpnDynRowVisible(rowStates, stateName)) continue;
           GomObjectData selectedState = !String.IsNullOrWhiteSpace(stateName) && rowStates != null && rowStates.TryGetValue(stateName, out GomObjectData stateRow)
             ? stateRow : null;
-          string action = selectedState == null ? null : CleanGomString(selectedState.ValueOrDefault<object>("dynMagName", null));
+          string action = selectedState == null ? null : CleanGomString(WorldInteractionDataValue(selectedState, "dynMagName", "4611686038108070003"));
 
           if (isMag && SpnMagActionHidden(visual, action)) {
             // Jedipedia treats a hidden animated part as the object itself being hidden for this dyn state.
@@ -1821,7 +1984,29 @@ namespace PugTools {
       }
 
       foreach (WorldSpnDynLight light in BuildSpnDynLights(dynNode, rows, stateNames)) template.Lights.Add(light);
-      return template.Models.Count == 0 && template.Lights.Count == 0 ? null : template;
+      for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++) {
+        if (rows[rowIndex] is not GomObjectData row) continue;
+        string visual = CleanGomString(WorldInteractionDataValue(row, "dynVisualFqn", "4611686038125770001"));
+        if (String.IsNullOrWhiteSpace(visual) || !visual.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase)) continue;
+        Dictionary<string, GomObjectData> rowStates = SpnDynRowStates(dynNode, row, rowIndex);
+        var effect = new WorldSpnFxPart { Path = NormalizeSpnFxSpecPath(visual), LocalMatrix = SpnDynLocalMatrix(row) };
+        if (stateNames.Count > 1) {
+          foreach (string name in stateNames) if (!String.IsNullOrWhiteSpace(name)) effect.StateVisibility[name] = SpnDynRowVisible(rowStates, name);
+        } else if (!SpnDynRowVisible(rowStates, stateNames.Count == 0 ? null : stateNames[0])) continue;
+        template.Effects.Add(effect);
+      }
+      return template.Models.Count == 0 && template.Lights.Count == 0 && template.Effects.Count == 0 ? null : template;
+    }
+
+    private static string NormalizeSpnFxSpecPath(string value) {
+      string path = CleanGomString(value)?.Replace('\\', '/');
+      if (String.IsNullOrWhiteSpace(path)) return null;
+      while (path.Contains("//")) path = path.Replace("//", "/");
+      path = path.Trim().TrimStart('/');
+      if (path.StartsWith("resources/art/fx/fxspec/", StringComparison.OrdinalIgnoreCase)) path = path.Substring("resources/".Length);
+      if (path.StartsWith("art/fx/fxspec/", StringComparison.OrdinalIgnoreCase)) path = path.Substring("art/fx/fxspec/".Length);
+      if (path.EndsWith(".fxspec", StringComparison.OrdinalIgnoreCase)) path = path.Substring(0, path.Length - ".fxspec".Length);
+      return "/resources/art/fx/fxspec/" + path.TrimStart('/') + ".fxspec";
     }
 
     private static string CleanGomString(object value) {
@@ -1846,7 +2031,7 @@ namespace PugTools {
 
     private static Dictionary<string, GomObjectData> SpnDynRowStates(GomObject dynNode, GomObjectData row, int rowIndex) {
       var result = new Dictionary<string, GomObjectData>(StringComparer.OrdinalIgnoreCase);
-      Dictionary<object, object> current = row?.ValueOrDefault<Dictionary<object, object>>("dynStateToDynObjectState", null);
+      Dictionary<object, object> current = WorldInteractionMap(WorldInteractionDataValue(row, "dynStateToDynObjectState", "4611686309241734002"));
       if (current != null) {
         foreach (var pair in current) if (pair.Value is GomObjectData state) {
           string name = CleanGomString(pair.Key);
@@ -1855,11 +2040,13 @@ namespace PugTools {
         if (result.Count > 0) return result;
       }
 
-      Dictionary<object, object> legacy = dynNode?.Data.ValueOrDefault<Dictionary<object, object>>("dynStateNameToListOfVisualStates", null);
+      Dictionary<object, object> legacy = WorldInteractionMap(WorldInteractionDataValue(dynNode?.Data, "dynStateNameToListOfVisualStates", "4611686038108070012"));
       if (legacy == null) return result.Count == 0 ? null : result;
       foreach (var pair in legacy) {
         string name = CleanGomString(pair.Key);
-        if (String.IsNullOrWhiteSpace(name) || pair.Value is not List<object> stateRows || rowIndex < 0 || rowIndex >= stateRows.Count) continue;
+        if (String.IsNullOrWhiteSpace(name)) continue;
+        List<object> stateRows = WorldInteractionListEntries(pair.Value);
+        if (rowIndex < 0 || rowIndex >= stateRows.Count) continue;
         if (stateRows[rowIndex] is GomObjectData state) result[name] = state;
       }
       return result.Count == 0 ? null : result;
@@ -1876,26 +2063,26 @@ namespace PugTools {
             placeable.WonkaPackageId != 0 || !String.IsNullOrWhiteSpace(placeable.ConversationFqn)) return true;
       }
       if (node?.Data == null) return false;
-      if (node.Data.ValueOrDefault("plcTemplateNoGlow", false)) return false;
+      if (WorldConversationBool(WorldInteractionDataValue(node.Data, "plcTemplateNoGlow", "4611686065871431191"))) return false;
       long propState = 0;
-      try { propState = Convert.ToInt64(node.Data.ValueOrDefault<object>("plcPropState", null), System.Globalization.CultureInfo.InvariantCulture); } catch { }
+      try { propState = Convert.ToInt64(WorldInteractionDataValue(node.Data, "plcPropState", "4611686093620969991"), System.Globalization.CultureInfo.InvariantCulture); } catch { }
       if ((propState & 4L) != 0) return true;
-      return SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcAbilitySpecOnUse", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcAbilitySpecOnLoot", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcCodexSpec", null)) ||
+      return SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcAbilitySpecOnUse", "4611686061870631204")) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcAbilitySpecOnLoot", "4611686062140131191")) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcCodexSpec", "4611686062140131223")) ||
         // These two field names changed in our old GOM name table while the stable IDs stayed the same. Accept both
         // spellings so Live and RED/Beta DOMs reach the same decision as the current Jedipedia reader.
-        (SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcRequiredLevelForUse", null)) ||
-         SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcTreasureChestLootLevel", null))) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcMissionBoardPkg", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcConvo", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcdynLootState", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcPartialLootTimer", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcDespawnOnUse", null)) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcDisableOnUse", null)) ||
-        (SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcUseDistance", null)) ||
-         SpnGlowValueSet(node.Data.ValueOrDefault<object>("plcTemplateUseDistance", null))) ||
-        SpnGlowValueSet(node.Data.ValueOrDefault<object>("wnkPackageID", null));
+        (SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcRequiredLevelForUse", "4611686334255220000")) ||
+         SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcTreasureChestLootLevel", "4611686334255220000"))) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcMissionBoardPkg", "4611686052498831192")) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcConvo", "4611686022462471005")) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcdynLootState", "4611686039191370000")) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcPartialLootTimer", "4611686054906331239")) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcDespawnOnUse", "4611686022146150487")) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcDisableOnUse", "4611686033786470002")) ||
+        (SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcUseDistance", "4611686054754632476")) ||
+         SpnGlowValueSet(WorldInteractionDataValue(node.Data, "plcTemplateUseDistance", "4611686054754632476"))) ||
+        SpnGlowValueSet(WorldInteractionDataValue(node.Data, "wnkPackageID", "4611686061108531204"));
     }
 
     private static bool SpnGlowValueSet(object value) {
@@ -1907,7 +2094,8 @@ namespace PugTools {
 
     private static bool SpnDynRowBlueGlow(Dictionary<string, GomObjectData> states, string stateName) {
       if (String.IsNullOrWhiteSpace(stateName) || states == null || !states.TryGetValue(stateName, out GomObjectData state) || state == null) return false;
-      if (!state.Dictionary.TryGetValue("dynState", out object raw) || raw == null) return false;
+      object raw = WorldInteractionDataValue(state, "dynState", "4611686038108070002");
+      if (raw == null) return false;
       return (SpnDynInteger(raw, 0) & 4L) != 0;
     }
 
@@ -1916,7 +2104,9 @@ namespace PugTools {
       bool authored = false;
       bool visible = false;
       foreach (var pair in states) {
-        if (pair.Value == null || !pair.Value.Dictionary.TryGetValue("dynState", out object raw) || raw == null) continue;
+        if (pair.Value == null) continue;
+        object raw = WorldInteractionDataValue(pair.Value, "dynState", "4611686038108070002");
+        if (raw == null) continue;
         authored = true;
         long flags = SpnDynInteger(raw, 0);
         if (String.Equals(pair.Key, stateName, StringComparison.OrdinalIgnoreCase) && (flags & 1L) != 0) visible = true;
@@ -1954,9 +2144,9 @@ namespace PugTools {
     }
 
     private static Matrix SpnDynLocalMatrix(GomObjectData row) {
-      Vector3 position = SpnDynVector3(row?.ValueOrDefault<object>("dynPosition", null), Vector3.Zero);
-      Vector3 rotation = SpnDynVector3(row?.ValueOrDefault<object>("dynRotation", null), Vector3.Zero);
-      Vector3 scale = SpnDynVector3(row?.ValueOrDefault<object>("dynScale", null), new Vector3(1f, 1f, 1f));
+      Vector3 position = SpnDynVector3(WorldInteractionDataValue(row, "dynPosition", "4611686038108070005"), Vector3.Zero);
+      Vector3 rotation = SpnDynVector3(WorldInteractionDataValue(row, "dynRotation", "4611686038108070006"), Vector3.Zero);
+      Vector3 scale = SpnDynVector3(WorldInteractionDataValue(row, "dynScale", "4611686038108070007"), new Vector3(1f, 1f, 1f));
       float rx = rotation.X * (float)Math.PI / 180f, ry = rotation.Y * (float)Math.PI / 180f, rz = rotation.Z * (float)Math.PI / 180f;
       // Row-vector equivalent of Jedipedia's T · Ry · Rx · Rz · S.
       return Matrix.Scaling(scale) * Matrix.RotationZ(rz) * Matrix.RotationX(rx) * Matrix.RotationY(ry) * Matrix.Translation(position);
@@ -1964,7 +2154,7 @@ namespace PugTools {
 
     private static bool SpnDynVisualHidden(GomObjectData row, string visual) {
       string path = (visual ?? String.Empty).Replace('\\', '/').ToLowerInvariant();
-      string objectName = CleanGomString(row?.ValueOrDefault<object>("dynObjectName", null)) ?? String.Empty;
+      string objectName = CleanGomString(WorldInteractionDataValue(row, "dynObjectName", "4611686039107870012")) ?? String.Empty;
       if (objectName.StartsWith("dbo_", StringComparison.OrdinalIgnoreCase)) return true;
       string[] pieces = path.Split(new[] { '/', '_', '.' }, StringSplitOptions.RemoveEmptyEntries);
       return pieces.Any(piece => String.Equals(piece, "collision", StringComparison.OrdinalIgnoreCase)) ||
@@ -1973,7 +2163,7 @@ namespace PugTools {
 
     private static bool SpnDynRowIsLight(GomObjectData row, string visual) {
       if (!String.IsNullOrWhiteSpace(visual) && visual.EndsWith(".lit", StringComparison.OrdinalIgnoreCase)) return true;
-      object rawType = row?.ValueOrDefault<object>("dynObjectType", null);
+      object rawType = WorldInteractionDataValue(row, "dynObjectType", "4611686359083027001");
       return SpnDynInteger(rawType, -1) == 5;
     }
 
@@ -2082,7 +2272,7 @@ namespace PugTools {
       if (dynNode == null || rows == null) return result;
       for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++) {
         if (rows[rowIndex] is not GomObjectData row) continue;
-        string visual = CleanGomString(row.ValueOrDefault<object>("dynVisualFqn", null));
+        string visual = CleanGomString(WorldInteractionDataValue(row, "dynVisualFqn", "4611686038125770001"));
         if (!SpnDynRowIsLight(row, visual)) continue;
 
         Dictionary<string, GomObjectData> rowStates = SpnDynRowStates(dynNode, row, rowIndex);
@@ -2114,8 +2304,8 @@ namespace PugTools {
 
     private static Dictionary<string, object> SpnDynLightProperties(GomObject dynNode, GomObjectData row) {
       var result = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
-      string objectName = CleanGomString(row?.ValueOrDefault<object>("dynObjectName", null));
-      Dictionary<object, object> legacyByName = dynNode?.Data.ValueOrDefault<Dictionary<object, object>>("dynLightNameToProperty", null);
+      string objectName = CleanGomString(WorldInteractionDataValue(row, "dynObjectName", "4611686039107870012"));
+      Dictionary<object, object> legacyByName = WorldInteractionMap(WorldInteractionDataValue(dynNode?.Data, "dynLightNameToProperty", "4611686039377470039"));
       if (legacyByName != null && !String.IsNullOrWhiteSpace(objectName)) {
         foreach (var pair in legacyByName) {
           if (!String.Equals(CleanGomString(pair.Key), objectName, StringComparison.OrdinalIgnoreCase) || pair.Value is not GomObjectData legacy) continue;
@@ -2130,11 +2320,14 @@ namespace PugTools {
         }
       }
 
-      foreach (string field in new[] {
-        "dynObjectDataStringProperties", "dynObjectDataFloatProperties", "dynObjectDataBooleanProperties",
-        "dynObjectDataIntegerProperties", "dynObjectDataVector3Properties"
+      foreach ((string Name, string Id) field in new[] {
+        ("dynObjectDataStringProperties", "4611686359132287000"),
+        ("dynObjectDataFloatProperties", "4611686359132287002"),
+        ("dynObjectDataBooleanProperties", "4611686359132287004"),
+        ("dynObjectDataIntegerProperties", "4611686359132287001"),
+        ("dynObjectDataVector3Properties", "4611686359132287003")
       }) {
-        Dictionary<object, object> map = row?.ValueOrDefault<Dictionary<object, object>>(field, null);
+        Dictionary<object, object> map = WorldInteractionMap(WorldInteractionDataValue(row, field.Name, field.Id));
         if (map == null) continue;
         foreach (var pair in map) {
           if (!TryUnsignedGomId(pair.Key, out ulong hash) || !SpnDynLightPropertyNames.TryGetValue(hash, out string name)) continue;
@@ -2145,7 +2338,19 @@ namespace PugTools {
     }
 
     private static void AddLegacySpnDynLightProperty(Dictionary<string, object> target, GomObjectData source, string field, string name) {
-      if (source != null && source.Dictionary.TryGetValue(field, out object value) && value != null) target[name] = value;
+      if (source == null) return;
+      string numeric = null;
+      switch (field) {
+        case "dynLightType": numeric = "4611686039377470026"; break;
+        case "dynLightColor": numeric = "4611686039377470027"; break;
+        case "dynLightRampMap": numeric = "4611686039377470030"; break;
+        case "dynLightIlluminationMap": numeric = "4611686039377470031"; break;
+        case "dynLightFalloff": numeric = "4611686039377470032"; break;
+        case "dynLightIntensity": numeric = "4611686039377470033"; break;
+        case "dynLightRange": numeric = "4611686039377470034"; break;
+      }
+      object value = WorldInteractionDataValue(source, field, numeric);
+      if (value != null) target[name] = value;
     }
 
     private static bool SpnDynBool(object value, bool fallback) {
@@ -2202,8 +2407,8 @@ namespace PugTools {
       var candidates = new List<string>();
       if (!String.IsNullOrWhiteSpace(placeable?.Model)) candidates.Add(placeable.Model);
       if (node != null) {
-        string plcModel = node.Data.ValueOrDefault<string>("plcModel", null);
-        string modelSpec = node.Data.ValueOrDefault<string>("plcModelAssetSpec", null);
+        string plcModel = WorldInteractionText(WorldInteractionDataValue(node.Data, "plcModel", "4611686019112067712"));
+        string modelSpec = WorldInteractionText(WorldInteractionDataValue(node.Data, "plcModelAssetSpec", "4611686029003970036"));
         if (!String.IsNullOrWhiteSpace(plcModel)) candidates.Add(plcModel);
         if (!String.IsNullOrWhiteSpace(modelSpec)) candidates.Add(modelSpec);
       }
@@ -2229,16 +2434,19 @@ namespace PugTools {
       }
       string fqn = referenceValue.Replace('/', '.').Replace('\\', '.').Trim('.');
       GomObject dyn = null;
-      try { dyn = currentDom.GetObject(fqn); } catch { }
+      try { dyn = WorldResolveGomObject(fqn); } catch { }
       if (dyn == null) return;
-      foreach (string field in new[] { "plcModel", "plcModelAssetSpec", "vehAppModel", "dynVisualFqn" }) {
-        string direct = dyn.Data.ValueOrDefault<string>(field, null);
+      foreach ((string Name, string Id) field in new[] {
+        ("plcModel", "4611686019112067712"), ("plcModelAssetSpec", "4611686029003970036"),
+        ("vehAppModel", "4611686061988131201"), ("dynVisualFqn", "4611686038125770001") }) {
+        string direct = WorldInteractionText(WorldInteractionDataValue(dyn.Data, field.Name, field.Id));
         if (!String.IsNullOrWhiteSpace(direct)) CollectSpnModels(direct, output, visited, ref animation);
       }
-      var visuals = dyn.Data.ValueOrDefault<List<object>>("dynObjectDataList", null)
-        ?? dyn.Data.ValueOrDefault<List<object>>("dynVisualList", null);
-      if (visuals != null) foreach (object item in visuals) if (item is GomObjectData row) {
-        string visual = row.ValueOrDefault<string>("dynVisualFqn", null) ?? row.ValueOrDefault<string>("dynVisualModel", null);
+      List<object> visuals = WorldInteractionListEntries(WorldInteractionDataValue(dyn.Data, "dynObjectDataList", "4611686038108070010"));
+      if (visuals.Count == 0) visuals = WorldInteractionListEntries(WorldInteractionDataValue(dyn.Data, "dynVisualList", null));
+      foreach (object item in visuals) if (item is GomObjectData row) {
+        string visual = WorldInteractionText(WorldInteractionDataValue(row, "dynVisualFqn", "4611686038125770001")) ??
+          WorldInteractionText(WorldInteractionDataValue(row, "dynVisualModel", null));
         if (!String.IsNullOrWhiteSpace(visual)) CollectSpnModels(visual, output, visited, ref animation);
       }
     }
@@ -2416,13 +2624,13 @@ namespace PugTools {
     private int ResolveNpcCombatMode(string idleAnimationName) {
       if (String.IsNullOrWhiteSpace(idleAnimationName) || currentDom == null) return 1;
       try {
-        GomObject packages = currentDom.GetObject("npcIdlePackagePrototype");
-        var packageMap = packages?.Data.ValueOrDefault<Dictionary<object, object>>("npcIdlePackageMap", null);
+        GomObject packages = WorldResolveGomObject("npcIdlePackagePrototype");
+        var packageMap = WorldInteractionMap(WorldInteractionDataValue(packages?.Data, "npcIdlePackageMap", "4611686054906631197"));
         if (packageMap == null) return 1;
         foreach (var pair in packageMap) {
           if (!String.Equals(pair.Key?.ToString(), idleAnimationName, StringComparison.OrdinalIgnoreCase)) continue;
           if (pair.Value is not GomObjectData row) return 1;
-          object raw = row.ValueOrDefault<object>("npcIdlePackageWeaponMode", null);
+          object raw = WorldInteractionDataValue(row, "npcIdlePackageWeaponMode", "4611686054906631195");
           if (raw is ScriptEnum script) {
             string text = script.ToString();
             if (text.IndexOf("Melee", StringComparison.OrdinalIgnoreCase) >= 0) return 2;
@@ -2448,10 +2656,10 @@ namespace PugTools {
 
     private void AddNpcWeaponAttachments(WorldNpcPlacement placement, GomObjectData visual, Dictionary<string, GR2> modelCache) {
       if (placement == null || visual == null) return;
-      AddNpcWeaponAttachment(placement, visual.ValueOrDefault<ulong>("npcTemplateVisualDataMeleeWeapon", 0), 2, "rightweapon", modelCache);
-      AddNpcWeaponAttachment(placement, visual.ValueOrDefault<ulong>("npcTemplateVisualDataMeleeOffWeapon", 0), 2, "leftweapon", modelCache);
-      AddNpcWeaponAttachment(placement, visual.ValueOrDefault<ulong>("npcTemplateVisualDataRangedWeapon", 0), 3, "rightweapon", modelCache);
-      AddNpcWeaponAttachment(placement, visual.ValueOrDefault<ulong>("npcTemplateVisualDataRangedOffWeapon", 0), 3, "leftweapon", modelCache);
+      AddNpcWeaponAttachment(placement, WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataMeleeWeapon", "4611686061193731191")), 2, "rightweapon", modelCache);
+      AddNpcWeaponAttachment(placement, WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataMeleeOffWeapon", "4611686061193731192")), 2, "leftweapon", modelCache);
+      AddNpcWeaponAttachment(placement, WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataRangedWeapon", "4611686061193731193")), 3, "rightweapon", modelCache);
+      AddNpcWeaponAttachment(placement, WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataRangedOffWeapon", "4611686061193731194")), 3, "leftweapon", modelCache);
     }
 
     private void AddNpcWeaponAttachment(WorldNpcPlacement placement, ulong itemId, int fallbackMode, string boneName, Dictionary<string, GR2> modelCache) {
@@ -2493,10 +2701,10 @@ namespace PugTools {
     private string[] ResolveVisualItemNames(GomObjectData visual) {
       if (visual == null) return Array.Empty<string>();
       var names = new List<string>();
-      AddNpcItemName(visual.ValueOrDefault<ulong>("npcTemplateVisualDataMeleeWeapon", 0), names);
-      AddNpcItemName(visual.ValueOrDefault<ulong>("npcTemplateVisualDataMeleeOffWeapon", 0), names);
-      AddNpcItemName(visual.ValueOrDefault<ulong>("npcTemplateVisualDataRangedWeapon", 0), names);
-      AddNpcItemName(visual.ValueOrDefault<ulong>("npcTemplateVisualDataRangedOffWeapon", 0), names);
+      AddNpcItemName(WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataMeleeWeapon", "4611686061193731191")), names);
+      AddNpcItemName(WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataMeleeOffWeapon", "4611686061193731192")), names);
+      AddNpcItemName(WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataRangedWeapon", "4611686061193731193")), names);
+      AddNpcItemName(WorldInteractionUnsigned(WorldInteractionDataValue(visual, "npcTemplateVisualDataRangedOffWeapon", "4611686061193731194")), names);
       return names.Distinct(StringComparer.CurrentCultureIgnoreCase).ToArray();
     }
 

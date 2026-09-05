@@ -196,7 +196,7 @@ namespace PugTools {
       string value = package.Trim();
       foreach (string candidate in new[] { value, value.TrimStart('/'), value.Replace('/', '.') }.Distinct(StringComparer.OrdinalIgnoreCase)) {
         try {
-          GomObject obj = currentDom.GetObject(candidate);
+          GomObject obj = WorldResolveGomObject(candidate);
           if (obj != null) return obj;
         } catch { }
       }

@@ -20,6 +20,7 @@ namespace PugTools {
     private bool miniMapWorldScope = true;
     private bool miniMapPreferOriginalArt;
     private bool miniMapCaptureUseAutoScope = true;
+    private bool miniMapCaptureForceFullExtent;
     private long miniMapTrackedCameraPageGuid = Int64.MinValue;
     private long miniMapLinkedMapNameSId;
     private long miniMapLinkedSubmapNameSId;
@@ -139,9 +140,14 @@ namespace PugTools {
       miniMapCaptureUseAutoScope = true;
       ResetMapCamera();
       AreaMapPage selected = MiniMapSelectedPage;
+      bool forceFullExtent = miniMapCaptureForceFullExtent;
+      miniMapCaptureForceFullExtent = false;
       bool usePageBounds = !MiniMapIsWorldScope || (miniMapPreferOriginalArt && selected?.HasImage == true);
       if (usePageBounds && InteractiveMapPageHasBounds(selected)) SetInteractiveMapExtentFromPage(selected);
-      else ApplyMapExtentSelection();
+      else if (forceFullExtent && mapFullExtentMaxX > mapFullExtentMinX && mapFullExtentMaxZ > mapFullExtentMinZ) {
+        mapExtentMinX = mapFullExtentMinX; mapExtentMaxX = mapFullExtentMaxX;
+        mapExtentMinZ = mapFullExtentMinZ; mapExtentMaxZ = mapFullExtentMaxZ;
+      } else ApplyMapExtentSelection();
       mapCenter = new Vector2((mapExtentMinX + mapExtentMaxX) * .5f, (mapExtentMinZ + mapExtentMaxZ) * .5f);
       mapZoom = 1f;
       UpdateMapCamera();
@@ -155,7 +161,12 @@ namespace PugTools {
     }
 
     public void RequestMiniMapSnapshot(bool autoSelectScope) {
+      RequestMiniMapSnapshot(autoSelectScope, false);
+    }
+
+    public void RequestMiniMapSnapshot(bool autoSelectScope, bool forceFullExtent) {
       miniMapCaptureUseAutoScope = autoSelectScope;
+      miniMapCaptureForceFullExtent = forceFullExtent;
       miniMapCaptureRequested = true;
     }
 

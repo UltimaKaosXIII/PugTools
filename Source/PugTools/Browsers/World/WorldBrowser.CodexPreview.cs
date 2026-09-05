@@ -62,7 +62,7 @@ namespace PugTools {
       ulong codexId = 0;
       object rawNameRetriever = null;
       try {
-        GomObject plcNode = !String.IsNullOrWhiteSpace(spn.SourceFqn) ? currentDom.GetObject(spn.SourceFqn) : null;
+        GomObject plcNode = !String.IsNullOrWhiteSpace(spn.SourceFqn) ? WorldResolveGomObject(spn.SourceFqn) : null;
         codexId = WorldInteractionUnsigned(WorldInteractionDataValue(plcNode?.Data, "plcCodexSpec", "4611686062140131223"));
         object rawLocMap = WorldInteractionDataValue(plcNode?.Data, "locTextRetrieverMap", "4611686102842470023");
         rawNameRetriever = WorldCodexDictionaryValue(rawLocMap, 15685385242400905286UL);
@@ -156,6 +156,7 @@ namespace PugTools {
         // GetObjectId is an index-only lookup. It cannot be derailed by a sparse selected localization and is exactly
         // what we need here: the cdx node's stable identity, not its translated model yet.
         try { ulong directId = currentDom.GetObjectId(fqn); if (directId != 0) return directId; } catch { }
+        try { GomObject legacy = WorldResolveGomObject(fqn); if (legacy != null && legacy.Id != 0) return legacy.Id; } catch { }
       }
 
       // A few releases renamed the codex leaf without changing the PLC topic. Compare normalized tutorial leaves as
@@ -164,7 +165,7 @@ namespace PugTools {
       if (String.IsNullOrWhiteSpace(wanted)) return 0;
       var matches = new List<ulong>();
       try {
-        foreach (GomObject node in currentDom.GetObjectsStartingWith("cdx.game_rules.tutorials.")) {
+        foreach (GomObject node in WorldObjectsStartingWith("cdx.game_rules.tutorials.")) {
           if (node == null || node.Id == 0 || String.IsNullOrWhiteSpace(node.Name)) continue;
           string leaf = node.Name.Substring(node.Name.LastIndexOf('.') + 1);
           string compact = WorldLoreCodexCompactKey(leaf);
@@ -185,7 +186,7 @@ namespace PugTools {
       ulong bestId = 0;
       bool tied = false;
       try {
-        foreach (GomObject node in currentDom.GetObjectsStartingWith("cdx.")) {
+        foreach (GomObject node in WorldObjectsStartingWith("cdx.")) {
           if (node == null || node.Id == 0 || String.IsNullOrWhiteSpace(node.Name)) continue;
           string fqn = node.Name.ToLowerInvariant();
           string leaf = fqn.Substring(fqn.LastIndexOf('.') + 1);
@@ -259,7 +260,7 @@ namespace PugTools {
       var duplicateKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
       var duplicateRetrievers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
       try {
-        foreach (GomObject node in currentDom.GetObjectsStartingWith("cdx.")) {
+        foreach (GomObject node in WorldObjectsStartingWith("cdx.")) {
           if (node == null || node.Id == 0 || String.IsNullOrWhiteSpace(node.Name)) continue;
 
           // The FQN leaf is language independent and remains useful for old/beta objects whose PLC carries no
@@ -402,7 +403,7 @@ namespace PugTools {
       // gender variant (or a sparse STB row), which used to leave the World Browser with an empty knowledge popup.
       // Always re-read the raw retrievers and explicitly choose the current locale with a same-language fallback.
       try {
-        GomObject node = currentDom.GetObject(id);
+        GomObject node = WorldResolveGomObject(id);
         if (node == null) {
           if (result != null) return result;
           error = loaderError == null ? "Codex node " + id + " was not found." : loaderError.Message;

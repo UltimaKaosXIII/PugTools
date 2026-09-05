@@ -142,7 +142,7 @@ namespace PugTools {
       try {
         if (selectedFqn.StartsWith("tax.", StringComparison.OrdinalIgnoreCase)) terminalFqn = selectedFqn;
         else {
-          GomObject selected = currentDom.GetObject(selectedFqn);
+          GomObject selected = WorldResolveGomObject(selectedFqn);
           rawTerminal = TaxiDataValue(selected?.Data, "plcTaxiTerminalSpec", "4611686035128171095")
             ?? TaxiDataValue(selected?.Data, "taxTerminalSpec", "4611686035046870025");
           terminalFqn = ResolveTaxiReferenceName(rawTerminal);
@@ -449,7 +449,7 @@ namespace PugTools {
       if (String.IsNullOrWhiteSpace(sourceFqn) || currentDom == null) return null;
       if (sourceFqn.StartsWith("tax.", StringComparison.OrdinalIgnoreCase)) return sourceFqn;
       try {
-        GomObject selected = currentDom.GetObject(sourceFqn);
+        GomObject selected = WorldResolveGomObject(sourceFqn);
         return TaxiDataValue(selected?.Data, "plcTaxiTerminalSpec", "4611686035128171095")
           ?? TaxiDataValue(selected?.Data, "taxTerminalSpec", "4611686035046870025");
       } catch { return null; }
@@ -551,6 +551,35 @@ namespace PugTools {
       return String.Join(" • ", bits);
     }
 
+    private IEnumerable<GomObject> WorldLegacyTaxiTerminalObjects() {
+      if (!WorldUsesLegacyContent || area?.MapNotes == null) yield break;
+      var seen = new HashSet<ulong>();
+      foreach (AreaMapNote note in area.MapNotes) {
+        if (note == null || String.IsNullOrWhiteSpace(note.Fqn)) continue;
+        string target = null;
+        try {
+          string mpn = note.Fqn.Trim().Trim('.');
+          GomObject mapNote = WorldResolveGomObject(mpn.StartsWith("mpn.", StringComparison.OrdinalIgnoreCase) ? mpn : "mpn." + mpn);
+          target = WorldInteractionText(WorldInteractionDataValue(mapNote?.Data, "mpnMetadataFullFQN", "4611686226320720000"));
+        } catch { }
+        if (String.IsNullOrWhiteSpace(target)) {
+          // Jedipedia's virtual-prototype reconstruction: a taxi map note mirrors the terminal name, with
+          // mpn.location.<body> becoming tax.<body>. This is only needed when the legacy GOM omitted the tax.* name.
+          string mpn = note.Fqn.Trim().Trim('.');
+          if (mpn.StartsWith("mpn.location.", StringComparison.OrdinalIgnoreCase) &&
+              mpn.IndexOf(".taxi.", StringComparison.OrdinalIgnoreCase) >= 0)
+            target = "tax." + mpn.Substring("mpn.location.".Length);
+        }
+        string normalized = WorldNormalizePrototypeReference(target);
+        if (String.IsNullOrWhiteSpace(normalized) || !normalized.StartsWith("tax.", StringComparison.OrdinalIgnoreCase)) continue;
+        GomObject terminal = null;
+        try { terminal = WorldResolveGomObject(normalized); } catch { }
+        if (terminal == null || !seen.Add(terminal.Id)) continue;
+        if (String.IsNullOrWhiteSpace(terminal.Name)) terminal.Name = normalized;
+        yield return terminal;
+      }
+    }
+
     /// <summary>
     /// Resolve the current area's taxi graph once while the area is already loading. SWTOR stores terminal links in
     /// tax.* objects (taxRoutes -> taxRoutePath/taxRouteDestination). The path itself is authored in area.dat, so only
@@ -571,7 +600,13 @@ namespace PugTools {
       try { terminalNames = currentDom.StringTable.Find("str.tax.terminals"); } catch { }
 
       try {
-        foreach (GomObject terminal in currentDom.GetObjectsStartingWith("tax.")) {
+        var taxiTerminals = WorldObjectsStartingWith("tax.");
+        if (WorldUsesLegacyContent) {
+          var knownTaxiIds = new HashSet<ulong>(taxiTerminals.Where(x => x != null).Select(x => x.Id));
+          foreach (GomObject terminal in WorldLegacyTaxiTerminalObjects())
+            if (terminal != null && knownTaxiIds.Add(terminal.Id)) taxiTerminals.Add(terminal);
+        }
+        foreach (GomObject terminal in taxiTerminals) {
           if (terminal == null) continue;
           GomObjectData data;
           try { data = terminal.Data; } catch { continue; }
@@ -758,26 +793,29 @@ namespace PugTools {
     private GomObject FindTaxiPrototypeWithDataField(string fieldName, string numericFieldName, string nameHint, params string[] preferredNames) {
       if (currentDom == null) return null;
       Func<GomObject, bool> hasField = node => {
-        try { return node?.Data != null && TaxiDataValue(node.Data, fieldName, numericFieldName) is System.Collections.IDictionary; }
+        try {
+          object raw = node?.Data == null ? null : TaxiDataValue(node.Data, fieldName, numericFieldName);
+          return raw is System.Collections.IDictionary || raw is GomObjectData;
+        }
         catch { return false; }
       };
 
       if (preferredNames != null) foreach (string name in preferredNames) {
         if (String.IsNullOrWhiteSpace(name)) continue;
-        try { GomObject node = currentDom.GetObject(name); if (hasField(node)) return node; } catch { }
+        try { GomObject node = WorldResolveGomObject(name); if (hasField(node)) return node; } catch { }
       }
 
       // Prototype object names have moved over the lifetime of the client while the table field itself stayed stable.
       // Search only likely names first, then all *Prototype instances as a conservative last resort.
       try {
-        IEnumerable<string> names = currentDom.GetAllInstanceNames().Keys;
+        IEnumerable<string> names = WorldKnownPrototypeNames();
         foreach (string name in names.Where(x => !String.IsNullOrWhiteSpace(x) &&
           x.IndexOf(nameHint ?? String.Empty, StringComparison.OrdinalIgnoreCase) >= 0)) {
-          try { GomObject node = currentDom.GetObject(name); if (hasField(node)) return node; } catch { }
+          try { GomObject node = WorldResolveGomObject(name); if (hasField(node)) return node; } catch { }
         }
         foreach (string name in names.Where(x => !String.IsNullOrWhiteSpace(x) &&
           x.IndexOf("prototype", StringComparison.OrdinalIgnoreCase) >= 0)) {
-          try { GomObject node = currentDom.GetObject(name); if (hasField(node)) return node; } catch { }
+          try { GomObject node = WorldResolveGomObject(name); if (hasField(node)) return node; } catch { }
         }
       } catch { }
       return null;
@@ -785,7 +823,17 @@ namespace PugTools {
 
     private static System.Collections.IDictionary TaxiDataTable(GomObject prototype, string fieldName, string numericFieldName) {
       if (prototype?.Data == null) return null;
-      return TaxiDataValue(prototype.Data, fieldName, numericFieldName) as System.Collections.IDictionary;
+      object raw = TaxiDataValue(prototype.Data, fieldName, numericFieldName);
+      if (raw is System.Collections.IDictionary dictionary) return dictionary;
+      if (raw is GomObjectData data) {
+        var result = new Dictionary<object, object>();
+        foreach (KeyValuePair<string, object> pair in data.Dictionary) {
+          if (String.Equals(pair.Key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          result[pair.Key] = pair.Value;
+        }
+        return result;
+      }
+      return null;
     }
 
     private GR2 ResolveTaxiModelReference(object raw, out string modelPath) {
@@ -909,7 +957,7 @@ namespace PugTools {
       if (currentDom == null || names == null) return null;
       foreach (string name in names) {
         if (String.IsNullOrWhiteSpace(name)) continue;
-        try { GomObject node = currentDom.GetObject(name); if (node != null) return node; } catch { }
+        try { GomObject node = WorldResolveGomObject(name); if (node != null) return node; } catch { }
       }
       return null;
     }
@@ -1024,7 +1072,18 @@ namespace PugTools {
 
     private IEnumerable<GomObjectData> EnumerateTaxiRouteRows(object raw) {
       if (raw == null) yield break;
-      if (raw is GomObjectData inline) { yield return inline; yield break; }
+      if (raw is GomObjectData inline) {
+        // A modern route reference can be the row itself; RED often serializes the route list as an anonymous
+        // GomObjectData map. Distinguish the two by the stable route-path field and recurse only for the list shape.
+        if (TaxiDataValue(inline, "taxRoutePath", "4611686034424570033") != null ||
+            TaxiDataValue(inline, "taxRouteDestination", "4611686034424570031") != null) {
+          yield return inline;
+        } else {
+          foreach (object value in WorldInteractionListEntries(inline))
+            foreach (GomObjectData row in EnumerateTaxiRouteRows(value)) yield return row;
+        }
+        yield break;
+      }
       if (raw is GomObject objectNode) { GomObjectData d = null; try { d = objectNode.Data; } catch { } if (d != null) yield return d; yield break; }
       GomObject referenced = ResolveTaxiObject(raw);
       if (referenced != null) { GomObjectData d = null; try { d = referenced.Data; } catch { } if (d != null) yield return d; yield break; }
@@ -1046,8 +1105,8 @@ namespace PugTools {
       if (raw == null) return null;
       if (raw is GomObject direct) return direct;
       try {
-        if (TryUnsignedGomId(raw, out ulong id) && id != 0) return currentDom.GetObject(id);
-        if (raw is string text && !String.IsNullOrWhiteSpace(text)) return currentDom.GetObject(text.Trim());
+        if (TryUnsignedGomId(raw, out ulong id) && id != 0) return WorldResolveGomObject(id);
+        if (raw is string text && !String.IsNullOrWhiteSpace(text)) return WorldResolveGomObject(text.Trim());
       } catch { }
       return null;
     }
@@ -1071,7 +1130,8 @@ namespace PugTools {
     private string TaxiTerminalDisplayName(GomObject terminal, StringTable table) {
       if (terminal == null) return null;
       try {
-        long id = terminal.Data.ValueOrDefault<long>("taxNameId", -1);
+        long id = WonkInt64(WorldInteractionDataValue(terminal.Data, "taxNameId", "4611686198670960000"));
+        if (id == 0) id = -1;
         if (id >= 0 && table != null) {
           string localized = table.GetText(0x7D60500000000L + id, String.Empty);
           if (!String.IsNullOrWhiteSpace(localized)) return localized.Trim();

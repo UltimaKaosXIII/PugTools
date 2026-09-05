@@ -31,23 +31,23 @@ namespace PugTools {
 
       var byNode = new Dictionary<long, WorldConversationConditionData>();
       try {
-        GomObject raw = currentDom.GetObject(conversation.Id);
-        if (raw == null && !String.IsNullOrWhiteSpace(conversation.Fqn)) raw = currentDom.GetObject(conversation.Fqn);
+        GomObject raw = WorldResolveGomObject(conversation.Id);
+        if (raw == null && !String.IsNullOrWhiteSpace(conversation.Fqn)) raw = WorldResolveGomObject(conversation.Fqn);
         object rawDialogs = WorldInteractionDataValue(raw?.Data, "cnvTreeDialogNodes_Prototype", "4611686050212071021");
-        if (rawDialogs is IDictionary map) {
-          IDictionaryEnumerator iterator = map.GetEnumerator();
-          while (iterator.MoveNext()) {
-            if (!(iterator.Value is GomObjectData data)) continue;
-            long nodeId = WonkInt64(WorldInteractionDataValue(data, "cnvNodeNumber", null));
-            if (nodeId == 0) nodeId = WonkInt64(iterator.Key);
-            if (nodeId == 0) continue;
-            var item = new WorldConversationConditionData();
-            AppendWorldConversationConditionTokens(item.Condition,
-              WorldConversationConditionValue(data, "cnvConditionCompiled", "4611686244921010004", "4611686050718671495"));
-            AppendWorldConversationConditionTokens(item.PreviewCondition,
-              WorldConversationConditionValue(data, "cnvConditionPreviewCompiled", "4611686244921010003", "4611686050718671499"));
-            if (item.Condition.Count > 0 || item.PreviewCondition.Count > 0) byNode[nodeId] = item;
-          }
+        foreach (KeyValuePair<object, object> entry in WorldConversationMapEntries(rawDialogs)) {
+          GomObjectData data = WorldConversationFirstObjectData(entry.Value, false);
+          if (WorldUsesLegacyContent && (data == null || WorldInteractionDataValue(data, "cnvNodeNumber", "4611686019044571365") == null))
+            data = WorldConversationFindObjectDataWithField(entry.Value, "cnvNodeNumber", "4611686019044571365");
+          if (data == null) continue;
+          long nodeId = WonkInt64(WorldInteractionDataValue(data, "cnvNodeNumber", "4611686019044571365"));
+          if (nodeId == 0) nodeId = WonkInt64(entry.Key);
+          if (nodeId == 0) continue;
+          var item = new WorldConversationConditionData();
+          AppendWorldConversationConditionTokens(item.Condition,
+            WorldConversationConditionValue(data, "cnvConditionCompiled", "4611686244921010004", "4611686050718671495"));
+          AppendWorldConversationConditionTokens(item.PreviewCondition,
+            WorldConversationConditionValue(data, "cnvConditionPreviewCompiled", "4611686244921010003", "4611686050718671499"));
+          if (item.Condition.Count > 0 || item.PreviewCondition.Count > 0) byNode[nodeId] = item;
         }
       } catch (Exception ex) {
         System.Diagnostics.Debug.WriteLine("Conversation condition index failed for " + (conversation.Fqn ?? conversation.Id.ToString(CultureInfo.InvariantCulture)) + ": " + ex.Message);
@@ -124,7 +124,8 @@ namespace PugTools {
       ulong nodeId = 0xE000000000000000UL | (token >> 16);
       int local = (int)(token & 0xFFFFUL);
       string quest = null;
-      try { quest = currentDom?.GetObject(nodeId)?.Name; } catch { }
+      try { quest = WorldResolveGomObject(nodeId)?.Name; } catch { }
+      if (String.IsNullOrWhiteSpace(quest) && WorldUsesLegacyContent) quest = WorldLegacyPrototypeName(nodeId, "qst");
       if (String.IsNullOrWhiteSpace(quest)) quest = "quest@" + nodeId.ToString(CultureInfo.InvariantCulture);
       string variable = local == 1 ? "is_on_quest" : local == 2 ? "has_completed_quest" : local == 3 ? "has_failed_quest" :
         local == 4 ? "is_eligible_for_quest" : local == 5 ? "experienced_alternate_ending" : local == 88 ? "QUEST_NAME" : "#" + local.ToString(CultureInfo.InvariantCulture);

@@ -40,6 +40,7 @@ namespace PugTools {
     private sealed class WorldConversationStageContext {
       public string Fqn;
       public GomObjectData Data;
+      public Room Room;
       public Matrix World;
       public float Yaw;
     }
@@ -115,7 +116,8 @@ namespace PugTools {
       WorldConversationStagingInfo staging = ReadWorldConversationStaging(conversation, node.NodeId);
       if (staging == null) return;
       if (player != null && staging.Player != null && !String.IsNullOrWhiteSpace(staging.Player.Stage) && !String.IsNullOrWhiteSpace(staging.Player.Mark) &&
-          TryResolveWorldConversationActorMark(staging.Player.Stage, staging.Player.Mark, out Vector3 playerPosition, out float playerYaw)) {
+          TryResolveWorldConversationActorMark(staging.Player.Stage, staging.Player.Mark, out Vector3 playerPosition, out float playerYaw, out Room playerRoom)) {
+        if (player.ConversationVirtual && playerRoom != null) player.Room = playerRoom;
         panelRender.SetWorldConversationActorMark(player, playerPosition, playerYaw);
         worldConversationStagedNpcs.Add(player);
       }
@@ -126,10 +128,12 @@ namespace PugTools {
 
         ApplyWorldConversationDefaultStance(placement);
         if (markRef == null || String.IsNullOrWhiteSpace(markRef.Stage) || String.IsNullOrWhiteSpace(markRef.Mark)) continue;
-        if (!TryResolveWorldConversationActorMark(markRef.Stage, markRef.Mark, out Vector3 position, out float yaw)) continue;
+        if (!TryResolveWorldConversationActorMark(markRef.Stage, markRef.Mark, out Vector3 position, out float yaw, out Room markRoom)) continue;
+        if (placement.ConversationVirtual && markRoom != null) placement.Room = markRoom;
         panelRender.SetWorldConversationActorMark(placement, position, yaw);
         worldConversationStagedNpcs.Add(placement);
       }
+      UpdateWorldConversationVfxAnchors(staging);
     }
 
     private void EnsureWorldConversationAnimationCache() {
@@ -168,13 +172,18 @@ namespace PugTools {
         return;
       }
 
-      WorldNpcPlacement placement = FindWorldConversationActionPlacement(conversation, node, action);
+      bool vfxAction = String.Equals(kind, "Play VFX", StringComparison.OrdinalIgnoreCase) ||
+        String.Equals(kind, "Stop Character VFX", StringComparison.OrdinalIgnoreCase);
+      // Do not synthesize a visible NPC merely because a VFX beat names it. Cinematic-extras nodes are often
+      // transform-only markers; if no real/cast body already exists, the VFX path below resolves a staging anchor.
+      WorldNpcPlacement placement = FindWorldConversationActionPlacement(conversation, node, action, !vfxAction);
       if (String.Equals(kind, "Set Mark", StringComparison.OrdinalIgnoreCase)) {
         if (placement == null) return;
         string text = (action.Value ?? String.Empty).Trim();
         int split = text.LastIndexOf(':');
         if (split <= 0 || split + 1 >= text.Length) return;
-        if (!TryResolveWorldConversationActorMark(text.Substring(0, split), text.Substring(split + 1), out Vector3 position, out float yaw)) return;
+        if (!TryResolveWorldConversationActorMark(text.Substring(0, split), text.Substring(split + 1), out Vector3 position, out float yaw, out Room markRoom)) return;
+        if (placement.ConversationVirtual && markRoom != null) placement.Room = markRoom;
         panelRender.SetWorldConversationActorMark(placement, position, yaw);
         worldConversationStagedNpcs.Add(placement);
         return;
@@ -185,6 +194,18 @@ namespace PugTools {
         bool hidden = !String.Equals((action.Value ?? String.Empty).Trim(), "false", StringComparison.OrdinalIgnoreCase);
         panelRender.SetWorldConversationActorHidden(placement, hidden);
         worldConversationStagedNpcs.Add(placement);
+        return;
+      }
+
+      if (String.Equals(kind, "Play VFX", StringComparison.OrdinalIgnoreCase)) {
+        if (placement == null) placement = EnsureWorldConversationVfxAnchor(conversation, node, action);
+        if (placement != null && !String.IsNullOrWhiteSpace(action.Value)) panelRender.PlayWorldConversationFx(placement, action.Value);
+        return;
+      }
+
+      if (String.Equals(kind, "Stop Character VFX", StringComparison.OrdinalIgnoreCase)) {
+        if (placement == null && !String.IsNullOrWhiteSpace(action.Actor)) worldConversationVfxAnchors.TryGetValue(action.Actor.Trim(), out placement);
+        if (placement != null) panelRender.StopWorldConversationFx(placement, action.Value);
         return;
       }
 
@@ -259,7 +280,7 @@ namespace PugTools {
       }
     }
 
-    private WorldNpcPlacement FindWorldConversationActionPlacement(Conversation conversation, DialogNode node, WorldConversationCinematicAction action) {
+    private WorldNpcPlacement FindWorldConversationActionPlacement(Conversation conversation, DialogNode node, WorldConversationCinematicAction action, bool createCast = true) {
       if (action == null) return null;
       if (!String.IsNullOrWhiteSpace(action.Actor)) {
         string symbolic = action.Actor.Trim().ToLowerInvariant().Replace("_", " ").Replace("-", " ");
@@ -269,6 +290,9 @@ namespace PugTools {
         if (WorldConversationPlayerActorName(action.Actor)) return EnsureWorldConversationPlayerPlacement();
         WorldNpcPlacement participant = FindWorldConversationActorPlacement(action.Actor);
         if (participant != null) return participant;
+        // Hydra toolboxes frequently name members of the scene's cast that are not AREA placements at all. The game
+        // creates those actors for the conversation; build the same NPC body on demand for any action that needs one.
+        if (createCast && action.Actor.Trim().StartsWith("npc.", StringComparison.OrdinalIgnoreCase)) return EnsureWorldConversationCastPlacement(action.Actor);
       }
 
       if (action.ActorId == WorldConversationRoleSpeaker || action.ActorId == WorldConversationRoleSpeakerCc)
@@ -280,6 +304,64 @@ namespace PugTools {
       // A fair number of old cinematics omit hydObject on speaker-local animation/posture actions. The game resolves
       // those against the active speaker, so do the same instead of silently dropping the beat.
       return action.ActorId == 0 ? FindWorldConversationSpeakerPlacement(conversation, node) : null;
+    }
+
+    private WorldConversationStageMarkRef FindWorldConversationStagingMarkForActor(WorldConversationStagingInfo staging, string actorFqn) {
+      string wanted = (actorFqn ?? String.Empty).Trim();
+      if (staging == null || wanted.Length == 0 || currentDom == null) return null;
+      foreach (KeyValuePair<ulong, WorldConversationStageMarkRef> pair in staging.Speakers) {
+        string fqn = null;
+        try { fqn = WorldResolveGomObject(pair.Key)?.Name; } catch { }
+        if (String.IsNullOrWhiteSpace(fqn) && WorldUsesLegacyContent) fqn = WorldLegacyPrototypeName(pair.Key, null);
+        if (String.IsNullOrWhiteSpace(fqn)) {
+          try { fqn = currentDom.ConversationLoader.LoadSpeaker(pair.Key)?.Fqn; } catch { }
+        }
+        if (String.Equals((fqn ?? String.Empty).Trim(), wanted, StringComparison.OrdinalIgnoreCase)) return pair.Value;
+      }
+      return null;
+    }
+
+    private WorldNpcPlacement EnsureWorldConversationVfxAnchor(Conversation conversation, DialogNode node, WorldConversationCinematicAction action) {
+      string actor = (action?.Actor ?? String.Empty).Trim();
+      if (actor.Length == 0 || panelRender == null) return null;
+      if (worldConversationVfxAnchors.TryGetValue(actor, out WorldNpcPlacement existing)) {
+        PositionWorldConversationVfxAnchor(existing, ReadWorldConversationStaging(conversation, node?.NodeId ?? 0), actor);
+        return existing;
+      }
+      WorldConversationStagingInfo staging = ReadWorldConversationStaging(conversation, node?.NodeId ?? 0);
+      WorldConversationStageMarkRef mark = FindWorldConversationStagingMarkForActor(staging, actor);
+      if (mark == null || String.IsNullOrWhiteSpace(mark.Stage) || String.IsNullOrWhiteSpace(mark.Mark)) return null;
+      if (!TryResolveWorldConversationActorMark(mark.Stage, mark.Mark, out Vector3 position, out float yaw, out Room markRoom)) return null;
+      var anchor = new WorldNpcPlacement {
+        Room = markRoom ?? worldConversationPrimaryNpc?.Room ?? area?.RoomList?.FirstOrDefault(x => x != null),
+        Instance = null,
+        SourceFqn = actor,
+        Name = actor,
+        ShowNameplate = false,
+        Scale = 1f,
+        ConversationVirtual = true,
+        ConversationHidden = false,
+        ConversationUnplaced = false,
+        ConversationFxAnchor = true
+      };
+      panelRender.SetWorldConversationActorMark(anchor, position, yaw);
+      worldConversationVfxAnchors[actor] = anchor;
+      return anchor;
+    }
+
+    private void PositionWorldConversationVfxAnchor(WorldNpcPlacement anchor, WorldConversationStagingInfo staging, string actorFqn) {
+      if (anchor == null || staging == null || panelRender == null) return;
+      WorldConversationStageMarkRef mark = FindWorldConversationStagingMarkForActor(staging, actorFqn);
+      if (mark == null || String.IsNullOrWhiteSpace(mark.Stage) || String.IsNullOrWhiteSpace(mark.Mark)) return;
+      if (!TryResolveWorldConversationActorMark(mark.Stage, mark.Mark, out Vector3 position, out float yaw, out Room markRoom)) return;
+      if (markRoom != null) anchor.Room = markRoom;
+      panelRender.SetWorldConversationActorMark(anchor, position, yaw);
+    }
+
+    private void UpdateWorldConversationVfxAnchors(WorldConversationStagingInfo staging) {
+      if (staging == null || worldConversationVfxAnchors.Count == 0) return;
+      foreach (KeyValuePair<string, WorldNpcPlacement> pair in worldConversationVfxAnchors.ToArray())
+        PositionWorldConversationVfxAnchor(pair.Value, staging, pair.Key);
     }
 
     private static bool WorldConversationPlayerRole(ulong role) =>
@@ -344,14 +426,64 @@ namespace PugTools {
       }
     }
 
+    private WorldNpcPlacement EnsureWorldConversationCastPlacement(string fqn, Room roomHint = null) {
+      string clean = (fqn ?? String.Empty).Trim();
+      if (clean.Length == 0 || !clean.StartsWith("npc.", StringComparison.OrdinalIgnoreCase) || currentDom == null || currentAssets == null || panelRender == null)
+        return null;
+      if (worldConversationCastNpcs.TryGetValue(clean, out WorldNpcPlacement existing)) {
+        panelRender.AddWorldConversationVirtualActor(existing);
+        return existing;
+      }
+      try {
+        Room room = roomHint ?? worldConversationPrimaryNpc?.Room ?? area?.RoomList?.FirstOrDefault(x => x != null);
+        if (room == null) return null;
+        Npc npc = null;
+        try { npc = currentDom.NpcLoader.Load(clean); } catch { }
+        var appearanceCache = new Dictionary<string, List<GR2>>(StringComparer.OrdinalIgnoreCase);
+        var interactionCache = new Dictionary<string, WorldInteractionInfo>(StringComparer.OrdinalIgnoreCase);
+        var weaponCache = new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<ulong, float> speciesScales = null;
+        try { speciesScales = LoadNpcSpeciesScales(); } catch { }
+        WorldNpcPlacement placement = npc == null ? null : BuildNpcPlacement(room, null, clean, npc, appearanceCache,
+          speciesScales, null, worldConversationAnimationCache, interactionCache, weaponCache);
+        if (placement == null && WorldUsesLegacyContent) {
+          GomObject node = null;
+          try { node = WorldResolveGomObject(clean); } catch { }
+          placement = BuildLegacyNpcPlacement(room, null, clean, node, appearanceCache, speciesScales, null,
+            worldConversationAnimationCache, interactionCache, weaponCache);
+        }
+        if (placement == null || placement.Models == null || placement.Models.Count == 0) return null;
+        placement.ConversationVirtual = true;
+        placement.ConversationUnplaced = true;
+        placement.ConversationHidden = true;
+        placement.ShowNameplate = false;
+        placement.Room = room;
+        placement.Instance = null;
+        worldConversationCastNpcs[clean] = placement;
+        panelRender.AddWorldConversationVirtualActor(placement);
+        return placement;
+      } catch (Exception ex) {
+        WorldConversationDiagnosticFileWrite("CNV virtual cast failed " + clean + ": " + ex.Message);
+        return null;
+      }
+    }
+
     private WorldNpcPlacement FindWorldConversationSpeakerPlacement(ulong speakerId) {
       if (speakerId == 0) return null;
       string fqn = null;
-      try { fqn = currentDom?.GetObject(speakerId)?.Name; } catch { }
+      try { fqn = WorldResolveGomObject(speakerId)?.Name; } catch { }
+      if (String.IsNullOrWhiteSpace(fqn) && WorldUsesLegacyContent)
+        fqn = WorldLegacyPrototypeName(speakerId, null);
       if (String.IsNullOrWhiteSpace(fqn)) {
         try { fqn = currentDom?.ConversationLoader.LoadSpeaker(speakerId)?.Fqn; } catch { }
       }
-      return FindWorldConversationActorPlacement(fqn);
+      WorldNpcPlacement placement = FindWorldConversationActorPlacement(fqn);
+      if (placement != null) return placement;
+      if (worldConversationPrimaryNpc != null && !String.IsNullOrWhiteSpace(fqn)) {
+        if (String.IsNullOrWhiteSpace(worldConversationPrimaryStandInFqn)) worldConversationPrimaryStandInFqn = fqn.Trim();
+        if (String.Equals(worldConversationPrimaryStandInFqn, fqn.Trim(), StringComparison.OrdinalIgnoreCase)) return worldConversationPrimaryNpc;
+      }
+      return EnsureWorldConversationCastPlacement(fqn);
     }
 
     private WorldConversationStagingInfo ReadWorldConversationStaging(Conversation conversation, long nodeId) {
@@ -386,8 +518,11 @@ namespace PugTools {
       return !String.IsNullOrWhiteSpace(stage) && !String.IsNullOrWhiteSpace(name) ? new WorldConversationStageMarkRef { Stage = stage, Mark = name } : null;
     }
 
-    private bool TryResolveWorldConversationActorMark(string stageFqn, string markName, out Vector3 position, out float yaw) {
-      position = Vector3.Zero; yaw = 0f;
+    private bool TryResolveWorldConversationActorMark(string stageFqn, string markName, out Vector3 position, out float yaw) =>
+      TryResolveWorldConversationActorMark(stageFqn, markName, out position, out yaw, out _);
+
+    private bool TryResolveWorldConversationActorMark(string stageFqn, string markName, out Vector3 position, out float yaw, out Room room) {
+      position = Vector3.Zero; yaw = 0f; room = null;
       if (!TryGetWorldConversationStageContext(stageFqn, out WorldConversationStageContext stage)) return false;
       GomObjectData mark = WorldConversationNamedObject(WorldInteractionDataValue(stage.Data, "stgTemplateActorMarkList_ForPrototype", "4611686042788570002"), markName);
       if (mark == null) return false;
@@ -395,6 +530,7 @@ namespace PugTools {
       Vector3 rotation = SpnDynVector3(WorldInteractionDataValue(mark, "stgMarkRotation", "4611686024438910011"), Vector3.Zero);
       position = Vector3.TransformCoordinate(local, stage.World);
       yaw = stage.Yaw + DegreesToRadians(rotation.Y);
+      room = stage.Room;
       return IsFiniteVector(position);
     }
 
@@ -591,6 +727,7 @@ namespace PugTools {
       if (stageData == null) return false;
 
       Matrix bestWorld = Matrix.Identity;
+      Room bestRoom = null;
       bool found = false;
       float bestDistance = Single.MaxValue;
       Vector3 reference = Vector3.Zero;
@@ -615,13 +752,14 @@ namespace PugTools {
             Vector3 p = new Vector3(world.M41, world.M42, world.M43);
             distance = (p - reference).LengthSquared();
           }
-          if (!found || distance < bestDistance) { found = true; bestDistance = distance; bestWorld = world; }
+          if (!found || distance < bestDistance) { found = true; bestDistance = distance; bestWorld = world; bestRoom = room; }
         }
       }
       if (!found) return false;
       context = new WorldConversationStageContext {
         Fqn = clean,
         Data = stageData,
+        Room = bestRoom,
         World = bestWorld,
         Yaw = (float)Math.Atan2(-bestWorld.M13, bestWorld.M11)
       };
@@ -632,7 +770,7 @@ namespace PugTools {
       EnsureWorldConversationCinematicCaches();
       if (worldConversationStageCache.TryGetValue(fqn, out GomObjectData cached)) return cached;
       GomObjectData data = null;
-      try { data = currentDom?.GetObject(fqn)?.Data; } catch { }
+      try { data = WorldResolveGomObject(fqn)?.Data; } catch { }
       worldConversationStageCache[fqn] = data;
       return data;
     }
@@ -641,7 +779,7 @@ namespace PugTools {
       EnsureWorldConversationCinematicCaches();
       if (worldConversationAutoCameraCache.TryGetValue(fqn, out GomObjectData cached)) return cached;
       GomObjectData data = null;
-      try { data = currentDom?.GetObject(fqn)?.Data; } catch { }
+      try { data = WorldResolveGomObject(fqn)?.Data; } catch { }
       worldConversationAutoCameraCache[fqn] = data;
       return data;
     }
@@ -676,14 +814,16 @@ namespace PugTools {
       if (conversation == null || currentDom == null || nodeId == 0) return false;
       GomObject raw = null;
       try {
-        raw = conversation.Id != 0 ? currentDom.GetObject(conversation.Id) : null;
-        if (raw == null && !String.IsNullOrWhiteSpace(conversation.Fqn)) raw = currentDom.GetObject(conversation.Fqn);
+        raw = conversation.Id != 0 ? WorldResolveGomObject(conversation.Id) : null;
+        if (raw == null && !String.IsNullOrWhiteSpace(conversation.Fqn)) raw = WorldResolveGomObject(conversation.Fqn);
       } catch { }
       root = raw?.Data;
       if (root == null) return false;
       object dialogs = WorldInteractionDataValue(root, "cnvTreeDialogNodes_Prototype", "4611686050212071021");
       foreach (KeyValuePair<object, object> pair in WorldConversationMapEntries(dialogs)) {
         GomObjectData candidate = WorldConversationFirstObjectData(pair.Value, false);
+        if (WorldUsesLegacyContent && (candidate == null || WorldInteractionDataValue(candidate, "cnvNodeNumber", "4611686019044571365") == null))
+          candidate = WorldConversationFindObjectDataWithField(pair.Value, "cnvNodeNumber", "4611686019044571365");
         if (candidate == null) continue;
         long id = WonkInt64(WorldInteractionDataValue(candidate, "cnvNodeNumber", "4611686019044571365"));
         if (id == 0) id = WonkInt64(pair.Key);
@@ -712,6 +852,14 @@ namespace PugTools {
           if (String.Equals(it.Key?.ToString(), "_count", StringComparison.OrdinalIgnoreCase)) continue;
           yield return new KeyValuePair<object, object>(it.Key, it.Value);
         }
+        yield break;
+      }
+      // A few early beta schemas expose a serialized LookupList/List through a non-generic enumerable wrapper rather
+      // than IDictionary.  Modern 64-bit data never reaches this branch.  Preserve each element and give it a stable
+      // synthetic key; the RED dialog rows carry cnvNodeNumber themselves, so their real id is recovered below.
+      if (map is IEnumerable enumerable && map is not string) {
+        int index = 1;
+        foreach (object value in enumerable) yield return new KeyValuePair<object, object>(index++, value);
       }
     }
 
@@ -731,6 +879,75 @@ namespace PugTools {
         return preferred as GomObjectData;
       }
       return null;
+    }
+
+
+    // RED/Beta occasionally wraps ClassView values in one or more container layers.  The retail parser path above
+    // intentionally stays unchanged; this helper is used only by legacy fallbacks and finds the nested ClassView by
+    // a field that identifies the structure we are after (dialog node, link node, root node, loc retriever, ...).
+    private static GomObjectData WorldConversationFindObjectDataWithField(object value, string fieldName, string numericFieldName, int depth = 0) {
+      if (value == null || depth > 6 || value is string) return null;
+      if (value is GomObject gomObject) {
+        try { return WorldConversationFindObjectDataWithField(gomObject.Data, fieldName, numericFieldName, depth + 1); }
+        catch { return null; }
+      }
+      if (value is GomObjectData data) {
+        if (WorldInteractionDataValue(data, fieldName, numericFieldName) != null) return data;
+        foreach (KeyValuePair<string, object> pair in data.Dictionary) {
+          if (String.Equals(pair.Key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          GomObjectData found = WorldConversationFindObjectDataWithField(pair.Value, fieldName, numericFieldName, depth + 1);
+          if (found != null) return found;
+        }
+        return null;
+      }
+      if (value is IDictionary dictionary) {
+        foreach (DictionaryEntry pair in dictionary) {
+          if (String.Equals(pair.Key?.ToString(), "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          GomObjectData found = WorldConversationFindObjectDataWithField(pair.Value, fieldName, numericFieldName, depth + 1);
+          if (found != null) return found;
+        }
+        return null;
+      }
+      if (value is IEnumerable enumerable) {
+        foreach (object item in enumerable) {
+          GomObjectData found = WorldConversationFindObjectDataWithField(item, fieldName, numericFieldName, depth + 1);
+          if (found != null) return found;
+        }
+      }
+      return null;
+    }
+
+    private static IEnumerable<GomObjectData> WorldConversationFindAllObjectDataWithField(object value, string fieldName, string numericFieldName, int depth = 0) {
+      if (value == null || depth > 6 || value is string) yield break;
+      if (value is GomObject gomObject) {
+        GomObjectData root = null;
+        try { root = gomObject.Data; } catch { }
+        if (root != null)
+          foreach (GomObjectData found in WorldConversationFindAllObjectDataWithField(root, fieldName, numericFieldName, depth + 1)) yield return found;
+        yield break;
+      }
+      if (value is GomObjectData data) {
+        if (WorldInteractionDataValue(data, fieldName, numericFieldName) != null) {
+          yield return data;
+          yield break;
+        }
+        foreach (KeyValuePair<string, object> pair in data.Dictionary) {
+          if (String.Equals(pair.Key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          foreach (GomObjectData found in WorldConversationFindAllObjectDataWithField(pair.Value, fieldName, numericFieldName, depth + 1)) yield return found;
+        }
+        yield break;
+      }
+      if (value is IDictionary dictionary) {
+        foreach (DictionaryEntry pair in dictionary) {
+          if (String.Equals(pair.Key?.ToString(), "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          foreach (GomObjectData found in WorldConversationFindAllObjectDataWithField(pair.Value, fieldName, numericFieldName, depth + 1)) yield return found;
+        }
+        yield break;
+      }
+      if (value is IEnumerable enumerable) {
+        foreach (object item in enumerable)
+          foreach (GomObjectData found in WorldConversationFindAllObjectDataWithField(item, fieldName, numericFieldName, depth + 1)) yield return found;
+      }
     }
 
     private static GomObjectData WorldConversationNamedObject(object table, string name) {

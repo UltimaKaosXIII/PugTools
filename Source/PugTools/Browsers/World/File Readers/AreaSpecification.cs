@@ -113,6 +113,9 @@ namespace FileFormats {
     public long SId { get; set; }
     public long ParentId { get; set; }
     public string MapName { get; set; }
+    // Localized SWTOR map-page title (str.sys.worldmap / MapPage.<mapName>). The room-change banner uses this
+    // instead of exposing the internal room/map identifiers whenever the installed client provides a real name.
+    public string DisplayName { get; set; }
     public string ImagePath { get; set; }
     public bool HasImage { get; set; }
     public Vector3 Min { get; set; }

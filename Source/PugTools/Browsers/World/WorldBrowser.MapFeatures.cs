@@ -92,10 +92,10 @@ namespace PugTools {
       if (worldMapQuestReverseCacheBuilt) return;
       worldMapQuestReverseCacheBuilt = true;
       try {
-        foreach (GomObject candidate in currentDom.GetObjectsStartingWith("qst.")) {
+        foreach (GomObject candidate in WorldObjectsStartingWith("qst.")) {
           if (candidate == null) continue;
           GomObject qstObject = candidate;
-          try { if (qstObject.Data == null) qstObject = currentDom.GetObject(candidate.Id); } catch { }
+          try { if (qstObject.Data == null) qstObject = WorldResolveGomObject(candidate.Id); } catch { }
           if (qstObject?.Data == null) continue;
           foreach (GomObjectData branch in WorldInteractionListEntries(WorldInteractionDataValue(qstObject.Data, "qstBranches", "4611686039996770003")).OfType<GomObjectData>()) {
             foreach (GomObjectData step in WorldInteractionListEntries(WorldInteractionDataValue(branch, "qstSteps", "4611686039996770001")).OfType<GomObjectData>()) {
@@ -122,13 +122,13 @@ namespace PugTools {
       if (note == null || questId == 0 || currentDom == null) return;
       if (!note.QuestIds.Contains(questId)) note.QuestIds.Add(questId);
       try {
-        GomObject qstObject = currentDom.GetObject(questId);
+        GomObject qstObject = WorldResolveGomObject(questId);
         if (qstObject?.Data == null) return;
         string questName = ResolveWorldQuestName(qstObject);
         if (!String.IsNullOrWhiteSpace(questName) && !note.QuestNames.Contains(questName, StringComparer.OrdinalIgnoreCase))
           note.QuestNames.Add(questName.Trim());
         string targetMpn = NormalizeWorldMapnoteFqn(note.Fqn);
-        Dictionary<object, object> textLookup = WorldInteractionDataValue(qstObject.Data, "locTextRetrieverMap", "4611686102842470023") as Dictionary<object, object>;
+        Dictionary<object, object> textLookup = WorldInteractionMap(WorldInteractionDataValue(qstObject.Data, "locTextRetrieverMap", "4611686102842470023"));
         foreach (GomObjectData branch in WorldInteractionListEntries(WorldInteractionDataValue(qstObject.Data, "qstBranches", "4611686039996770003")).OfType<GomObjectData>()) {
           foreach (GomObjectData step in WorldInteractionListEntries(WorldInteractionDataValue(branch, "qstSteps", "4611686039996770001")).OfType<GomObjectData>()) {
             foreach (GomObjectData task in WorldInteractionListEntries(WorldInteractionDataValue(step, "qstTasks", "4611686039996770000")).OfType<GomObjectData>()) {
@@ -296,10 +296,10 @@ namespace PugTools {
       fullText = String.Empty; questName = null;
       if (currentDom == null || questId == 0) return null;
       GomObject qstObject;
-      try { qstObject = currentDom.GetObject(questId); } catch { qstObject = null; }
+      try { qstObject = WorldResolveGomObject(questId); } catch { qstObject = null; }
       if (qstObject?.Data == null) return null;
       questName = ResolveWorldQuestName(qstObject) ?? qstObject.Name;
-      Dictionary<object, object> textLookup = WorldInteractionDataValue(qstObject.Data, "locTextRetrieverMap", "4611686102842470023") as Dictionary<object, object>;
+      Dictionary<object, object> textLookup = WorldInteractionMap(WorldInteractionDataValue(qstObject.Data, "locTextRetrieverMap", "4611686102842470023"));
       var all = new System.Text.StringBuilder();
       all.AppendLine(questName).AppendLine(qstObject.Name).Append("ID: ").AppendLine(questId.ToString(CultureInfo.InvariantCulture));
       long requiredLevel = WorldQuestLong(qstObject.Data, "qstReqMinLevel", "4611686019157990631");
@@ -396,8 +396,8 @@ namespace PugTools {
       if (npc?.Interaction == null || currentDom == null) return false;
       GomObject conversation = null;
       try {
-        if (npc.Interaction.ConversationId != 0) conversation = currentDom.GetObject(npc.Interaction.ConversationId);
-        if (conversation == null && !String.IsNullOrWhiteSpace(npc.Interaction.Conversation)) conversation = currentDom.GetObject(npc.Interaction.Conversation);
+        if (npc.Interaction.ConversationId != 0) conversation = WorldResolveGomObject(npc.Interaction.ConversationId);
+        if (conversation == null && !String.IsNullOrWhiteSpace(npc.Interaction.Conversation)) conversation = WorldResolveGomObject(npc.Interaction.Conversation);
       } catch { }
       if (conversation?.References == null || !conversation.References.TryGetValue("startsQuest", out SortedSet<ulong> questIds) || questIds.Count == 0) return false;
       bool exploration = false;
@@ -408,7 +408,7 @@ namespace PugTools {
           string questName = null;
           try { questName = quest?.ToXElement(false)?.Element("Name")?.Value; } catch { }
           if (!String.IsNullOrWhiteSpace(questName)) questNames.Add(questName.Trim());
-          string qfqn = quest?.Fqn ?? currentDom.GetObject(questId)?.Name ?? String.Empty;
+          string qfqn = quest?.Fqn ?? WorldResolveGomObject(questId)?.Name ?? String.Empty;
           if (qfqn.IndexOf("exploration", StringComparison.OrdinalIgnoreCase) >= 0 || qfqn.IndexOf(".explore.", StringComparison.OrdinalIgnoreCase) >= 0) exploration = true;
         } catch { }
       }

@@ -44,6 +44,7 @@ namespace TorArchive {
 
       _FileRef = file;
       Source = file.Archive.FileName.Split('\\').Last();
+      if (data != null) FirstSeenVersion = data.FirstSeenVersion;
 
       if (data != null && data.FileName.Length > 0) {
         IsNamed = true;
@@ -111,6 +112,8 @@ namespace TorArchive {
       set => _FileRef = value;
     }
     public String FileName { get; private set; }
+    /// <summary>Earliest patch known from the compact hash-history index, if available.</summary>
+    public String FirstSeenVersion { get; private set; }
     public State FileState { get; private set; }
     public Boolean IsNamed { get; private set; }
     public String Source { get; private set; }

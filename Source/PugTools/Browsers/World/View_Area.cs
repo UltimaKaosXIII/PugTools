@@ -264,6 +264,10 @@ namespace PugTools {
     private Dictionary<ulong, GR2> models = new Dictionary<ulong, GR2>();
     private Dictionary<string, GR2_Material> materials = new Dictionary<string, GR2_Material>();
     private List<Room> rooms = new List<Room>();
+    // User-controlled room visibility is deliberately independent from portal/dPVS visibility. The HashSet reference
+    // is replaced rather than mutated so the WinForms toolbar can toggle rooms while the render thread performs hot
+    // RoomVisible() checks without enumerator/collection races.
+    private HashSet<string> manuallyHiddenRoomNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     // v6 resource streaming: only decoded models are added to models/render entries. The catalog itself is cheap
     // (asset id + archive path) and lets the initial frame avoid decoding an entire planet.
     private WorldModelStreamer modelStreamer;
@@ -738,6 +742,10 @@ namespace PugTools {
     private RenderTargetView sceneRenderTarget;
     private ShaderResourceView sceneShaderResource;
     private ShaderResourceView sceneDepthShaderResource;
+    // Read-only twin of the sampleable depth target. FXSPEC projector decals sample scene depth while blending
+    // back into the active world render target, which D3D11 only permits while the DSV is bound read-only.
+    private DepthStencilView sceneDepthReadOnlyView;
+    private RenderTargetView worldActiveRenderTarget;
     private readonly Texture2D[] taaHistoryTextures = new Texture2D[2];
     private readonly RenderTargetView[] taaHistoryRenderTargets = new RenderTargetView[2];
     private readonly ShaderResourceView[] taaHistoryShaderResources = new ShaderResourceView[2];
@@ -786,6 +794,7 @@ namespace PugTools {
 
     public void LoadModel(Dictionary<ulong,GR2> models, Dictionary<string,GR2_Material> materials, List<Room> rooms, string fqn, Area area=null, Dictionary<string,GR2> utilityModels=null, List<WorldNpcPlacement> npcData=null, List<WorldSpnPlacement> spnData=null, WorldModelStreamer streamer=null, IEnumerable<WorldModelStreamRequest> streamRequests=null) {
       this.fqn=fqn; this.area=area; this.models=models??new Dictionary<ulong,GR2>(); this.materials=materials??new Dictionary<string,GR2_Material>(); this.rooms=rooms??new List<Room>();
+      manuallyHiddenRoomNames=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
       modelStreamer=streamer;materialMetadataStreamer?.Dispose();materialMetadataStreamer=modelStreamer==null?null:new WorldMaterialMetadataStreamer(4); BuildModelStreamingCatalog(streamRequests); initialStreamLoading=modelStreamer!=null&&streamCatalogAssetCount>0;initialStreamVisibilityKeepUntilFrame=0;
       WorldRenderSettings initialSettings=SettingsSnapshot();
       appliedTextureMipSkip=TextureMipSkip(initialSettings.TextureQuality);
@@ -802,6 +811,7 @@ namespace PugTools {
       // or a Skydome material: ordinary Dantooine rooms contain those too and would disappear from the world/map.
       BuildAuthoritativeSkyRoomSet();
       BuildInstanceWorldTransformCache();
+      BuildWorldAmbientFxPlacements();
       BuildSpatialStreamingBootstrapIndex();
       BuildPathFollowers();
       UpdatePathFollowers(elapsed);
@@ -1138,7 +1148,13 @@ namespace PugTools {
             if(!TryWorldModelsSphere(npc.Models,world,out Vector3 center,out float radius))continue;
             float npcPickRadius=interactionPick&&npc.Interaction!=null?WorldInteractionPickRadius(center,radius,s):Math.Max(.08f,radius);
             if(!TryRaySphere(rayOrigin,rayDirection,center,npcPickRadius,out float distance))continue;
-            hits.Add(new WorldPickCandidate{Kind="npc",Key="npc:"+(npc.Room.RoomName??String.Empty)+":"+npc.Instance.ID+":"+(npc.SourceFqn??String.Empty),Distance=distance,HitPoint=rayOrigin+rayDirection*distance,Center=center,Radius=Math.Max(.08f,radius),Npc=npc});
+            GR2 hitModel=null;GR2_Mesh hitMesh=null;GR2_Mesh_Piece hitPiece=null;Vector3 hitPoint=rayOrigin+rayDirection*distance;float exactDistance=float.MaxValue;
+            if(!interactionPick){
+              bool exact=TryRayHitNpcPlacement(npc,world,rayOrigin,rayDirection,s,ref exactDistance,ref hitPoint,ref hitModel,ref hitMesh,ref hitPiece);
+              if(exact)distance=exactDistance;
+              else if(!NpcPickNeedsAnimatedFallback(npc))continue;
+            }
+            hits.Add(new WorldPickCandidate{Kind="npc",Key="npc:"+(npc.Room.RoomName??String.Empty)+":"+npc.Instance.ID+":"+(npc.SourceFqn??String.Empty),Distance=distance,HitPoint=hitPoint,Center=center,Radius=Math.Max(.08f,radius),Npc=npc,Model=hitModel,Mesh=hitMesh,Piece=hitPiece});
           }
         }
         if(s.ShowSpnObjects&&spnPlacements!=null){
@@ -1161,7 +1177,13 @@ namespace PugTools {
             if(!haveSphere)continue;
             float pickRadius=interactiveService?WorldInteractionPickRadius(center,radius,s):Math.Max(.08f,radius);
             if(!TryRaySphere(rayOrigin,rayDirection,center,pickRadius,out float distance))continue;
-            hits.Add(new WorldPickCandidate{Kind="spn",Key="spn:"+(spn.Room.RoomName??String.Empty)+":"+spn.Instance.ID+":"+(spn.SourceFqn??String.Empty),Distance=distance,HitPoint=rayOrigin+rayDirection*distance,Center=center,Radius=Math.Max(.08f,radius),Spn=spn});
+            GR2 hitModel=null;GR2_Mesh hitMesh=null;GR2_Mesh_Piece hitPiece=null;Vector3 hitPoint=rayOrigin+rayDirection*distance;float exactDistance=float.MaxValue;
+            if(!interactionPick){
+              bool exact=TryRayHitSpnPlacement(spn,world,dyn,rayOrigin,rayDirection,s,ref exactDistance,ref hitPoint,ref hitModel,ref hitMesh,ref hitPiece,out bool animatedVisual);
+              if(exact)distance=exactDistance;
+              else if(!animatedVisual)continue;
+            }
+            hits.Add(new WorldPickCandidate{Kind="spn",Key="spn:"+(spn.Room.RoomName??String.Empty)+":"+spn.Instance.ID+":"+(spn.SourceFqn??String.Empty),Distance=distance,HitPoint=hitPoint,Center=center,Radius=Math.Max(.08f,radius),Spn=spn,Model=hitModel,Mesh=hitMesh,Piece=hitPiece});
           }
         }
 
@@ -1182,6 +1204,33 @@ namespace PugTools {
         }
       }
       return hits;
+    }
+
+    private static bool NpcPickNeedsAnimatedFallback(WorldNpcPlacement npc){
+      if(npc==null)return false;
+      return npc.Animation?.Animation!=null||npc.ConversationAnimation?.Animation!=null||npc.WalkAnimation?.Animation!=null||npc.RunAnimation?.Animation!=null||
+        (npc.ClothAssets!=null&&npc.ClothAssets.Count>0);
+    }
+
+    private bool TryRayHitNpcPlacement(WorldNpcPlacement npc,Matrix world,Vector3 rayOrigin,Vector3 rayDirection,WorldRenderSettings s,ref float bestDistance,ref Vector3 bestPoint,ref GR2 bestModel,ref GR2_Mesh bestMesh,ref GR2_Mesh_Piece bestPiece){
+      if(npc?.Models==null)return false;bool hit=false;
+      foreach(GR2 model in npc.Models)if(model!=null&&TryRayHitModel(model,world,1f,rayOrigin,rayDirection,s,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))hit=true;
+      return hit;
+    }
+
+    private bool TryRayHitSpnPlacement(WorldSpnPlacement spn,Matrix world,WorldSpnDynState dyn,Vector3 rayOrigin,Vector3 rayDirection,WorldRenderSettings s,ref float bestDistance,ref Vector3 bestPoint,ref GR2 bestModel,ref GR2_Mesh bestMesh,ref GR2_Mesh_Piece bestPiece,out bool animatedVisual){
+      animatedVisual=false;if(spn==null)return false;bool hit=false;
+      if(dyn!=null){
+        foreach(WorldSpnDynPart part in dyn.Parts){
+          if(part?.Model==null)continue;if(part.Animation?.Animation!=null)animatedVisual=true;
+          Matrix partWorld=part.LocalMatrix*world;
+          if(TryRayHitModel(part.Model,partWorld,1f,rayOrigin,rayDirection,s,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))hit=true;
+        }
+        return hit;
+      }
+      if(spn.Animation?.Animation!=null)animatedVisual=true;
+      if(spn.Models!=null)foreach(GR2 model in spn.Models)if(model!=null&&TryRayHitModel(model,world,1f,rayOrigin,rayDirection,s,ref bestDistance,ref bestPoint,ref bestModel,ref bestMesh,ref bestPiece))hit=true;
+      return hit;
     }
 
     private bool TryRayHitAreaPath(Vector3 rayOrigin,Vector3 rayDirection,AreaPath path,WorldRenderSettings s,out float bestDistance,out Vector3 bestPoint){
@@ -1249,7 +1298,9 @@ namespace PugTools {
         if(!String.IsNullOrWhiteSpace(n.IdleAnimationName))sb.AppendLine("Idle animation: "+n.IdleAnimationName);if(!String.IsNullOrWhiteSpace(n.PathFqn))sb.AppendLine("Path: "+n.PathFqn);
         if(!String.IsNullOrWhiteSpace(n.RepublicReaction)||!String.IsNullOrWhiteSpace(n.ImperialReaction))sb.AppendLine("Faction reaction: Republic="+(n.RepublicReaction??"?")+", Empire="+(n.ImperialReaction??"?"));
         AppendWorldInteractionDetails(sb,n.Interaction);
-        sb.AppendLine(WorldPickPositionLine("World position",pick.Center));return sb.ToString().TrimEnd();
+        if(pick.Mesh!=null)sb.AppendLine("Mesh: "+(pick.Mesh.meshName??"(unknown)")+"  [LOD "+pick.Mesh.lod+"]");
+        if(pick.Piece!=null){GR2_Material material=ResolvePieceMaterial(pick.Model,pick.Piece);sb.AppendLine("Material: "+(material?.materialName??"(none)"));}
+        sb.AppendLine(WorldPickPositionLine("World position",pick.Center));sb.AppendLine(WorldPickPositionLine("Hit point",pick.HitPoint));return sb.ToString().TrimEnd();
       }
       if(pick.Spn!=null){
         WorldSpnPlacement spn=pick.Spn;sb.AppendLine("Placeable: "+(spn.Name??spn.SourceFqn??"(unknown)"));sb.AppendLine("Node: "+(spn.SourceFqn??"(none)"));
@@ -1257,7 +1308,9 @@ namespace PugTools {
         WorldSpnDynState dyn=ActiveSpnDynState(spn,SettingsSnapshot().AnimateSpnObjects);if(dyn!=null)sb.AppendLine("State: "+(dyn.Name??"(unnamed)")+(dyn.Hidden?" (hidden)":""));
         AppendWorldInteractionDetails(sb,spn.Interaction);
         if(spn.Interaction==null&&spn.WonkaPackageId!=0)sb.AppendLine("Wonkavator package: "+spn.WonkaPackageId);
-        sb.AppendLine("Interactable glow: "+spn.BlueGlow);sb.AppendLine(WorldPickPositionLine("World position",pick.Center));return sb.ToString().TrimEnd();
+        if(pick.Mesh!=null)sb.AppendLine("Mesh: "+(pick.Mesh.meshName??"(unknown)")+"  [LOD "+pick.Mesh.lod+"]");
+        if(pick.Piece!=null){GR2_Material material=ResolvePieceMaterial(pick.Model,pick.Piece);sb.AppendLine("Material: "+(material?.materialName??"(none)"));}
+        sb.AppendLine("Interactable glow: "+spn.BlueGlow);sb.AppendLine(WorldPickPositionLine("World position",pick.Center));sb.AppendLine(WorldPickPositionLine("Hit point",pick.HitPoint));return sb.ToString().TrimEnd();
       }
       Room room=pick.Utility?.Room??pick.RenderEntry?.Room;AssetInstance inst=pick.Utility?.Instance??pick.RenderEntry?.Instance;AreaAsset asset=null;if(inst!=null&&area!=null)area.AssetIdMap.TryGetValue(inst.assetID,out asset);
       sb.AppendLine("Asset: "+WorldAssetDisplayPath(asset,pick.Model??pick.Utility?.Model??pick.RenderEntry?.Model));sb.AppendLine("Room: "+(room?.RoomName??"unknown"));sb.AppendLine("Instance id: "+(inst?.ID??0));
@@ -1429,7 +1482,7 @@ namespace PugTools {
       x=pos.X;z=pos.Z;lookX=look.X;lookZ=look.Z;
     }
 
-    public void Clear(){ClearSpaceFlypathState();EndTaxiRide(null);CloseTaxiRouteMapState();CloseQuickTravelMapState();ReleaseWorldGpu(); SetImplicitPhaseName(String.Empty); pathFollowers.Clear();instanceWorldTransforms.Clear(); models.Clear();materials.Clear();rooms.Clear();area=null;}
+    public void Clear(){ClearSpaceFlypathState();EndTaxiRide(null);CloseTaxiRouteMapState();CloseQuickTravelMapState();ReleaseWorldGpu(); SetImplicitPhaseName(String.Empty); locationBannerLastRoomName=String.Empty;locationBannerLastDisplayName=String.Empty;locationBannerText=String.Empty;locationBannerStartedAt=-1000f; pathFollowers.Clear();instanceWorldTransforms.Clear(); models.Clear();materials.Clear();rooms.Clear();area=null;}
     private void ReleaseWorldGpu(){
       // Capture every material while population/SPN/model references are still alive.  Appearance-specific NPC
       // materials are not guaranteed to live in the area's top-level MAT dictionary; releasing only that dictionary
@@ -1458,7 +1511,7 @@ namespace PugTools {
     private static void Release<T>(ref T v) where T:class,IDisposable{v?.Dispose();v=null;}
 
     protected override void Dispose(bool disposing){
-      if(!_disposed){if(disposing){ReleaseWorldGpu();DisposeFeatureTextRenderer();ReleasePostTargets();Release(ref sceneDepthShaderResource);for(int i=0;i<shadowMaps.Length;i++)shadowMaps[i]?.Dispose();dynamicDetailLayout?.Dispose();instancedLayout?.Dispose();skinnedLayout?.Dispose();inputLayout?.Dispose();fx?.Dispose();RenderStates.DestroyAll();}_disposed=true;}base.Dispose(disposing);
+      if(!_disposed){if(disposing){ReleaseWorldGpu();DisposeFeatureTextRenderer();ReleasePostTargets();Release(ref sceneDepthShaderResource);Release(ref sceneDepthReadOnlyView);for(int i=0;i<shadowMaps.Length;i++)shadowMaps[i]?.Dispose();dynamicDetailLayout?.Dispose();instancedLayout?.Dispose();skinnedLayout?.Dispose();inputLayout?.Dispose();fx?.Dispose();RenderStates.DestroyAll();}_disposed=true;}base.Dispose(disposing);
     }
 
     public override void OnResize(){
@@ -1480,12 +1533,14 @@ namespace PugTools {
     }
 
     private void CreateSampleableDepthTarget(){
-      Release(ref sceneDepthShaderResource); Release(ref DepthStencilView); Release(ref DepthStencilBuffer);
+      Release(ref sceneDepthShaderResource); Release(ref sceneDepthReadOnlyView); Release(ref DepthStencilView); Release(ref DepthStencilBuffer);
       if(Device==null || ClientWidth<=0 || ClientHeight<=0)return;
       var desc=new Texture2DDescription{Width=ClientWidth,Height=ClientHeight,MipLevels=1,ArraySize=1,Format=Format.R24G8_Typeless,SampleDescription=new SampleDescription(1,0),Usage=ResourceUsage.Default,BindFlags=BindFlags.DepthStencil|BindFlags.ShaderResource,CpuAccessFlags=CpuAccessFlags.None,OptionFlags=ResourceOptionFlags.None};
       DepthStencilBuffer=new Texture2D(Device,desc){DebugName="World sampleable depth"};
       var dsvDesc=new DepthStencilViewDescription{Flags=DepthStencilViewFlags.None,Format=Format.D24_UNorm_S8_UInt,Dimension=DepthStencilViewDimension.Texture2D,MipSlice=0};
       DepthStencilView=new DepthStencilView(Device,DepthStencilBuffer,dsvDesc);
+      var readOnlyDsvDesc=dsvDesc; readOnlyDsvDesc.Flags=DepthStencilViewFlags.ReadOnlyDepth|DepthStencilViewFlags.ReadOnlyStencil;
+      sceneDepthReadOnlyView=new DepthStencilView(Device,DepthStencilBuffer,readOnlyDsvDesc);
       var srvDesc=new ShaderResourceViewDescription{Format=Format.R24_UNorm_X8_Typeless,Dimension=ShaderResourceViewDimension.Texture2D,MipLevels=1,MostDetailedMip=0};
       sceneDepthShaderResource=new ShaderResourceView(Device,DepthStencilBuffer,srvDesc);
       ImmediateContext.OutputMerger.SetTargets(DepthStencilView,RenderTargetView);
@@ -1502,6 +1557,7 @@ namespace PugTools {
     }
 
     private void ReleasePostTargets(){
+      worldActiveRenderTarget=null;
       fx?.ClearAntiAliasing(); fx?.ClearPost();
       Release(ref aaTempShaderResource);Release(ref aaTempRenderTarget);Release(ref aaTempTexture);
       for(int i=0;i<2;i++){Release(ref taaHistoryShaderResources[i]);Release(ref taaHistoryRenderTargets[i]);Release(ref taaHistoryTextures[i]);}
@@ -1669,6 +1725,7 @@ namespace PugTools {
       Room renderCameraRoom=cameraRoom;
       if(modelStreamer!=null&&s.Mode!=WorldRenderMode.Map){Room streamed=ResolveStreamingRoom(camera.Position,cameraRoom);if(streamed!=null&&!IsEverywhereRoom(streamed))renderCameraRoom=streamed;}
       UpdateStreamTransitionGrace(renderCameraRoom);
+      UpdateLocationBanner(displayCameraRoom??cameraRoom,s);
       UpdateCurrentPhase(camera.Position);
       // Jedipedia does not let the synthetic `_everywhere_` cell choose a room environment/skyscene. When the
       // camera has no concrete visibility room it explicitly falls back to envSchemes.area. Using `_everywhere_`'s
@@ -1723,6 +1780,7 @@ namespace PugTools {
 
       bool useOffscreen=sceneRenderTarget!=null&&(useColorPost||useTaa||useFxaa);
       RenderTargetView target=useOffscreen?sceneRenderTarget:RenderTargetView;
+      worldActiveRenderTarget=target;
       ImmediateContext.OutputMerger.SetTargets(DepthStencilView,target);ImmediateContext.Rasterizer.SetViewports(Viewport);
       var clear=new Color4(env.FogColorSky.W,env.FogColorSky.X,env.FogColorSky.Y,env.FogColorSky.Z);
       ImmediateContext.ClearRenderTargetView(target,clear);ImmediateContext.ClearDepthStencilView(DepthStencilView,DepthStencilClearFlags.Depth|DepthStencilClearFlags.Stencil,1,0);
@@ -1744,7 +1802,7 @@ namespace PugTools {
       // conservative D3D11 depth prepass and also give nameplate occlusion the authored walls instead of text-only heuristics.
       if(s.ShowModels&&s.EnableOccluderPrepass&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Wireframe)
         DrawOccluderPrepass(viewProj,visible,s);
-      if(s.ShowTerrain)DrawTerrain(viewProj,visible,s,env,shadows);if(s.ShowDynamicDetails&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDynamicDetails(viewProj,visible,s,env,shadows);if(s.ShowModels)DrawModels(viewProj,visible,s,env,shadows);if((s.ShowNpcs||s.ShowTaxiTerminals)&&s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Map)DrawJedipediaNpcs(viewProj,visible,s,env,shadows);if(s.ShowSpnObjects&&s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaSpnObjects(viewProj,visible,s,env,shadows);DrawTaxiVehicle(viewProj,visible,s,env,shadows);DrawSpaceCombatShips(viewProj,visible,s,env,shadows);if(s.ShowDecorationHooks&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDecorationHooks(viewProj,visible,s,env,shadows);if(s.ShowWater)DrawWater(viewProj,visible,s);
+      if(s.ShowTerrain)DrawTerrain(viewProj,visible,s,env,shadows);if(s.ShowDynamicDetails&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDynamicDetails(viewProj,visible,s,env,shadows);if(s.ShowModels)DrawModels(viewProj,visible,s,env,shadows);if((s.ShowNpcs||s.ShowTaxiTerminals||HasWorldConversationVirtualActors)&&s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Map)DrawJedipediaNpcs(viewProj,visible,s,env,shadows);if(s.Mode!=WorldRenderMode.Heightmap&&s.Mode!=WorldRenderMode.Map)DrawWorldConversationFx(viewProj,s);if(s.ShowSpnObjects&&s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaSpnObjects(viewProj,visible,s,env,shadows);if(s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawWorldAmbientFx(viewProj,visible,s);DrawTaxiVehicle(viewProj,visible,s,env,shadows);DrawSpaceCombatShips(viewProj,visible,s,env,shadows);if(s.ShowDecorationHooks&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap)DrawDecorationHooks(viewProj,visible,s,env,shadows);if(s.ShowWater)DrawWater(viewProj,visible,s);
       if(s.Mode==WorldRenderMode.Map&&s.ShowMapArt)DrawMapArt(viewProj);
       if(s.ShowRoads)DrawLines(roadGpu,viewProj,s.Mode==WorldRenderMode.Map?float.MaxValue:camera.FarZ);
       if(s.ShowMapNotes&&s.Mode==WorldRenderMode.Map){
@@ -1768,6 +1826,7 @@ namespace PugTools {
         DrawWorldConversationSubtitleHud(s);
         DrawSpaceFlypathHud(s);
         DrawTaxiRideHud(s);
+        DrawWorldLocationBanner(s);
       }
       UpdateObjectOcclusionVisibility(viewProj,visible,s);
       UpdateWorldRenderStatsSnapshot();
@@ -4175,10 +4234,32 @@ namespace PugTools {
       return ulong.TryParse(text,out id)&&id!=0;
     }
 
-    private bool RoomVisible(Room r,HashSet<string> visible)=>visible==null||visible.Contains(r.RoomName);
+    public bool IsRoomManuallyVisible(string roomName){
+      if(String.IsNullOrWhiteSpace(roomName))return true;
+      HashSet<string> hidden=manuallyHiddenRoomNames;
+      return hidden==null||!hidden.Contains(roomName);
+    }
+
+    public void SetRoomManuallyVisible(string roomName,bool visible){
+      if(String.IsNullOrWhiteSpace(roomName))return;
+      HashSet<string> current=manuallyHiddenRoomNames??new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      bool currentlyVisible=!current.Contains(roomName);
+      if(currentlyVisible==visible)return;
+      var next=new HashSet<string>(current,StringComparer.OrdinalIgnoreCase);
+      if(visible)next.Remove(roomName);else next.Add(roomName);
+      manuallyHiddenRoomNames=next;
+    }
+
+    public void SetAllRoomsManuallyVisible(bool visible){
+      if(visible)manuallyHiddenRoomNames=new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      else manuallyHiddenRoomNames=new HashSet<string>((rooms??new List<Room>()).Where(r=>r!=null&&!String.IsNullOrWhiteSpace(r.RoomName)).Select(r=>r.RoomName),StringComparer.OrdinalIgnoreCase);
+    }
+
+    private bool RoomManuallyVisible(Room r)=>r==null||IsRoomManuallyVisible(r.RoomName);
+    private bool RoomVisible(Room r,HashSet<string> visible)=>RoomManuallyVisible(r)&&(visible==null||visible.Contains(r.RoomName));
     // A follower-owned traffic model can leave the static room that authored it. Jedipedia deliberately bypasses
-    // that room's dPVS gate for the moving subtree; otherwise a ship disappears as soon as its owner room is culled.
-    private bool InstanceRoomVisible(AssetInstance inst,Room room,HashSet<string> visible)=>inst!=null&&inst.PathFollowerAnimated||RoomVisible(room,visible);
+    // that room's dPVS gate for the moving subtree; the explicit user room checkbox remains authoritative, though.
+    private bool InstanceRoomVisible(AssetInstance inst,Room room,HashSet<string> visible)=>RoomManuallyVisible(room)&&(inst!=null&&inst.PathFollowerAnimated||(visible==null||visible.Contains(room?.RoomName)));
 
     private float GetOrthographicHalfHeight(WorldRenderSettings s){
       float zoom=Math.Max(OrthographicZoomMin,Math.Min(OrthographicZoomMax,orthographicZoom));
@@ -4644,7 +4725,7 @@ namespace PugTools {
       string activeSky=ResolveSkyRoomName(env);
       if(string.IsNullOrEmpty(activeSky)||activeSky=="_everywhere_")return;
       Room room=rooms.FirstOrDefault(r=>r!=null&&r.RoomName==activeSky);
-      if(room==null)return;
+      if(room==null||!RoomManuallyVisible(room))return;
       ApplyRoomEnvironment(room,env,s,false);ClearLocalLightBinding();
       Matrix skyCameraInv=Matrix.Identity;bool hasSkyCamera=TryGetSkyCameraInverse(room,out skyCameraInv);
       Matrix skyVp=GetSkyViewProjection();
@@ -4653,6 +4734,8 @@ namespace PugTools {
         Matrix world=InstanceWorldForSky(inst,room);if(hasSkyCamera)world*=skyCameraInv;
         DrawModel(model,world,skyVp,s,true,null);
       }
+      DrawWorldAmbientSkyFx(skyVp,s,room,hasSkyCamera?skyCameraInv:(Matrix?)null);
+      DrawShipVfxEffects(skyVp,s,true,room,hasSkyCamera?skyCameraInv:(Matrix?)null);
     }
 
     private void DrawModels(Matrix vp,HashSet<string> visible,WorldRenderSettings s,AreaEnvironmentScheme env,bool sceneShadows){

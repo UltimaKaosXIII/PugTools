@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Data;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Xml;
@@ -46,6 +47,15 @@ namespace PugTools {
     private ArrayList _rootList;
     private Int32 _searchIndex;
     private List<String> _searchNodes;
+    private System.Windows.Forms.Timer _nodeTreeFilterTimer;
+    private CancellationTokenSource _nodeTreeFilterCancellation;
+    private Int32 _nodeTreeFilterGeneration;
+    private const Int32 NodeTreeFilterDisplayLimit = 2500;
+    private const Int32 NodeTreeFilterNodeLimit = 8000;
+    private const Int32 NodeTreeFilterAutoExpandLimit = 100;
+    private NodeSearchEntry[] _nodeSearchIndex = Array.Empty<NodeSearchEntry>();
+    private TreeViewFast.Controls.TreeViewFast.PreparedTree _fullNodeTree;
+    private TreeViewFast.Controls.TreeViewFast _nodeFilterTree;
     #endregion
 
     #region NodeBrowser
@@ -55,6 +65,9 @@ namespace PugTools {
       if (extractLocation == null) throw new ArgumentNullException(nameof(extractLocation));
 
       InitializeComponent();
+      InitializeNodeFilterTreeView();
+      InitializeNodeTreeLiveFilter();
+      InitializeNodePreviewUi();
       Config.Load();
 
       _assetsLocation = assetLocation;
@@ -106,9 +119,23 @@ namespace PugTools {
 
         return children;
       };
+
+      // Jedipedia-style navigation: a node reference in the raw value table behaves like a link.
+      // The existing right-click “Go to Node” remains available; double-click is the fast path.
+      treeViewGrid1.MouseDoubleClick += TreeViewGrid1MouseDoubleClickNavigate;
     }
     private void NodeBrowserFormClosed(Object sender, FormClosedEventArgs e) {
+      try { _nodeTreeFilterTimer?.Stop(); _nodeTreeFilterTimer?.Dispose(); } catch { }
+      _nodeTreeFilterTimer = null;
+      try { _nodeTreeFilterCancellation?.Cancel(); _nodeTreeFilterCancellation?.Dispose(); } catch { }
+      _nodeTreeFilterCancellation = null;
       Hide();
+      DisposeNodePreview();
+
+      if (_nodeFilterTree != null) {
+        try { _nodeFilterTree.Dispose(); } catch { }
+        _nodeFilterTree = null;
+      }
 
       if (treeViewFast1 != null) {
         treeViewFast1.Dispose();
@@ -151,8 +178,11 @@ namespace PugTools {
       _closing = true;
     }
     private void NodeBrowserFormResize(Object sender, EventArgs e) {
-      treeViewFast1.Size =
+      var treeSize =
         new System.Drawing.Size(splitContainer2.Panel1.Width, splitContainer2.Panel1.Height - 70);
+      if (treeViewFast1 != null) treeViewFast1.Size = treeSize;
+      if (_nodeFilterTree != null) _nodeFilterTree.Size = treeSize;
+      ResizeNodePreviewLayout();
     }
     #endregion
 
@@ -163,6 +193,7 @@ namespace PugTools {
       System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.LowLatency;
 
       _currentAssets = AssetHandler.Instance.GetCurrentAssets(_assetsLocation, _assetsUsePts);
+      LocalizationResolver.Apply(_currentAssets, Config.Language);
       _currentDom = DomHandler.Instance.GetCurrentDOM(_currentAssets);
 
       if (_compareNodes) {
@@ -450,17 +481,58 @@ namespace PugTools {
     private void BackgroundWorker3Run(Object sender, DoWorkEventArgs e) {
       if (_closing) return;
 
+      // Build a compact search array and the managed TreeNode hierarchy off the UI thread.
+      // Only the final attachment to WinForms happens in BackgroundWorker3Completed.
+      var searchEntries = new List<NodeSearchEntry>(_assetDict.Count);
+      foreach (NodeAsset item in _assetDict.Values) {
+        GomObject obj = item?.Obj;
+        if (obj == null) continue;
+
+        searchEntries.Add(new NodeSearchEntry(
+          item.id,
+          item.displayName,
+          obj.Name,
+          obj.Id.ToString(),
+          obj.DomClass?.Id.ToString(),
+          obj.NumGlommed
+        ));
+      }
+      _nodeSearchIndex = searchEntries.ToArray();
+
       String getId(NodeAsset x) => x.id;
       String getParentId(NodeAsset x) => x.parentId;
       String getDisplayName(NodeAsset x) => x.displayName;
+      Int32 getImageIndex(NodeAsset x) =>
+        x != null && (x.Obj != null || x.dynObject != null || x.objData != null) ? 2 : 1;
+      Int32 compare(NodeAsset x, NodeAsset y) {
+        Boolean xLeaf = x != null && (x.Obj != null || x.dynObject != null || x.objData != null);
+        Boolean yLeaf = y != null && (y.Obj != null || y.dynObject != null || y.objData != null);
+        if (xLeaf != yLeaf) return xLeaf ? 1 : -1;
+        return String.Compare(x?.id, y?.id, StringComparison.Ordinal);
+      }
 
-      treeViewFast1.BeginUpdate();
-      treeViewFast1.LoadItems<NodeAsset>(_assetDict, getId, getParentId, getDisplayName);
-      treeViewFast1.EndUpdate();
-      TreeViewFast1Show();
+      _fullNodeTree = TreeViewFast.Controls.TreeViewFast.PrepareItems(
+        _assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, compare
+      );
     }
     private void BackgroundWorker3Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (_closing) return;
+
+      if (e.Error != null) {
+        StatusLabel1Text("Unable to build node tree.");
+        MessageBox.Show(e.Error.Message, "Node Browser", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        ProgressBarHide();
+        LoadingSwirlHide();
+        return;
+      }
+
+      treeViewFast1.BeginUpdate();
+      try {
+        if (_fullNodeTree != null) treeViewFast1.LoadPrepared(_fullNodeTree);
+      } finally {
+        treeViewFast1.EndUpdate();
+      }
+      TreeViewFast1Show();
 
       ProgressBarHide();
       StatusLabel1Text(
@@ -486,14 +558,10 @@ namespace PugTools {
 
     #region Buttons
     private void BtnClearSearchClick(Object sender, EventArgs e) {
-      _searchNodes = new List<String>();
-      _searchIndex = 0;
-      txtSearch.Enabled = true;
+      if (txtSearch == null) return;
       txtSearch.Text = String.Empty;
-      btnSearch.Enabled = true;
-      btnFindNext.Enabled = false;
-      btnClearSearch.Enabled = false;
-      StatusLabel1Text(String.Empty);
+      ApplyNodeTreeLiveFilter();
+      txtSearch.Focus();
     }
     private void BtnExtractClick(Object sender, EventArgs e) {
       try {
@@ -663,8 +731,15 @@ namespace PugTools {
     //   }
     // }
     private void NodeExtraction() {
-      treeViewFast1.Invoke(new Action(() => {
-        TreeNode node = treeViewFast1.SelectedNode;
+      TreeViewFast.Controls.TreeViewFast tree = ActiveNodeTree;
+      if (tree == null) return;
+      tree.Invoke(new Action(() => {
+        TreeNode node = tree.SelectedNode;
+        if (node == null) {
+          MessageBox.Show("Please select a node before extracting.", "Node Browser",
+                          MessageBoxButtons.OK, MessageBoxIcon.Warning);
+          return;
+        }
         String extractResult = NodeExtraction(node, false);
 
         if (String.IsNullOrEmpty(extractResult))
@@ -903,6 +978,354 @@ namespace PugTools {
     }
     #endregion
 
+    private TreeViewFast.Controls.TreeViewFast ActiveNodeTree =>
+      _nodeFilterTree != null && _nodeFilterTree.Visible ? _nodeFilterTree : treeViewFast1;
+
+    private void InitializeNodeFilterTreeView() {
+      _nodeFilterTree = new TreeViewFast.Controls.TreeViewFast {
+        BorderStyle = treeViewFast1.BorderStyle,
+        Dock = treeViewFast1.Dock,
+        ImageIndex = treeViewFast1.ImageIndex,
+        ImageList = treeViewFast1.ImageList,
+        Margin = treeViewFast1.Margin,
+        SelectedImageIndex = treeViewFast1.SelectedImageIndex,
+        Size = treeViewFast1.Size,
+        TabIndex = treeViewFast1.TabIndex,
+        Visible = false
+      };
+      _nodeFilterTree.AfterSelect += TreeViewFast1AfterSelect;
+      _nodeFilterTree.KeyDown += TreeViewFast1KeyDown;
+      _nodeFilterTree.MouseHover += TreeViewFast1MouseHover;
+      _nodeFilterTree.MouseUp += TreeViewFast1MouseUp;
+      splitContainer2.Panel1.Controls.Add(_nodeFilterTree);
+      _nodeFilterTree.BringToFront();
+    }
+
+    private void InitializeNodeTreeLiveFilter() {
+      _nodeTreeFilterTimer = new System.Windows.Forms.Timer { Interval = 180 };
+      _nodeTreeFilterTimer.Tick += (_, __) => {
+        _nodeTreeFilterTimer.Stop();
+        ApplyNodeTreeLiveFilter();
+      };
+      txtSearch.TextChanged += (_, __) => {
+        if (_closing) return;
+        Boolean hasFilter = txtSearch.Enabled && !String.IsNullOrWhiteSpace(txtSearch.Text);
+        btnClearSearch.Enabled = hasFilter;
+        _nodeTreeFilterTimer.Stop();
+        if (hasFilter) _nodeTreeFilterTimer.Start();
+        else ApplyNodeTreeLiveFilter();
+      };
+
+      btnSearch.Visible = false;
+      btnFindNext.Visible = false;
+      btnClearSearch.Text = "Clear filter";
+      btnClearSearch.Location = new System.Drawing.Point(34, 37);
+      btnClearSearch.Size = new System.Drawing.Size(335, 27);
+      btnClearSearch.Enabled = false;
+      txtSearch.PlaceholderText = "Filter: words are ANDed, -word excludes, #3 = 3+ GLOMmed";
+    }
+
+    private readonly struct NodeSearchEntry {
+      internal String Id { get; }
+      internal String DisplayName { get; }
+      internal String NodeName { get; }
+      internal String ObjectId { get; }
+      internal String BaseClassId { get; }
+      internal Int32 NumGlommed { get; }
+
+      internal NodeSearchEntry(
+        String id,
+        String displayName,
+        String nodeName,
+        String objectId,
+        String baseClassId,
+        Int32 numGlommed
+      ) {
+        Id = id ?? String.Empty;
+        DisplayName = displayName ?? String.Empty;
+        NodeName = nodeName ?? String.Empty;
+        ObjectId = objectId ?? String.Empty;
+        BaseClassId = baseClassId ?? String.Empty;
+        NumGlommed = numGlommed;
+      }
+    }
+
+    private sealed class NodeTreeFilterResult {
+      internal Dictionary<String, NodeAsset> Items { get; }
+      internal List<String> DisplayMatches { get; }
+      internal Int32 TotalMatches { get; }
+      internal Boolean IsTruncated { get; }
+      internal TreeViewFast.Controls.TreeViewFast.PreparedTree PreparedTree { get; }
+
+      internal NodeTreeFilterResult(
+        Dictionary<String, NodeAsset> items,
+        List<String> displayMatches,
+        Int32 totalMatches,
+        Boolean isTruncated = false,
+        TreeViewFast.Controls.TreeViewFast.PreparedTree preparedTree = null
+      ) {
+        Items = items;
+        DisplayMatches = displayMatches;
+        TotalMatches = totalMatches;
+        IsTruncated = isTruncated;
+        PreparedTree = preparedTree;
+      }
+    }
+
+    private static Boolean TryParseNodeGlomFilter(String query, out Int32 minGlommed) {
+      minGlommed = 0;
+      if (String.IsNullOrWhiteSpace(query) || query[0] != '#') return false;
+      if (query == "#") {
+        minGlommed = 1;
+        return true;
+      }
+      if (!Int32.TryParse(query.Substring(1), out minGlommed)) return false;
+      return minGlommed >= 0;
+    }
+
+    private NodeTreeFilterResult BuildNodeTreeFilter(
+      TreeFilterQuery filter,
+      Int32? minGlommed,
+      CancellationToken token
+    ) {
+      Dictionary<String, NodeAsset> assets = _assetDict;
+      if (assets == null) return new NodeTreeFilterResult(
+        new Dictionary<String, NodeAsset>(StringComparer.OrdinalIgnoreCase),
+        new List<String>(),
+        0
+      );
+
+      var displayMatches = new List<String>(NodeTreeFilterDisplayLimit);
+      Int32 totalMatches = 0;
+      Int32 scanned = 0;
+      Boolean truncated = false;
+      NodeSearchEntry[] searchIndex = _nodeSearchIndex ?? Array.Empty<NodeSearchEntry>();
+
+      foreach (NodeSearchEntry entry in searchIndex) {
+        if ((++scanned & 0xff) == 0) token.ThrowIfCancellationRequested();
+
+        Boolean match = minGlommed.HasValue
+          ? entry.NumGlommed >= minGlommed.Value
+          : filter.Matches(
+              entry.Id, entry.DisplayName, entry.NodeName, entry.ObjectId, entry.BaseClassId
+            );
+        if (!match) continue;
+
+        totalMatches++;
+        if (displayMatches.Count < NodeTreeFilterDisplayLimit) {
+          displayMatches.Add(entry.Id);
+        } else {
+          truncated = true;
+          break;
+        }
+      }
+
+      token.ThrowIfCancellationRequested();
+
+      var include = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+      var retainedMatches = new List<String>(displayMatches.Count);
+      foreach (String id in displayMatches) {
+        token.ThrowIfCancellationRequested();
+        var path = new List<String>(12);
+        String current = id;
+        while (!String.IsNullOrWhiteSpace(current) && !include.Contains(current)) {
+          path.Add(current);
+          if (!assets.TryGetValue(current, out NodeAsset currentItem)
+              || currentItem == null
+              || String.IsNullOrWhiteSpace(currentItem.parentId)) break;
+          current = currentItem.parentId;
+        }
+
+        if (include.Count + path.Count > NodeTreeFilterNodeLimit) {
+          truncated = true;
+          break;
+        }
+        foreach (String pathId in path) include.Add(pathId);
+        retainedMatches.Add(id);
+      }
+      displayMatches = retainedMatches;
+
+      var filtered = new Dictionary<String, NodeAsset>(include.Count, StringComparer.OrdinalIgnoreCase);
+      foreach (String id in include) {
+        if (assets.TryGetValue(id, out NodeAsset item) && item != null)
+          filtered[id] = item;
+      }
+
+      TreeViewFast.Controls.TreeViewFast.PreparedTree prepared = PrepareNodeFilterTree(filtered.Values);
+      return new NodeTreeFilterResult(filtered, displayMatches, totalMatches, truncated, prepared);
+    }
+
+    private static TreeViewFast.Controls.TreeViewFast.PreparedTree PrepareNodeFilterTree(
+      IEnumerable<NodeAsset> items
+    ) {
+      String getId(NodeAsset x) => x.id;
+      String getParentId(NodeAsset x) => x.parentId;
+      String getDisplayName(NodeAsset x) => x.displayName;
+      Int32 getImageIndex(NodeAsset x) =>
+        x != null && (x.Obj != null || x.dynObject != null || x.objData != null) ? 2 : 1;
+      Int32 compare(NodeAsset x, NodeAsset y) {
+        Boolean xLeaf = x != null && (x.Obj != null || x.dynObject != null || x.objData != null);
+        Boolean yLeaf = y != null && (y.Obj != null || y.dynObject != null || y.objData != null);
+        if (xLeaf != yLeaf) return xLeaf ? 1 : -1;
+        return String.Compare(x?.id, y?.id, StringComparison.Ordinal);
+      }
+      return TreeViewFast.Controls.TreeViewFast.PrepareItems(
+        items, getId, getParentId, getDisplayName, getImageIndex, compare
+      );
+    }
+
+    private NodeTreeFilterResult BuildNodeUnsupportedVersionFilterResult() {
+      var items = new Dictionary<String, NodeAsset>(StringComparer.OrdinalIgnoreCase);
+      if (_assetDict != null) {
+        foreach (KeyValuePair<String, NodeAsset> pair in _assetDict) {
+          if (pair.Value != null && String.IsNullOrWhiteSpace(pair.Value.parentId)) {
+            items[pair.Key] = pair.Value;
+            break;
+          }
+        }
+      }
+      return new NodeTreeFilterResult(
+        items, new List<String>(), 0, false, PrepareNodeFilterTree(items.Values)
+      );
+    }
+
+    private async void ApplyNodeTreeLiveFilter() {
+      if (_closing || _assetDict == null || treeViewFast1 == null || txtSearch == null) return;
+      if (InvokeRequired) { BeginInvoke(new Action(ApplyNodeTreeLiveFilter)); return; }
+
+      TreeFilterQuery filter = TreeFilterQuery.Parse(txtSearch.Text, false);
+      String query = filter.RawText;
+      String selectedId = ActiveNodeTree?.SelectedNode?.Name;
+      Int32? minGlommed = TryParseNodeGlomFilter(query, out Int32 glomValue)
+        ? glomValue
+        : null;
+
+      CancellationTokenSource previous = _nodeTreeFilterCancellation;
+      var cancellation = new CancellationTokenSource();
+      _nodeTreeFilterCancellation = cancellation;
+      try { previous?.Cancel(); previous?.Dispose(); } catch { }
+      Int32 generation = ++_nodeTreeFilterGeneration;
+
+      if (filter.IsEmpty) {
+        ApplyNodeTreeFilterResult(
+          filter,
+          selectedId,
+          new NodeTreeFilterResult(_assetDict, new List<String>(), 0),
+          minGlommed
+        );
+        return;
+      }
+
+      if (filter.HasVersionTerms) {
+        ApplyNodeTreeFilterResult(
+          filter,
+          selectedId,
+          BuildNodeUnsupportedVersionFilterResult(),
+          minGlommed
+        );
+        StatusLabel1Text(
+          "Patch filter " + String.Join(" ", filter.VersionTerms)
+          + " requires a local first-seen/history index. Text, -exclude and # GLOM filters are available now."
+        );
+        return;
+      }
+
+      StatusLabel1Text("Filtering nodes ...");
+
+      NodeTreeFilterResult result;
+      try {
+        result = await Task.Run(
+          () => BuildNodeTreeFilter(filter, minGlommed, cancellation.Token),
+          cancellation.Token
+        );
+      }
+      catch (OperationCanceledException) {
+        return;
+      }
+      catch (ObjectDisposedException) {
+        return;
+      }
+
+      if (_closing || cancellation.IsCancellationRequested
+          || generation != _nodeTreeFilterGeneration
+          || !String.Equals(query, (txtSearch.Text ?? String.Empty).Trim(), StringComparison.Ordinal)) return;
+
+      ApplyNodeTreeFilterResult(filter, selectedId, result, minGlommed);
+    }
+
+    private void ApplyNodeTreeFilterResult(
+      TreeFilterQuery filter,
+      String selectedId,
+      NodeTreeFilterResult result,
+      Int32? minGlommed
+    ) {
+      if (_closing || treeViewFast1 == null || _nodeFilterTree == null) return;
+
+      String query = filter?.RawText ?? String.Empty;
+      if (filter == null || filter.IsEmpty) {
+        _nodeFilterTree.Visible = false;
+        treeViewFast1.Visible = true;
+        treeViewFast1.BringToFront();
+        btnClearSearch.Enabled = false;
+        StatusLabel1Text(
+          _compareNodes
+            ? "Comparison loaded. Showing New, Changed and Removed nodes only."
+            : "Showing all nodes."
+        );
+        return;
+      }
+
+      if (result == null || result.PreparedTree == null) return;
+      Dictionary<String, NodeAsset> filtered = result.Items;
+      List<String> directMatches = result.DisplayMatches;
+
+      _nodeFilterTree.BeginUpdate();
+      try {
+        _nodeFilterTree.LoadPrepared(result.PreparedTree);
+
+        if (directMatches.Count <= NodeTreeFilterAutoExpandLimit) {
+          var expanded = new HashSet<String>(StringComparer.Ordinal);
+          foreach (String id in directMatches) {
+            if (!result.PreparedTree.NodeMap.TryGetValue(id, out TreeNode node)) continue;
+            for (TreeNode parent = node.Parent; parent != null; parent = parent.Parent) {
+              if (expanded.Add(parent.Name)) parent.Expand();
+            }
+          }
+        } else {
+          foreach (TreeNode root in _nodeFilterTree.Nodes) root.Expand();
+        }
+
+        if (!String.IsNullOrWhiteSpace(selectedId) && filtered.ContainsKey(selectedId)) {
+          try { _nodeFilterTree.SelectedNode = _nodeFilterTree.GetNode(selectedId); } catch { }
+        }
+      } finally {
+        _nodeFilterTree.EndUpdate();
+      }
+
+      treeViewFast1.Visible = false;
+      _nodeFilterTree.Visible = true;
+      _nodeFilterTree.BringToFront();
+
+      btnClearSearch.Enabled = txtSearch.Enabled && query.Length > 0;
+      String noun = minGlommed.HasValue ? "GLOM matches" : "matches";
+      if (result.IsTruncated) {
+        String countText = result.TotalMatches > NodeTreeFilterDisplayLimit
+          ? NodeTreeFilterDisplayLimit.ToString("n0") + "+"
+          : result.TotalMatches.ToString("n0");
+        StatusLabel1Text(
+          "Filter: " + countText + " " + noun
+          + ". Showing first " + directMatches.Count.ToString("n0") + " ("
+          + filtered.Count.ToString("n0")
+          + " nodes including parents); type more characters to narrow the result."
+        );
+      } else {
+        StatusLabel1Text(
+          "Filter: " + result.TotalMatches.ToString("n0") + " " + noun + " ("
+          + filtered.Count.ToString("n0") + " nodes including parents)."
+        );
+      }
+    }
+
     #region Search
     private void Search() {
       StatusLabel1Text("Performing Search ...");
@@ -981,29 +1404,70 @@ namespace PugTools {
       BtnExtractClick(this, null);
     }
     private void ToolStripMenuItem2Click(Object sender, EventArgs e) {
-      // BrightIdeasSoftware.TreeListView tlv = sender as BrightIdeasSoftware.TreeListView;
-      NodeListItem item = treeViewGrid1.SelectedObject as NodeListItem;
-      // NodeListItem item = tr.SelectedObject as NodeListItem;
-      String nodeString;
+      NavigateToNodeReference(treeViewGrid1.SelectedObject as NodeListItem);
+    }
 
-      if (item.DisplayValue.Contains(" (") && item.DisplayValue.EndsWith(")")) {
-        nodeString = item.DisplayValue.Split(' ').Last().Replace("(", "").Replace(")", "");
-      } else {
-        nodeString = item.DisplayName.Split(' ').Last().Replace("(", "").Replace(")", "");
-      }
+    private Boolean NavigateToNodeReference(NodeListItem item) {
+      if (!TryGetNodeReference(item, out String nodeString) || String.IsNullOrWhiteSpace(nodeString)) return false;
 
-      TreeNode[] node = treeViewFast1.Nodes.Find(nodeString, true);
-      if (node.Length == 0 && _compareNodes) {
+      // Navigation targets the persistent full tree. Leaving the filter view is an O(1) visibility
+      // swap now, so references can reliably reveal their real hierarchy without rebuilding it.
+      if (_nodeFilterTree != null && _nodeFilterTree.Visible && !String.IsNullOrEmpty(txtSearch.Text))
+        txtSearch.Clear();
+
+      TreeNode[] nodes = treeViewFast1.Nodes.Find(nodeString, true);
+      if (nodes.Length == 0 && _compareNodes) {
         String compareKey = _assetDict.Keys.FirstOrDefault(key =>
           key.EndsWith("/" + nodeString, StringComparison.OrdinalIgnoreCase)
         );
-        if (!String.IsNullOrEmpty(compareKey))
-          node = treeViewFast1.Nodes.Find(compareKey, true);
+        if (!String.IsNullOrEmpty(compareKey)) nodes = treeViewFast1.Nodes.Find(compareKey, true);
       }
 
-      if (node.Length > 0)
-        treeViewFast1.SelectedNode = node.First();
+      if (nodes.Length == 0) return false;
+      treeViewFast1.SelectedNode = nodes[0];
+      treeViewFast1.SelectedNode.EnsureVisible();
+      treeViewFast1.Focus();
+      return true;
     }
+
+    private Boolean TryGetNodeReference(NodeListItem item, out String nodeString) {
+      nodeString = null;
+      if (item == null || _currentDom == null) return false;
+
+      // First use the actual typed value; unlike parsing the display text this also catches FQN
+      // strings (spnEntityFqn, plcModel -> dyn.*, conversation refs, etc.).
+      try {
+        if (item.value is UInt64 u) nodeString = _currentDom.GetObject(u)?.Name;
+        else if (item.value is Int64 i) nodeString = _currentDom.GetObject(unchecked((UInt64)i))?.Name;
+        else if (item.value is UInt32 u32) nodeString = _currentDom.GetObject((UInt64)u32)?.Name;
+        else if (item.value is Int32 i32 && i32 >= 0) nodeString = _currentDom.GetObject((UInt64)i32)?.Name;
+        else if (item.value is String direct) {
+          String trimmed = direct.Trim();
+          if (UInt64.TryParse(trimmed, out UInt64 numeric)) nodeString = _currentDom.GetObject(numeric)?.Name;
+          else nodeString = _currentDom.GetObject(trimmed)?.Name;
+        }
+      } catch { }
+
+      if (!String.IsNullOrWhiteSpace(nodeString)) return true;
+
+      // Fall back to the legacy “123 (fqn)” decoration used by NodeListItem for node ids and map keys.
+      foreach (String display in new[] { item.DisplayValue, item.DisplayName }) {
+        if (String.IsNullOrWhiteSpace(display)) continue;
+        Int32 open = display.LastIndexOf(" (", StringComparison.Ordinal);
+        if (open < 0 || !display.EndsWith(")", StringComparison.Ordinal)) continue;
+        String candidate = display.Substring(open + 2, display.Length - open - 3).Trim();
+        if (candidate.Length == 0) continue;
+        try {
+          GomObject obj = _currentDom.GetObject(candidate);
+          if (obj != null) {
+            nodeString = obj.Name;
+            return true;
+          }
+        } catch { }
+      }
+      return false;
+    }
+
     private void ToolStripTextBox1KeyDown(Object sender, KeyEventArgs e) {
       if (e.KeyCode == Keys.Enter && !String.IsNullOrEmpty(toolStripTextBox1.Text)) {
         toolStripTextBox1.Enabled = false;
@@ -1066,8 +1530,8 @@ namespace PugTools {
 
     #region TreeViewFast1
     private void TreeViewFast1AfterSelect(Object sender, TreeViewEventArgs e) {
-      TreeNode node = treeViewFast1.SelectedNode;
-      NodeAsset asset = (NodeAsset)node.Tag;
+      TreeNode node = e?.Node ?? (sender as TreeViewFast.Controls.TreeViewFast)?.SelectedNode;
+      if (node?.Tag is not NodeAsset asset) return;
 
       String actualNodeName = asset?.Obj?.Name ?? asset?.displayName ?? asset?.id;
       Text = "Node Browser - " + actualNodeName;
@@ -1124,6 +1588,7 @@ namespace PugTools {
       _currentTreeNode = actualNodeName;
       dataGridView1.DataSource = _dataTable;
       dataGridView1.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.AllCells;
+      UpdateNodePreview(asset);
 
       LoadingSwirlHide();
       ProgressBarHide();
@@ -1141,15 +1606,13 @@ namespace PugTools {
 
     }
     private void TreeViewFast1MouseHover(Object sender, EventArgs e) {
-      if (!_closing && !btnFindNext.Focused) treeViewFast1.Focus();
+      if (!_closing && !btnFindNext.Focused && sender is TreeViewFast.Controls.TreeViewFast tree)
+        tree.Focus();
     }
     private void TreeViewFast1MouseUp(Object sender, MouseEventArgs e) {
-      if (e.Button == MouseButtons.Right) {
-        treeViewFast1.SelectedNode = treeViewFast1.GetNodeAt(e.X, e.Y);
-
-        if (treeViewFast1.SelectedNode != null) {
-          contextMenuStrip1.Show(treeViewFast1, e.Location);
-        }
+      if (e.Button == MouseButtons.Right && sender is TreeViewFast.Controls.TreeViewFast tree) {
+        tree.SelectedNode = tree.GetNodeAt(e.X, e.Y);
+        if (tree.SelectedNode != null) contextMenuStrip1.Show(tree, e.Location);
       }
     }
     private void TreeViewFast1Show() {
@@ -1183,6 +1646,11 @@ namespace PugTools {
           toolStripTextBox1.Focus();
         }
     }
+    private void TreeViewGrid1MouseDoubleClickNavigate(Object sender, MouseEventArgs e) {
+      if (e.Button != MouseButtons.Left) return;
+      if (treeViewGrid1.SelectedObject is NodeListItem item) NavigateToNodeReference(item);
+    }
+
     private void TreeViewGrid1MouseHover(Object sender, EventArgs e) {
       if (!_closing && !btnFindNext.Focused && !toolStripTextBox1.Focused)
         treeViewGrid1.Focus();
@@ -1191,13 +1659,8 @@ namespace PugTools {
       if (e.Button == MouseButtons.Right) {
         TreeListView tlv = sender as TreeListView;
 
-        if (tlv.SelectedObject is NodeListItem item)
-          // Prefer the value. Do we ever have a case of both the key and value representing nodes?
-          if (item.Type == "ulong"
-              && item.DisplayValue.Contains("(") && item.DisplayValue.Contains(")"))
-            contextMenuStrip2.Show(treeViewGrid1, e.Location);
-          else if (item.DisplayName.Contains(" (") && item.DisplayName.EndsWith(")"))
-            contextMenuStrip2.Show(treeViewGrid1, e.Location);
+        if (tlv.SelectedObject is NodeListItem item && TryGetNodeReference(item, out _))
+          contextMenuStrip2.Show(treeViewGrid1, e.Location);
       }
     }
     private void TreeViewGrid1Roots(ArrayList roots) {
@@ -1256,8 +1719,16 @@ namespace PugTools {
 
     #region TxtSearch
     private void TxtSearchKeyDown(Object sender, KeyEventArgs e) {
-      if (e.KeyCode == Keys.Enter && !String.IsNullOrEmpty(txtSearch.Text))
-        Search();
+      if (e.KeyCode == Keys.Enter) {
+        _nodeTreeFilterTimer?.Stop();
+        ApplyNodeTreeLiveFilter();
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+      } else if (e.KeyCode == Keys.Escape && !String.IsNullOrEmpty(txtSearch.Text)) {
+        txtSearch.Clear();
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+      }
     }
     #endregion
 

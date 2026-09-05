@@ -57,6 +57,24 @@
     float ViewerBlueGlow;
     float4 MapArtTint;
     float4x4 TaaReprojection;
+    // FXSPEC receiver-space projector pass. FxProjectorFromWorld maps world coordinates into the
+    // authored [-1,1]^3 projection box; the inverse view-projection reconstructs receiver points
+    // from the already-populated sampleable scene depth.
+    float4x4 FxProjectorFromWorld;
+    float4x4 FxProjectorInvViewProj;
+    float4 FxProjectorColor;
+    // xy = U/V tile, zw = integrated U/V scroll.
+    float4 FxProjectorUv;
+    // xy = cos(falloff start/stop), zw = fresnel edge/facing.
+    float4 FxProjectorFalloff;
+    float4 FxProjectorHue0;
+    float4 FxProjectorHue1;
+    float4 FxProjectorHue2;
+    float4 FxProjectorHue3;
+    int FxProjectorShape;
+    float FxProjectorTwoSided;
+    float FxProjectorUseNormal;
+    float FxProjectorHueOn;
     // xy = inverse render-target size, zw = current sub-pixel jitter in pixel/texture coordinates.
     float4 TaaParams0;
     // x = history weight, y = whether a valid history sample exists.
@@ -882,6 +900,16 @@ float4 WaterPS(VSOut i):SV_Target {
 }
 
 float4 MapArtPS(VSOut i):SV_Target { float4 c=MapArtMap.Sample(LinearClamp,i.Tex); c*=MapArtTint; c.a*=MapArtOpacity; return c; }
+float4 FxParticleAddPS(VSOut i):SV_Target { float4 c=MapArtMap.Sample(LinearClamp,i.Tex); c*=MapArtTint; c.a*=MapArtOpacity; return float4(c.rgb*c.a,c.a); }
+float4 FxRibbonPS(VSOut i):SV_Target { float4 c=MapArtMap.Sample(LinearWrap,i.Tex); c*=MapArtTint; c.a*=MapArtOpacity; return c; }
+
+
+float4 FxGlowPS(VSOut i):SV_Target {
+    float2 p=i.Tex*2.0-1.0;
+    float a=saturate(1.0-dot(p,p));
+    a*=a;
+    return float4(MapArtTint.rgb*a*MapArtTint.a,a*MapArtTint.a);
+}
 float4 OverlayPS(VSOut i):SV_Target { return OverlayColor; }
 float4 ShadowVS(VSIn v):SV_POSITION { return mul(mul(float4(v.Pos,1),World),ViewProj); }
 float4 InstancedAlphaShadowPS(VSOut i):SV_Target {
@@ -897,6 +925,91 @@ PostOut PostVS(uint id:SV_VertexID){
     float2 p=id==0?float2(-1,-1):(id==1?float2(-1,3):float2(3,-1));
     o.Pos=float4(p,0,1); o.Tex=float2(p.x*.5+.5, .5-p.y*.5); return o;
 }
+// Receiver-space FXSPEC projector. Unlike the old card/box stand-in this shades the scene receiver itself:
+// reconstruct its world position from depth, move that point into the projector box, clip/feather there, then
+// blend the authored projection texture over the already-rendered surface. Derivative normals keep the pass
+// independent of a G-buffer while still reproducing the important planar/cylinder/cube angle falloff.
+float3 FxProjectorHueRamp(float3 rgb) {
+    float lum=dot(rgb,float3(.33,.34,.33));
+    float d0=max(FxProjectorHue1.w-FxProjectorHue0.w,1e-5);
+    float d1=max(FxProjectorHue2.w-FxProjectorHue1.w,1e-5);
+    float d2=max(FxProjectorHue3.w-FxProjectorHue2.w,1e-5);
+    float t0=saturate((lum-FxProjectorHue0.w)/d0);
+    float t1=saturate((lum-FxProjectorHue1.w)/d1);
+    float t2=saturate((lum-FxProjectorHue2.w)/d2);
+    return lerp(lerp(FxProjectorHue0.rgb,FxProjectorHue1.rgb,t0),lerp(FxProjectorHue2.rgb,FxProjectorHue3.rgb,t2),t1);
+}
+
+float4 FxProjectorDecalCore(PostOut i, int blendMode) {
+    float depth=SceneDepthMap.SampleLevel(PointClamp,i.Tex,0).r;
+    if(depth>=0.999999) discard;
+    float2 ndc=float2(i.Tex.x*2.0-1.0,1.0-i.Tex.y*2.0);
+    float4 world4=mul(float4(ndc,depth,1.0),FxProjectorInvViewProj);
+    if(abs(world4.w)<1e-6) discard;
+    float3 worldPos=world4.xyz/world4.w;
+    float3 p=mul(float4(worldPos,1.0),FxProjectorFromWorld).xyz;
+    if(any(abs(p)>1.0005)) discard;
+
+    float3 edge=saturate(abs(p)*-4.0+4.0);
+    float mask=0.0;
+    float4 texel=0;
+    float3 toProjector=float3(0,0,1);
+    if(FxProjectorShape==1) {
+        float r2=dot(p.xy,p.xy); if(r2>1.0) discard;
+        mask=edge.z*saturate((1.0-r2)*(16.0/7.0));
+        float2 uv=float2(atan2(p.y,p.x)*0.15915494+0.5,p.z*0.5+0.5)*FxProjectorUv.xy+FxProjectorUv.zw;
+        float2 uvDx=ddx(uv),uvDy=ddy(uv);
+        uvDx.x-=floor(uvDx.x+0.5); uvDy.x-=floor(uvDy.x+0.5);
+        texel=MapArtMap.SampleGrad(LinearWrap,uv,uvDx,uvDy);
+        toProjector=normalize(float3(p.xy,0)+float3(1e-6,0,0));
+    } else if(FxProjectorShape==2) {
+        mask=edge.x*edge.y*edge.z;
+        float3 dpdx=ddx(p),dpdy=ddy(p);
+        float3 nBox=normalize(cross(dpdy,dpdx));
+        float3 cameraBoxForNormal=mul(float4(CameraPosition.xyz,1),FxProjectorFromWorld).xyz;
+        if(dot(nBox,cameraBoxForNormal-p)<0) nBox=-nBox;
+        float3 w=nBox*nBox; w/=max(w.x+w.y+w.z,1e-4);
+        float2 uvX=(FxProjectorUv.xy*p.yz+1.0)*0.5+FxProjectorUv.zw;
+        float2 uvY=(FxProjectorUv.xy*p.zx+1.0)*0.5+FxProjectorUv.zw;
+        float2 uvZ=(FxProjectorUv.xy*p.xy+1.0)*0.5+FxProjectorUv.zw;
+        texel=MapArtMap.Sample(LinearWrap,uvX)*w.x+MapArtMap.Sample(LinearWrap,uvY)*w.y+MapArtMap.Sample(LinearWrap,uvZ)*w.z;
+        toProjector=normalize(p+float3(0,0,1e-6));
+    } else {
+        // PLANAR / DUAL_PLANAR. UVSPACE requires the receiver's authored UV0 and is therefore intentionally left
+        // on the geometry fallback path rather than fabricating a world-space mapping here.
+        if(FxProjectorShape==3) discard;
+        mask=edge.x*edge.y*edge.z;
+        float2 uv=(FxProjectorUv.xy*p.xy+1.0)*0.5+FxProjectorUv.zw;
+        texel=MapArtMap.Sample(LinearWrap,uv);
+    }
+    if(mask<=0.0) discard;
+
+    if(FxProjectorUseNormal>0.5) {
+        float3 dpdx=ddx(p),dpdy=ddy(p);
+        float3 n=normalize(cross(dpdy,dpdx));
+        float3 cameraBoxForNormal=mul(float4(CameraPosition.xyz,1),FxProjectorFromWorld).xyz;
+        if(dot(n,cameraBoxForNormal-p)<0) n=-n;
+        float ndp=dot(n,toProjector); ndp=lerp(ndp,abs(ndp),saturate(FxProjectorTwoSided));
+        float span=FxProjectorFalloff.x-FxProjectorFalloff.y;
+        span+=span>=0?1e-4:-1e-4;
+        float angleFade=saturate((ndp-FxProjectorFalloff.y)/span);
+        float3 cameraBox=mul(float4(CameraPosition.xyz,1),FxProjectorFromWorld).xyz;
+        float viewFade=saturate(dot(n,normalize(cameraBox-p))*(FxProjectorFalloff.z-FxProjectorFalloff.w)+FxProjectorFalloff.w);
+        mask*=angleFade*viewFade;
+    }
+
+    float3 projectorRgb=FxProjectorHueOn>0.5?FxProjectorHueRamp(texel.rgb):texel.rgb;
+    float4 color=float4(projectorRgb,texel.a)*FxProjectorColor;
+    float alpha=color.a*mask;
+    if(alpha<0.0078125) discard;
+    if(blendMode==2) return float4(lerp(float3(1,1,1),color.rgb,alpha),1);
+    if(blendMode==1) return float4(color.rgb*alpha,0);
+    return float4(color.rgb,alpha);
+}
+float4 FxProjectorDecalAlphaPS(PostOut i):SV_Target { return FxProjectorDecalCore(i,0); }
+float4 FxProjectorDecalAdditivePS(PostOut i):SV_Target { return FxProjectorDecalCore(i,1); }
+float4 FxProjectorDecalMultiplyPS(PostOut i):SV_Target { return FxProjectorDecalCore(i,2); }
+
 struct NameplateVisibilityOut {
     float4 Pos : SV_POSITION;
     float3 Sample : TEXCOORD0;
@@ -1086,6 +1199,16 @@ technique11 Water { pass P0 { SetRasterizerState(WaterRS); SetDepthStencilState(
 technique11 Overlay { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,OverlayPS())); } }
 technique11 MapMarker { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,OverlayPS())); } }
 technique11 MapArt { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,MapArtPS())); } }
+technique11 FxParticleAlpha { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,MapArtPS())); } }
+technique11 FxParticleAdditive { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxParticleAddPS())); } }
+technique11 FxParticleMultiply { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(MultiplyBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,MapArtPS())); } }
+technique11 FxRibbonAlpha { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxRibbonPS())); } }
+technique11 FxRibbonAdditive { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxRibbonPS())); } }
+technique11 FxRibbonMultiply { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(MultiplyBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxRibbonPS())); } }
+technique11 FxProjectorDecalAlpha { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(AlphaBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,PostVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxProjectorDecalAlphaPS())); } }
+technique11 FxProjectorDecalAdditive { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,PostVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxProjectorDecalAdditivePS())); } }
+technique11 FxProjectorDecalMultiply { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(NoDepthDSS,0); SetBlendState(MultiplyBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,PostVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxProjectorDecalMultiplyPS())); } }
+technique11 FxGlow { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthReadDSS,0); SetBlendState(AddBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,FxGlowPS())); } }
 technique11 Shadow { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,ShadowVS())); SetGeometryShader(NULL); SetPixelShader(NULL); } }
 technique11 OccluderDepth { pass P0 { SetRasterizerState(OccluderRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(DepthOnlyBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,ShadowVS())); SetGeometryShader(NULL); SetPixelShader(NULL); } }
 technique11 AlphaShadow { pass P0 { SetRasterizerState(SolidRS); SetDepthStencilState(DepthWriteDSS,0); SetBlendState(OpaqueBS,float4(0,0,0,0),0xffffffff); SetVertexShader(CompileShader(vs_5_0,WorldVS())); SetGeometryShader(NULL); SetPixelShader(CompileShader(ps_5_0,InstancedAlphaShadowPS())); } }

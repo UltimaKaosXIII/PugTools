@@ -89,6 +89,10 @@ namespace PugTools {
       desired.M31 = -facingX * sz; desired.M32 = 0f; desired.M33 = -facingZ * sz;
       desired.M41 = position.X; desired.M42 = position.Y; desired.M43 = position.Z;
       placement.ConversationWorld = desired;
+      if (placement.ConversationVirtual && placement.ConversationUnplaced) {
+        placement.ConversationUnplaced = false;
+        placement.ConversationHidden = false;
+      }
     }
 
     internal void SetWorldConversationActorHidden(WorldNpcPlacement placement, bool hidden) {
@@ -100,6 +104,7 @@ namespace PugTools {
       if (placement == null) return;
       placement.ConversationWorld = null;
       placement.ConversationHidden = false;
+      placement.ConversationUnplaced = false;
     }
 
     internal void SetWorldConversationCamera(Vector3 position, Vector3 look, Vector3 up, float? fovRadians,

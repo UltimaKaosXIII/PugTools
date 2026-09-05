@@ -189,6 +189,7 @@ namespace PugTools {
 
       // Load current assets.
       _currentAssets = AssetHandler.Instance.GetCurrentAssets(_assetsLocation, _assetsUsePts);
+      LocalizationResolver.Apply(_currentAssets, Config.Language);
       _currentDom = DomHandler.Instance.GetCurrentDOM(_currentAssets);
 
       if ((Boolean)e.Argument) {

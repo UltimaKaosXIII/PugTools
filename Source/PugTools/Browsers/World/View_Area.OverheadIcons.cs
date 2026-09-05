@@ -158,18 +158,37 @@ namespace PugTools {
         // pass. Apart from matching SWTOR's behaviour this avoids a second depth query disagreeing by a pixel and
         // suppressing every service icon while the corresponding name is plainly visible.
         if (entry.Owner is WorldNpcPlacement npcOwner) {
-          // The requirement is literally the nameplate rule: if the nameplate visibility query has an answer, use
-          // that answer and do not let a second, independently sampled depth query veto the marker. This also makes
-          // an icon disappear behind exactly the same wall and at exactly the same instant as the NPC name.
-          if (npcNameplateHasVisibility && !npcNameplateVisible.Contains(npcOwner)) continue;
+          // Reuse the text-nameplate depth answer only when this NPC actually participated in that query. Some
+          // conversation actors deliberately have no authored text nameplate/NameplateLocal, yet still own an
+          // overhead quest FXSPEC. They must fall back to this pass' own depth sample rather than being interpreted
+          // as occluded merely because npcNameplateVisible cannot contain an NPC that was never queried.
+          if (npcNameplateHasVisibility && npcNameplateVisibilityQueried.Contains(npcOwner)) {
+            if (!npcNameplateVisible.Contains(npcOwner)) continue;
+          } else if (useOcclusion && !worldInteractionIconVisible.Contains(entry.Owner)) continue;
         } else if (useOcclusion && !worldInteractionIconVisible.Contains(entry.Owner)) continue;
+        // Quest/conversation capability is independent from the primary service identity. A vendor/trainer/taxi can
+        // also own cnvConversationId/cnvConversationName; the old mutually-exclusive Kind silently discarded that
+        // quest marker. Draw the small bundled SWTOR quest symbol explicitly and, for mixed service actors, place it
+        // one icon-height above the service marker so both remain readable. This also avoids the malformed green-box
+        // result produced by trying to approximate icon_overhead_questavailable.fxspec through the generic PRT host.
+        bool wantsQuestMarker = entry.Interaction.Kind == WorldInteractionKind.MissionBoard || entry.Interaction.HasConversation;
+        if (wantsQuestMarker) {
+          float questYOffset = (entry.Interaction.Kind == WorldInteractionKind.Conversation || entry.Interaction.Kind == WorldInteractionKind.MissionBoard)
+            ? entry.ScreenYOffset : entry.ScreenYOffset - 30f;
+          DrawWorldInteractionTextureAt("quest", entry.Anchor, questYOffset, labelViewProj, width, height);
+        }
+
+        // Pure conversation/mission-board entries use the stable screen-space quest marker above. Service actors can
+        // still render their own authored marker underneath it.
+        if (entry.Interaction.Kind == WorldInteractionKind.Conversation || entry.Interaction.Kind == WorldInteractionKind.MissionBoard) continue;
+
         bool drawn = false;
         bool runtimeHandled = false;
         if (TryWorldInteractionOriginalFxSpec(entry.Interaction, out string fxSpecPath)) {
           // Primary path: the same authored FXSPEC -> PRT runtime model Jedipedia uses. The old static sprite
           // extraction below is now only a compatibility fallback for malformed/legacy specs the structured host
           // cannot own yet (GRANNY/FXSPEC child particle types, unusual beta marshal layouts, etc.).
-          runtimeHandled = TryDrawWorldInteractionFxPlayer(entry, fxSpecPath, labelViewProj, out bool runtimeDrawn);
+          runtimeHandled = TryDrawWorldInteractionFxPlayer(entry, fxSpecPath, labelViewProj, s, out bool runtimeDrawn);
           drawn |= runtimeDrawn;
           if (!runtimeHandled) {
             List<WorldOverheadSprite> sprites = ResolveWorldOverheadSprites(fxSpecPath);
@@ -177,9 +196,8 @@ namespace PugTools {
               drawn |= DrawWorldInteractionSpriteAt(sprite, entry.Anchor, entry.ScreenYOffset, labelViewProj, width, height);
           }
         }
-        // Older/beta clients can genuinely lack one of the canonical FX resources. Quest/taxi/bindpoint and mailbox
-        // interactions still get a visible bundled SWTOR marker in that exceptional case; no generic text/service
-        // glyphs such as '$' are synthesized.
+        // Older/beta clients can genuinely lack one of the canonical FX resources. Taxi/bindpoint/mailbox interactions
+        // still get a visible bundled SWTOR marker in that exceptional case; no generic text/service glyphs are made.
         if (!drawn && !runtimeHandled && TryWorldInteractionBundledFallbackTexture(entry.Interaction, out string textureKey))
           DrawWorldInteractionTextureAt(textureKey, entry.Anchor, entry.ScreenYOffset, labelViewProj, width, height);
       }

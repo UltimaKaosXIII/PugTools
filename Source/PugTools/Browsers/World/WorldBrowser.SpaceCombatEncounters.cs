@@ -71,7 +71,7 @@ namespace PugTools {
       var result = new Dictionary<Int32, String>();
       if (path == null || String.IsNullOrWhiteSpace(path.Fqn) || currentDom == null) return result;
       GomObject node = null;
-      try { node = currentDom.GetObject(path.Fqn); } catch { }
+      try { node = WorldResolveGomObject(path.Fqn); } catch { }
       if (node?.Data == null) return result;
       Object raw = SpaceDataValue(node.Data, "pthPointList", "4611686030387598203");
       foreach (Object entryRaw in SpaceSequence(raw)) {
@@ -149,7 +149,7 @@ namespace PugTools {
 
         var resolved = new List<WorldSpaceCombatEncounterSpec>();
         GomObject hyd = null;
-        try { hyd = currentDom.GetObject(normalizedTrigger); } catch { }
+        try { hyd = WorldResolveGomObject(normalizedTrigger); } catch { }
         if (hyd?.Data != null) foreach (List<String> tokens in SpaceHydraEncounterLists(hyd.Data, faction)) {
           foreach (String token in tokens) {
             if (String.Equals(token, "sce.", StringComparison.OrdinalIgnoreCase)) continue;
@@ -259,19 +259,21 @@ namespace PugTools {
 
     private System.Collections.IDictionary SpacePrototypeTable(String preferredName, String fieldName, String numericField, String hint) {
       GomObject node = null;
-      try { node = currentDom?.GetObject(preferredName); } catch { }
+      try { node = WorldResolveGomObject(preferredName); } catch { }
       Object table = SpaceDataValue(node?.Data, fieldName, numericField);
-      if (table is System.Collections.IDictionary dictionary) return dictionary;
+      System.Collections.IDictionary dictionary = SpaceMapTable(table);
+      if (dictionary != null) return dictionary;
       try {
         node = FindTaxiPrototypeWithDataField(fieldName, numericField, hint, preferredName);
-        return SpaceDataValue(node?.Data, fieldName, numericField) as System.Collections.IDictionary;
+        return SpaceMapTable(SpaceDataValue(node?.Data, fieldName, numericField));
       } catch { return null; }
     }
 
     private IEnumerable<List<String>> SpaceHydraEncounterLists(GomObjectData hydra, String faction) {
       Object mapRaw = SpaceDataValue(hydra, "hydScriptMap", "4611686026539819747");
-      if (!(mapRaw is System.Collections.IDictionary map)) yield break;
-      foreach (DictionaryEntry hookEntry in map) {
+      System.Collections.IDictionary map = SpaceMapTable(mapRaw);
+      if (map == null) yield break;
+      foreach (KeyValuePair<Object, Object> hookEntry in SpaceDictionaryEntries(map)) {
         String hook = SpaceText(hookEntry.Key);
         if (!SpaceEncounterHooks.Any(x => String.Equals(x, hook, StringComparison.OrdinalIgnoreCase))) continue;
         GomObjectData script = SpaceObjectData(hookEntry.Value);
@@ -317,8 +319,8 @@ namespace PugTools {
         return copy;
       }
       try {
-        if (TryUnsignedGomId(raw, out UInt64 id) && id != 0) return currentDom?.GetObject(id)?.Data;
-        if (raw is String fqn && !String.IsNullOrWhiteSpace(fqn)) return currentDom?.GetObject(fqn.Trim())?.Data;
+        if (TryUnsignedGomId(raw, out UInt64 id) && id != 0) return WorldResolveGomObject(id)?.Data;
+        if (raw is String fqn && !String.IsNullOrWhiteSpace(fqn)) return WorldResolveGomObject(fqn.Trim())?.Data;
       } catch { }
       return null;
     }
@@ -339,6 +341,20 @@ namespace PugTools {
         yield break;
       }
       if (raw is IEnumerable enumerable) foreach (Object item in enumerable) yield return item;
+    }
+
+    private static System.Collections.IDictionary SpaceMapTable(Object raw) {
+      if (raw == null) return null;
+      if (raw is System.Collections.IDictionary dictionary) return dictionary;
+      if (raw is GomObjectData data) {
+        var result = new Dictionary<Object, Object>();
+        foreach (KeyValuePair<String, Object> pair in data.Dictionary) {
+          if (String.Equals(pair.Key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          result[pair.Key] = pair.Value;
+        }
+        return result;
+      }
+      return null;
     }
 
     // Do not use LINQ Cast<DictionaryEntry>() here. Generic Dictionary<TKey,TValue>
@@ -366,10 +382,10 @@ namespace PugTools {
       if (raw == null) return null;
       if (raw is GomObject node) return node.Name;
       try {
-        if (TryUnsignedGomId(raw, out UInt64 id) && id != 0) return currentDom?.GetObject(id)?.Name;
+        if (TryUnsignedGomId(raw, out UInt64 id) && id != 0) return WorldResolveGomObject(id)?.Name;
         String text = raw.ToString()?.Trim();
         if (!String.IsNullOrWhiteSpace(text) && !TryTaxiUInt64(text, out _)) {
-          try { return currentDom?.GetObject(text)?.Name ?? text; } catch { return text; }
+          try { return WorldResolveGomObject(text)?.Name ?? text; } catch { return text; }
         }
       } catch { }
       return raw.ToString()?.Trim();

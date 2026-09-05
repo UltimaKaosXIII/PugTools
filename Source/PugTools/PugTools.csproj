@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -38,6 +38,7 @@
 
 	<ItemGroup>
 		<Content Include="Hash\hashes_filename.bin.gz" CopyToOutputDirectory="PreserveNewest" />
+		<Content Include="Hash\hashes_filename.pfd1.gz" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Shaders\GR2.fx" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Shaders\World.fx" CopyToOutputDirectory="PreserveNewest" />
 		<Content Include="Resources\WorldMapIcons\*.png" CopyToOutputDirectory="PreserveNewest" />
@@ -100,6 +101,7 @@
 
 		<MakeDir Condition="!Exists('$(BinDir)Hash')" Directories="$(BinDir)Hash" />
 		<Copy SourceFiles="$(ProjectDir)Hash\hashes_filename.bin.gz" DestinationFolder="$(BinDir)Hash" />
+		<Copy SourceFiles="$(ProjectDir)Hash\hashes_filename.pfd1.gz" DestinationFolder="$(BinDir)Hash" />
 
 		<MakeDir Condition="!Exists('$(BinDir)Libraries')" Directories="$(BinDir)Libraries" />
 		<ItemGroup>

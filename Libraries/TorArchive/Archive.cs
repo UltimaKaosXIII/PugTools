@@ -263,9 +263,18 @@ namespace TorArchive {
         String fileName = value.Split('/').Last();
         fileName = fileName.Split('\\').Last();
 
-        // Remove swtor_test_
+        // Preserve the established LIVE/PTS normalization exactly.  The legacy prefixes are additive
+        // only, so current 64-bit archive naming keeps the same behavior it had before beta support.
         fileName = fileName.Replace("swtor_", String.Empty);
         fileName = fileName.Replace("test_", String.Empty);
+
+        // RED/HE32/early beta archives use a different physical prefix but the hash dictionary is still
+        // keyed by the logical archive name (main_1, en-us_1, ...). Remove only a leading legacy prefix.
+        foreach (String prefix in new[] { "red_", "assets_", "he32_", "green_" }) {
+          if (!fileName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+          fileName = fileName.Substring(prefix.Length);
+          break;
+        }
 
         // Remove .tor
         fileName = fileName.Replace(".tor", String.Empty);

@@ -59,6 +59,12 @@
       }
     }
     public bool ShowRoads { get; set; } = false;
+    // Optional SWTOR-style location title when the camera enters a different authored room/map region. Off by
+    // default so the existing World Browser behaviour remains unchanged unless the user explicitly enables it.
+    public bool ShowRoomLocationBanner { get; set; } = false;
+    // When enabled, the banner uses the authored room-file name and announces every technical room transition
+    // instead of coalescing rooms that share the same localized SWTOR map-page title.
+    public bool UseRoomNamesForLocationBanner { get; set; } = false;
     public bool ShowMapArt { get; set; } = true;
     // Map-note classes are opt-in. Large SWTOR areas can carry hundreds/thousands of authored notes, so keeping
     // them disabled by default avoids both visual clutter and a surprisingly expensive per-frame map overlay pass.

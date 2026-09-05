@@ -11,6 +11,13 @@ namespace TorArchive {
       _fileTypes.Add("CWS", "swf");
       _fileTypes.Add("CFX", "gfx");
       _fileTypes.Add("PROT", "node");
+      // Additional SWTOR system/generated formats supported by Jedipedia's File Reader.
+      _fileTypes.Add("PBUK", "bkt");
+      _fileTypes.Add("DBLB", "gom");
+      _fileTypes.Add("PBCK", "info");
+      _fileTypes.Add("PINF", "info");
+      _fileTypes.Add("SDEF", "list");
+      _fileTypes.Add("SIDS", "list");
       _fileTypes.Add("GAWB", "gr2");
       _fileTypes.Add("JAWB", "jba");
       _fileTypes.Add("SCPT", "scpt");
@@ -139,6 +146,12 @@ namespace TorArchive {
         if (strCheckDAT == "AREA_DAT_BINARY_FORMAT" || strCheckDAT == "ROOM_DAT_BINARY_FORMAT") {
           return "dat";
         }
+      }
+
+      if (bytes.Length >= 23
+          && Encoding.ASCII.GetString(bytes, 0, 20) == "Kaydara FBX Binary  "
+          && bytes[20] == 0 && bytes[21] == 0x1A && bytes[22] == 0) {
+        return "fbx";
       }
 
       String str = Encoding.ASCII.GetString(bytes, 0, bytes.Length);

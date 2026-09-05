@@ -912,6 +912,10 @@ namespace GomLib {
     public AMI Ami { get; private set; }
     public Assets Assets { get; }
     public Boolean IsLegacyGom { get { return m_legacyGom; } }
+    // 500 buckets is the pre-64-bit client layout (beta/early 32-bit); live 64-bit uses 997.
+    // This is intentionally derived from the already-parsed bucket list so compatibility detection does not alter
+    // the established GOM parsing path or maintain extra parser state.
+    public Boolean IsPre64BitClient { get { return m_bucketFiles != null && m_bucketFiles.Count == 500; } }
     public Data Data { get; private set; }
     public Dictionary<UInt64, DomType> DomTypeMap { get; private set; }
     public GomTypeLoader GomTypeLoader { get; private set; }

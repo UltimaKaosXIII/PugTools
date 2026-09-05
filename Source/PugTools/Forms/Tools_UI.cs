@@ -84,10 +84,9 @@ namespace PugTools {
     private void CbxLanguage_Changed(Object sender, EventArgs e) {
       if (cbxLanguage.SelectedItem == null) return;
       string locale = cbxLanguage.SelectedItem.ToString();
-      string localization = locale == "de-de" ? "deMale" : (locale == "fr-fr" ? "frMale" : "enMale");
-      GomLib.StringTable.SelectedLocale = locale;
-      GomLib.StringTable.SelectedLocalization = localization;
-      GomLib.Models.Tooltip.Language = localization;
+      LocalizationResolver.ApplyRequested(locale);
+      if (TorArchive.AssetHandler.Instance.CurrentLoaded)
+        LocalizationResolver.Apply(TorArchive.AssetHandler.Instance.GetCurrentAssets(), locale);
       if (!String.Equals(Config.Language, locale, StringComparison.OrdinalIgnoreCase)) {
         Config.Language = locale;
         Config.Save();

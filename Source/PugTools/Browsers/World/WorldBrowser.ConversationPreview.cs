@@ -35,8 +35,9 @@ namespace PugTools {
 
     private bool CanOpenWorldConversation(WorldInteractionInfo interaction) {
       if (interaction == null) return false;
-      if (interaction.Kind != WorldInteractionKind.Conversation && interaction.Kind != WorldInteractionKind.MissionBoard) return false;
-      return interaction.ConversationId != 0 || !String.IsNullOrWhiteSpace(interaction.Conversation);
+      // Vendors/trainers/taxi NPCs can also own a quest conversation. Primary interaction precedence must not hide
+      // the conversation-preview action when the underlying cnv reference is present.
+      return interaction.HasConversation;
     }
 
     private bool CanOpenSelectedWorldConversation() {
@@ -94,9 +95,26 @@ namespace PugTools {
           try { conversation = currentDom.ConversationLoader.Load(numeric); }
           catch (Exception ex) { errors.Add("id " + numeric + ": " + ex.Message); }
         }
+        // Keep the established 64-bit path first: use the authored reference exactly as before. Legacy path/FQN
+        // normalization and deterministic-id recovery are appended only for a DOM explicitly identified as legacy.
         if (conversation == null) {
           try { conversation = currentDom.ConversationLoader.Load(reference); }
           catch (Exception ex) { errors.Add(reference + ": " + ex.Message); }
+        }
+        if (conversation == null && WorldUsesLegacyContent) {
+          string normalized = WorldNormalizePrototypeReference(reference) ?? reference;
+          if (!String.Equals(normalized, reference, StringComparison.OrdinalIgnoreCase)) {
+            try { conversation = currentDom.ConversationLoader.Load(normalized); }
+            catch (Exception ex) { errors.Add(normalized + ": " + ex.Message); }
+          }
+          if (conversation == null) {
+            // RED can omit the FQN from the client.gom name table even though the prototype is present by id.
+            ulong folded = WorldPrototypeFqnToId(normalized);
+            if (folded != 0) {
+              try { conversation = currentDom.ConversationLoader.Load(folded); }
+              catch (Exception ex) { errors.Add("folded id " + folded + ": " + ex.Message); }
+            }
+          }
         }
       }
       if (conversation != null) { CaptureWorldConversationConditions(conversation); return true; }
@@ -107,14 +125,22 @@ namespace PugTools {
       // was absent. This path is read-only and does not alter the DOM/loaders used by the other browsers.
       GomObject raw = null;
       try {
-        if (interaction.ConversationId != 0) raw = currentDom.GetObject(interaction.ConversationId);
-        if (raw == null && !String.IsNullOrWhiteSpace(interaction.Conversation)) {
-          string reference = interaction.Conversation.Trim();
-          if (UInt64.TryParse(reference, NumberStyles.Integer, CultureInfo.InvariantCulture, out ulong rawId) && rawId != 0) raw = currentDom.GetObject(rawId);
-          if (raw == null) raw = currentDom.GetObject(reference);
-        }
+        if (interaction.ConversationId != 0) raw = WorldResolveGomObject(interaction.ConversationId);
+        if (raw == null && !String.IsNullOrWhiteSpace(interaction.Conversation)) raw = WorldResolveGomObject(interaction.Conversation);
         string fallbackError = null;
-        if (raw != null && TryBuildWorldConversationCore(raw, out conversation, out fallbackError)) { CaptureWorldConversationConditions(conversation); return true; }
+        if (raw != null && TryBuildWorldConversationCore(raw, out conversation, out fallbackError)) {
+          // RED/Beta objects are sometimes present only by deterministic prototype id and therefore have no Name in
+          // the client GOM name map.  Preserve the FQN the interaction/source path gave us so STB context, headers and
+          // cross-navigation still behave like Jedipedia instead of showing an anonymous conversation.
+          if (String.IsNullOrWhiteSpace(conversation.Fqn)) {
+            if (!String.IsNullOrWhiteSpace(interaction.Conversation))
+              conversation.Fqn = WorldNormalizePrototypeReference(interaction.Conversation) ?? interaction.Conversation.Trim();
+            if (String.IsNullOrWhiteSpace(conversation.Fqn) && interaction.ConversationId != 0)
+              conversation.Fqn = WorldLegacyPrototypeName(interaction.ConversationId, "cnv");
+          }
+          CaptureWorldConversationConditions(conversation);
+          return true;
+        }
         if (!String.IsNullOrWhiteSpace(fallbackError)) errors.Add("core reader: " + fallbackError);
       } catch (Exception ex) {
         errors.Add("core reader: " + ex.Message);
@@ -136,49 +162,75 @@ namespace PugTools {
           Fqn = obj.Name,
           Dom_ = currentDom,
           References = obj.References,
-          IsKOTORStyle = obj.Data.ValueOrDefault("cnvIsKOTORStyle", false),
-          DefaultSpeakerId = WorldInteractionUnsigned(WorldInteractionDataValue(obj.Data, "cnvDefaultSpeaker", null))
+          IsKOTORStyle = obj.Data.ValueOrDefault("cnvIsKOTORStyle", false) ||
+            (WorldUsesLegacyContent && WorldConversationBool(WorldInteractionDataValue(obj.Data, "cnvIsClassicKotORDialog", "4611686303632834000"))),
+          DefaultSpeakerId = WorldInteractionUnsigned(WorldInteractionDataValue(obj.Data, "cnvDefaultSpeaker", "4611686068585531195"))
         };
         if (result.DefaultSpeakerId != 0 && !result.SpeakersIds.Contains(result.DefaultSpeakerId)) result.SpeakersIds.Add(result.DefaultSpeakerId);
 
         object rawDialogs = WorldInteractionDataValue(obj.Data, "cnvTreeDialogNodes_Prototype", "4611686050212071021");
-        if (rawDialogs is IDictionary dialogMap) {
-          foreach (DictionaryEntry entry in dialogMap) {
-            if (!(entry.Value is GomObjectData data)) continue;
+        var dialogRows = new List<KeyValuePair<object, GomObjectData>>();
+        foreach (KeyValuePair<object, object> entry in WorldConversationMapEntries(rawDialogs)) {
+          GomObjectData data = WorldConversationFirstObjectData(entry.Value, false);
+          // Some RED builds put another wrapper around every ClassView in the lookup list.  Keep the normal direct
+          // 64-bit shape first and unwrap only when the selected world really is legacy.
+          if (WorldUsesLegacyContent && (data == null || WorldInteractionDataValue(data, "cnvNodeNumber", "4611686019044571365") == null))
+            data = WorldConversationFindObjectDataWithField(entry.Value, "cnvNodeNumber", "4611686019044571365");
+          if (data != null) dialogRows.Add(new KeyValuePair<object, GomObjectData>(entry.Key, data));
+        }
+        if (dialogRows.Count == 0 && WorldUsesLegacyContent) {
+          foreach (GomObjectData data in WorldConversationFindAllObjectDataWithField(rawDialogs, "cnvNodeNumber", "4611686019044571365"))
+            dialogRows.Add(new KeyValuePair<object, GomObjectData>(0L, data));
+        }
+        foreach (KeyValuePair<object, GomObjectData> entry in dialogRows) {
+            GomObjectData data = entry.Value;
             long fallbackId = WonkInt64(entry.Key);
-            long nodeId = WonkInt64(WorldInteractionDataValue(data, "cnvNodeNumber", null));
+            long nodeId = WonkInt64(WorldInteractionDataValue(data, "cnvNodeNumber", "4611686019044571365"));
             if (nodeId == 0) nodeId = fallbackId;
+            if (nodeId == 0) continue;
             var node = new DialogNode {
               Conversation = result,
               NodeId = nodeId,
-              MinLevel = (int)WonkInt64(WorldInteractionDataValue(data, "cnvLevelConditionMin", null)),
-              MaxLevel = (int)WonkInt64(WorldInteractionDataValue(data, "cnvLevelConditionMax", null)),
-              IsEmpty = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsEmpty", null)),
-              IsAmbient = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsAmbient", null)),
-              JoinDisabledForHolocom = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsJoinDisabledForHolocom", null)),
-              ChoiceDisabledForHolocom = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsVoteWinDisabledForHolocom", null)),
-              AbortsConversation = WorldConversationBool(WorldInteractionDataValue(data, "cnvAbortConversation", null)),
+              MinLevel = (int)WonkInt64(WorldInteractionDataValue(data, "cnvLevelConditionMin", "4611686019674493758")),
+              MaxLevel = (int)WonkInt64(WorldInteractionDataValue(data, "cnvLevelConditionMax", "4611686019674493755")),
+              IsEmpty = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsEmpty", "4611686019093994683")),
+              IsAmbient = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsAmbient", "4611686030912475398")) ||
+                (WorldUsesLegacyContent && WorldConversationBool(WorldInteractionDataValue(data, null, "4611686092038169994"))),
+              JoinDisabledForHolocom = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsJoinDisabledForHolocom", "4611686074873607191")),
+              ChoiceDisabledForHolocom = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsVoteWinDisabledForHolocom", "4611686070094731191")),
+              AbortsConversation = WorldConversationBool(WorldInteractionDataValue(data, "cnvAbortConversation", "4611686041734970002")),
               IsPlayerNode = WorldConversationBool(WorldInteractionDataValue(data, "cnvIsPcNode", "4611686019058500344")),
               GenericNodeNumber = WonkInt64(WorldInteractionDataValue(data, "cnvGenericNodeNumber", "4611686019251991207")),
-              CnvAlienVOFQN = WorldInteractionText(WorldInteractionDataValue(data, "cnvAlienVOConvoFQN", null)) ?? String.Empty,
-              CnvAlienVONode = WonkInt64(WorldInteractionDataValue(data, "cnvAlienVONodeNumber", null)),
-              ActionHook = WorldInteractionText(WorldInteractionDataValue(data, "cnvActionHook", null)),
+              CnvAlienVOFQN = WorldInteractionText(WorldInteractionDataValue(data, "cnvAlienVOConvoFQN", "4611686037539970007")) ?? String.Empty,
+              CnvAlienVONode = WonkInt64(WorldInteractionDataValue(data, "cnvAlienVONodeNumber", "4611686037539970006")),
+              ActionHook = WorldInteractionText(WorldInteractionDataValue(data, "cnvActionHook", "4611686019157992533")),
               SpeakerId = WorldInteractionUnsigned(WorldInteractionDataValue(data, "cnvSpeaker", "4611686068585531196")),
-              ActionQuest = WorldInteractionUnsigned(WorldInteractionDataValue(data, "cnvActionQuest", null)),
-              QuestReward = WorldInteractionUnsigned(WorldInteractionDataValue(data, "cnvRewardQuest", null)),
+              ActionQuest = WorldInteractionUnsigned(WorldInteractionDataValue(data, "cnvActionQuest", "4611686244754080006")),
+              QuestReward = WorldInteractionUnsigned(WorldInteractionDataValue(data, "cnvRewardQuest", "4611686226452830003")),
               ChildIds = WorldInteractionListEntries(WorldInteractionDataValue(data, "cnvChildNodes", "4611686019044571321")).Select(x => unchecked((int)WonkInt64(x))).ToList(),
-              QuestsGranted = WorldConversationEnabledIds(WorldInteractionDataValue(data, "cnvNodeQuestGrants", null)),
-              QuestsEnded = WorldConversationEnabledIds(WorldInteractionDataValue(data, "cnvNodeQuestEnds", null)),
-              QuestsProgressed = WorldConversationEnabledIds(WorldInteractionDataValue(data, "cnvNodeQuestProgress", null)),
+              QuestsGranted = WorldConversationEnabledIds(WorldInteractionDataValue(data, "cnvNodeQuestGrants", "4611686245059810000")),
+              QuestsEnded = WorldConversationEnabledIds(WorldInteractionDataValue(data, "cnvNodeQuestEnds", "4611686245059810001")),
+              QuestsProgressed = WorldConversationEnabledIds(WorldInteractionDataValue(data, "cnvNodeQuestProgress", "4611686245059810002")),
               AffectionRewardEvents = new Dictionary<long, KeyValuePair<int, string>>(),
               AffectionRewardEventsB62 = new Dictionary<string, KeyValuePair<int, Dictionary<string, string>>>()
             };
-            if (node.MinLevel == 0 && WorldInteractionDataValue(data, "cnvLevelConditionMin", null) == null) node.MinLevel = -1;
-            if (node.MaxLevel == 0 && WorldInteractionDataValue(data, "cnvLevelConditionMax", null) == null) node.MaxLevel = -1;
+            if (node.MinLevel == 0 && WorldInteractionDataValue(data, "cnvLevelConditionMin", "4611686019674493758") == null) node.MinLevel = -1;
+            if (node.MaxLevel == 0 && WorldInteractionDataValue(data, "cnvLevelConditionMax", "4611686019674493755") == null) node.MaxLevel = -1;
             if (node.SpeakerId != 0 && !result.SpeakersIds.Contains(node.SpeakerId)) result.SpeakersIds.Add(node.SpeakerId);
 
             object textMap = WorldInteractionDataValue(data, "locTextRetrieverMap", "4611686102842470023");
-            GomObjectData textData = WorldConversationMapValueById(textMap, nodeId) as GomObjectData;
+            object textValue = WorldConversationMapValueById(textMap, nodeId);
+            GomObjectData textData = WorldConversationFirstObjectData(textValue, false);
+            // Current raw nodes often key the retriever map by dialog node id. RED beta uses a one-entry loc map whose
+            // key is the text slot instead and can wrap the retriever ClassView once more. Preserve current behaviour
+            // first; the recursive lookup is legacy-only.
+            if (textData == null && WorldUsesLegacyContent) {
+              object firstTextValue = WorldConversationMapEntries(textMap).Select(x => x.Value).FirstOrDefault();
+              textData = WorldConversationFirstObjectData(firstTextValue, false)
+                ?? WorldConversationFindObjectDataWithField(firstTextValue, "strLocalizedTextRetrieverStringID", "4611686093000569992")
+                ?? WorldConversationFindObjectDataWithField(textMap, "strLocalizedTextRetrieverStringID", "4611686093000569992")
+                ?? WorldConversationFindObjectDataWithField(textMap, "strLocalizedTextRetrieverBucket", "4611686093000569993");
+            }
             if (textData != null) {
               if (TryWorldLocEntry(textData, out GomLib.StringTable.LocEntry locEntry)) node.Stb = locEntry.Bucket;
               node.Text = WorldLocText(textData, result.Fqn);
@@ -187,18 +239,28 @@ namespace PugTools {
             }
             result.DialogNodes.Add(node);
             result.NodeLookup[node.NodeId] = node;
-          }
         }
 
-        if (result.NodeLookup.Count == 0) { error = "cnvTreeDialogNodes_Prototype contains no readable dialog nodes"; return false; }
+        if (result.NodeLookup.Count == 0) {
+          string rawType = rawDialogs == null ? "null" : rawDialogs.GetType().FullName;
+          string sampleTypes = String.Join(", ", WorldConversationMapEntries(rawDialogs).Take(4)
+            .Select(x => x.Value == null ? "null" : x.Value.GetType().FullName).Distinct());
+          error = "cnvTreeDialogNodes_Prototype contains no readable dialog nodes (container " + rawType
+            + (String.IsNullOrWhiteSpace(sampleTypes) ? String.Empty : "; values " + sampleTypes) + ")";
+          return false;
+        }
 
         object rawRoot = WorldInteractionDataValue(obj.Data, "cnvTreeRootNode_Prototype", "4611686247405460000");
-        GomObjectData rootData = rawRoot as GomObjectData;
+        GomObjectData rootData = WorldConversationFirstObjectData(rawRoot, false);
+        if (WorldUsesLegacyContent && (rootData == null || WorldInteractionDataValue(rootData, "cnvChildNodes", "4611686019044571321") == null))
+          rootData = WorldConversationFindObjectDataWithField(rawRoot, "cnvChildNodes", "4611686019044571321");
         if (rootData == null) {
           // RED/Beta stores a plural root-node container instead of the later single root object.
           object legacyRoots = WorldInteractionDataValue(obj.Data, "cnvTreeRootNodes_Prototype", "4611686050212071023");
-          rootData = WorldInteractionListEntries(legacyRoots).OfType<GomObjectData>().FirstOrDefault();
-          if (rootData == null && legacyRoots is GomObjectData legacyRootData) rootData = legacyRootData;
+          rootData = WorldInteractionListEntries(legacyRoots).Select(x => WorldConversationFirstObjectData(x, false)).FirstOrDefault(x => x != null);
+          if (rootData == null) rootData = WorldConversationFirstObjectData(legacyRoots, true);
+          if (rootData == null || WorldInteractionDataValue(rootData, "cnvChildNodes", "4611686019044571321") == null)
+            rootData = WorldConversationFindObjectDataWithField(legacyRoots, "cnvChildNodes", "4611686019044571321");
         }
         if (rootData != null) {
           int index = 0;
@@ -209,13 +271,18 @@ namespace PugTools {
         }
 
         object rawLinks = WorldInteractionDataValue(obj.Data, "cnvTreeLinkNodes_Prototype", "4611686050212071022");
-        if (rawLinks is IDictionary linkMap) {
-          foreach (DictionaryEntry entry in linkMap) {
-            long linkId = WonkInt64(entry.Key);
-            if (linkId == 0 || !(entry.Value is GomObjectData linkData)) continue;
-            long target = WonkInt64(WorldInteractionDataValue(linkData, "cnvLinkTarget", "4611686019044820878"));
-            if (target != 0) result.NodeLinkList[linkId] = target;
-          }
+        foreach (KeyValuePair<object, object> entry in WorldConversationMapEntries(rawLinks)) {
+          GomObjectData linkData = WorldConversationFirstObjectData(entry.Value, false);
+          if (WorldUsesLegacyContent && (linkData == null || WorldInteractionDataValue(linkData, "cnvLinkTarget", "4611686019044820878") == null))
+            linkData = WorldConversationFindObjectDataWithField(entry.Value, "cnvLinkTarget", "4611686019044820878");
+          if (linkData == null) continue;
+          long linkId = WorldUsesLegacyContent
+            ? WonkInt64(WorldInteractionDataValue(linkData, "cnvNodeNumber", "4611686019044571365"))
+            : 0;
+          if (linkId == 0) linkId = WonkInt64(entry.Key);
+          if (linkId == 0) continue;
+          long target = WonkInt64(WorldInteractionDataValue(linkData, "cnvLinkTarget", "4611686019044820878"));
+          if (target != 0) result.NodeLinkList[linkId] = target;
         }
         conversation = result;
         return true;
@@ -225,9 +292,11 @@ namespace PugTools {
       }
     }
 
+    // WorldConversationMapEntries is shared with the cinematic/playback legacy compatibility layer.
+
     private static object WorldConversationMapValueById(object map, long id) {
-      if (!(map is IDictionary dictionary)) return null;
-      foreach (DictionaryEntry entry in dictionary) if (WonkInt64(entry.Key) == id) return entry.Value;
+      foreach (KeyValuePair<object, object> entry in WorldConversationMapEntries(map))
+        if (WonkInt64(entry.Key) == id) return entry.Value;
       return null;
     }
 
@@ -239,8 +308,7 @@ namespace PugTools {
 
     private static List<ulong> WorldConversationEnabledIds(object value) {
       var result = new List<ulong>();
-      if (!(value is IDictionary dictionary)) return result;
-      foreach (DictionaryEntry entry in dictionary) {
+      foreach (KeyValuePair<object, object> entry in WorldConversationMapEntries(value)) {
         if (!WorldConversationBool(entry.Value)) continue;
         ulong id = WorldInteractionUnsigned(entry.Key);
         if (id != 0 && !result.Contains(id)) result.Add(id);
@@ -534,7 +602,7 @@ namespace PugTools {
       // Jedipedia resolves speaker labels from the raw retriever pair, not from whichever localized name happened to
       // be materialized by a model loader. This also survives a sparse selected gender row in DE/FR.
       try {
-        GomObject rawSpeaker = currentDom?.GetObject(id);
+        GomObject rawSpeaker = WorldResolveGomObject(id);
         object locMap = WorldInteractionDataValue(rawSpeaker?.Data, "locTextRetrieverMap", "4611686102842470023");
         label = WorldLocMapText(locMap, WorldLocNameSlot, rawSpeaker?.Name);
       } catch { }
@@ -547,8 +615,10 @@ namespace PugTools {
         }
       } catch { }
       if (String.IsNullOrWhiteSpace(label)) {
-        try { label = currentDom?.GetObject(id)?.Name; } catch { }
+        try { label = WorldResolveGomObject(id)?.Name; } catch { }
       }
+      if (String.IsNullOrWhiteSpace(label) && WorldUsesLegacyContent)
+        label = WorldLegacyPrototypeName(id, null);
       if (String.IsNullOrWhiteSpace(label)) label = "Speaker " + id.ToString(CultureInfo.InvariantCulture);
       worldConversationSpeakerNames[id] = label;
       return label;

@@ -28,16 +28,51 @@ namespace nsHashDictionary {
   }
 
   public class HashData {
+    private String m_fileName;
+    private CompactFileNameStore m_nameStore;
+    private Int32 m_nameIndex = -1;
+
     public String ArchiveName { get; internal set; }
-    public String FileName { get; set; }
+    public String FileName {
+      get {
+        if (m_fileName != null) return m_fileName;
+        m_fileName = m_nameStore?.GetName(m_nameIndex) ?? String.Empty;
+        m_nameStore = null;
+        m_nameIndex = -1;
+        return m_fileName;
+      }
+      set {
+        m_fileName = value ?? String.Empty;
+        m_nameStore = null;
+        m_nameIndex = -1;
+      }
+    }
+
+    // Serialization should not permanently materialize every lazy filename just because the
+    // user saves the dictionary. The returned string may be temporary and is intentionally not
+    // cached in m_fileName.
+    internal String FileNameForSerialization =>
+      m_fileName ?? m_nameStore?.GetName(m_nameIndex) ?? String.Empty;
     public Int32 Crc { get; internal set; }
+    /// <summary>Earliest reliably known SWTOR patch for this hash, or null when history is unavailable.</summary>
+    public String FirstSeenVersion { get; internal set; }
     public UInt32 Ph { get; }
     public UInt32 Sh { get; }
 
     public HashData(UInt32 ph, UInt32 sh, String filename, Int32 crc, String archiveName) {
       Ph = ph;
       Sh = sh;
-      FileName = filename;
+      m_fileName = filename ?? String.Empty;
+      Crc = crc;
+      ArchiveName = archiveName;
+    }
+
+    internal HashData(UInt32 ph, UInt32 sh, CompactFileNameStore nameStore, Int32 nameIndex,
+                      Int32 crc, String archiveName) {
+      Ph = ph;
+      Sh = sh;
+      m_nameStore = nameStore;
+      m_nameIndex = nameIndex;
       Crc = crc;
       ArchiveName = archiveName;
     }
@@ -71,6 +106,9 @@ namespace nsHashDictionary {
     private readonly HashSet<String> m_extListing;
     private readonly HashSet<String> m_fileListing;
     private const String m_hashFile = "hashes_filename.bin";
+    private const String m_compactHashFile = "hashes_filename.pfd1";
+    private const UInt32 CompactMagic = 0x31444650; // PFD1
+    private const UInt16 CompactVersion = 2;
     private readonly SortedList<String, SortedList<UInt64, HashData>> m_hashList;
     private Boolean m_helpersCreated;
     private readonly Dictionary<UInt64, HashSet<String>> m_masterArchiveHashList;
@@ -198,8 +236,11 @@ namespace nsHashDictionary {
           subHashList = m_hashList.Values[j];
 
           for (Int32 i = 0; i < subHashList.Count; i++) {
-            AddDirectory(subHashList.Values[i].FileName);
-            AddFileandExtension(subHashList.Values[i].FileName);
+            // Helper generation may touch millions of rows. Read lazy PFD1 names transiently so
+            // this maintenance operation does not permanently inflate every HashData into a String.
+            String fileName = subHashList.Values[i].FileNameForSerialization;
+            AddDirectory(fileName);
+            AddFileandExtension(fileName);
           }
         }
 
@@ -207,72 +248,223 @@ namespace nsHashDictionary {
       }
     }
 
-    /// <summary>
-    /// Creates a sorted list based on the dictionary file
-    /// </summary>
-    public void LoadBinaryHashList() {
+    private static String GetHashDirectory() {
       Assembly assembly = Assembly.GetEntryAssembly();
       String path = Path.GetDirectoryName(assembly.Location);
       String parentPath = Directory.GetParent(path).FullName;
-
-      String fullPath = File.Exists($"{parentPath}\\PugTools.exe")
+      return File.Exists($"{parentPath}\\PugTools.exe")
         ? $"{parentPath}\\Hash\\"
         : $"{path}\\Hash\\";
+    }
 
-      String filePath = $"{fullPath}{m_hashFile}.gz";
+    /// <summary>
+    /// Loads the filename dictionary. PFD1 is preferred because it keeps all names in one
+    /// front-coded pool and gives each HashData a lazy name reference. The legacy has2 gzip
+    /// remains a fully compatible fallback for user dictionaries created by older PugTools.
+    /// </summary>
+    public void LoadBinaryHashList() {
+      String fullPath = GetHashDirectory();
+      String compactPath = $"{fullPath}{m_compactHashFile}.gz";
+      String legacyPath = $"{fullPath}{m_hashFile}.gz";
 
-      if (File.Exists(filePath)) {
-        FileStream fs = new FileStream(filePath, FileMode.Open);
-
-        using (GZipStream gzip = new GZipStream(fs, CompressionMode.Decompress)) {
-          using (MemoryStream ms = new MemoryStream()) {
-            gzip.CopyTo(ms);
-
-            ms.Position = 0;
-
-            using (BinaryReader br = new BinaryReader(ms)) {
-              Int32 i = 0;
-              Int32 magic = 0x32736168; // has2
-              UInt32 test = br.ReadUInt32();
-
-              if (test != magic) {
-                return;
-              }
-
-              Int16 archives = br.ReadInt16();
-
-              while (archives > 0) {
-                Int16 id = br.ReadInt16();
-                String archiveName = br.ReadString();
-                m_archiveList[id] = archiveName;
-                m_archiveReverseList[archiveName] = id;
-                archives--;
-              }
-
-              while (br.BaseStream.Position != br.BaseStream.Length) {
-                i++;
-
-                UInt32 ph = br.ReadUInt32();
-                UInt32 sh = br.ReadUInt32();
-                Int32 crc = br.ReadInt32();
-                Int16 archiveId = br.ReadInt16();
-                String fileName = br.ReadString();
-
-                // LoadHash(ph, sh, fileName, crc, archiveId);
-                LoadHashFile(ph, sh, fileName, crc, archiveId);
-
-                if (i % 200 == 0) {
-                  Single percentProgress = br.BaseStream.Position / br.BaseStream.Length;
-                  OnHashEvent(
-                    new DictionaryEventArgs(DictionaryState.Building, percentProgress));
-                }
-              }
-            }
-          }
+      Boolean loaded = false;
+      Boolean compactIsCurrent = File.Exists(compactPath)
+        && (!File.Exists(legacyPath)
+            || File.GetLastWriteTimeUtc(compactPath) >= File.GetLastWriteTimeUtc(legacyPath));
+      if (compactIsCurrent) {
+        try {
+          loaded = LoadCompactHashList(compactPath);
+        }
+        catch (Exception ex) when (ex is InvalidDataException || ex is EndOfStreamException
+                                   || ex is IOException) {
+          Debug.WriteLine("Unable to read compact PFD1 hash dictionary: " + ex.Message);
+          ClearLoadedHashData();
         }
       }
 
-      OnHashEvent(new DictionaryEventArgs(DictionaryState.Finished, 100F));
+      if (!loaded && File.Exists(legacyPath)) {
+        LoadLegacyHashList(legacyPath);
+        loaded = true;
+      }
+
+      OnHashEvent(new DictionaryEventArgs(DictionaryState.Finished, loaded ? 100F : 0F));
+    }
+
+    private void ClearLoadedHashData() {
+      m_archiveList.Clear();
+      m_archiveReverseList.Clear();
+      m_hashList.Clear();
+      m_masterArchiveHashList.Clear();
+      m_dirListing.Clear();
+      m_extListing.Clear();
+      m_fileListing.Clear();
+      m_helpersCreated = false;
+    }
+
+    private Boolean LoadCompactHashList(String filePath) {
+      using FileStream fs = new FileStream(
+        filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 128, FileOptions.SequentialScan
+      );
+      using GZipStream gzip = new GZipStream(fs, CompressionMode.Decompress);
+      using BinaryReader br = new BinaryReader(gzip, System.Text.Encoding.UTF8, false);
+
+      UInt32 magic = br.ReadUInt32();
+      if (magic != CompactMagic) return false;
+      UInt16 version = br.ReadUInt16();
+      UInt16 flags = br.ReadUInt16();
+      // v1 was an internal preview of PFD1. Its public-patch firstSeen inference treated
+      // assets_* archive counters as live releases, but Jedipedia's archive reader confirms
+      // assets_*, he32_* and red_* are beta environments. Keep v1 readable for filename
+      // compatibility, but only trust its Beta marker. v2 stores only defensible history.
+      if (version != 1 && version != CompactVersion)
+        throw new InvalidDataException($"PFD1: unsupported version {version}.");
+      if (flags != 0)
+        throw new InvalidDataException($"PFD1: unsupported flags 0x{flags:X4}.");
+
+      Int32 archiveCount = br.ReadInt32();
+      Int32 nameCount = br.ReadInt32();
+      Int32 rowCount = br.ReadInt32();
+      Int32 patchCount = br.ReadInt32();
+      Int32 poolBytes = br.ReadInt32();
+      Int32 suffixBytes = br.ReadInt32();
+      Int32 maxNameLength = br.ReadInt32();
+      _ = br.ReadInt32(); // reserved
+      _ = br.ReadInt32(); // reserved
+
+      if (archiveCount < 0 || archiveCount > Int16.MaxValue || nameCount < 0 || rowCount < 0
+          || patchCount < 0 || patchCount > UInt16.MaxValue - 1 || poolBytes < 0
+          || suffixBytes < 0 || maxNameLength < 0)
+        throw new InvalidDataException("PFD1: invalid header counts.");
+
+      for (Int32 i = 0; i < archiveCount; i++) {
+        Int16 id = br.ReadInt16();
+        UInt16 byteLength = br.ReadUInt16();
+        Byte[] bytes = br.ReadBytes(byteLength);
+        if (bytes.Length != byteLength) throw new EndOfStreamException("PFD1: truncated archive table.");
+        String archiveName = System.Text.Encoding.UTF8.GetString(bytes);
+        m_archiveList[id] = archiveName;
+        m_archiveReverseList[archiveName] = id;
+      }
+
+      String[] patches = new String[patchCount];
+      for (Int32 i = 0; i < patchCount; i++) {
+        UInt16 id = br.ReadUInt16();
+        UInt16 byteLength = br.ReadUInt16();
+        Byte[] bytes = br.ReadBytes(byteLength);
+        if (bytes.Length != byteLength) throw new EndOfStreamException("PFD1: truncated patch table.");
+        if (id >= patchCount) throw new InvalidDataException("PFD1: patch id outside table.");
+        patches[id] = System.Text.Encoding.ASCII.GetString(bytes);
+      }
+
+      CompactFileNameStore names = CompactFileNameStore.Read(br, nameCount, poolBytes, suffixBytes);
+      if (names.Count != nameCount) throw new InvalidDataException("PFD1: filename count mismatch.");
+
+      for (Int32 i = 0; i < rowCount; i++) {
+        UInt32 ph = br.ReadUInt32();
+        UInt32 sh = br.ReadUInt32();
+        Int32 crc = br.ReadInt32();
+        Int16 archiveId = br.ReadInt16();
+        Int32 nameIndex = br.ReadInt32();
+        UInt16 firstSeenId = br.ReadUInt16();
+
+        if (!m_archiveList.ContainsKey(archiveId))
+          throw new InvalidDataException($"PFD1: row {i} references archive {archiveId}.");
+        if (nameIndex < -1 || nameIndex >= nameCount)
+          throw new InvalidDataException($"PFD1: row {i} references filename {nameIndex}.");
+        if (firstSeenId != UInt16.MaxValue && firstSeenId >= patchCount)
+          throw new InvalidDataException($"PFD1: row {i} references patch {firstSeenId}.");
+
+        String firstSeenVersion = firstSeenId == UInt16.MaxValue ? null : patches[firstSeenId];
+        if (version == 1 && !String.Equals(firstSeenVersion, "Beta", StringComparison.OrdinalIgnoreCase))
+          firstSeenVersion = null;
+
+        LoadHashFile(ph, sh, names, nameIndex, crc, archiveId, firstSeenVersion);
+
+        if ((i & 0x7fff) == 0 && rowCount > 0) {
+          OnHashEvent(new DictionaryEventArgs(DictionaryState.Building, i / (Single)rowCount));
+        }
+      }
+
+      return true;
+    }
+
+    private void LoadLegacyHashList(String filePath) {
+      using FileStream fs = new FileStream(
+        filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 128, FileOptions.SequentialScan
+      );
+      using GZipStream gzip = new GZipStream(fs, CompressionMode.Decompress);
+      using BinaryReader br = new BinaryReader(gzip);
+
+      const UInt32 magic = 0x32736168; // has2
+      if (br.ReadUInt32() != magic) return;
+
+      Int16 archives = br.ReadInt16();
+      while (archives > 0) {
+        Int16 id = br.ReadInt16();
+        String archiveName = br.ReadString();
+        m_archiveList[id] = archiveName;
+        m_archiveReverseList[archiveName] = id;
+        archives--;
+      }
+
+      Int32 i = 0;
+      while (true) {
+        try {
+          UInt32 ph = br.ReadUInt32();
+          UInt32 sh = br.ReadUInt32();
+          Int32 crc = br.ReadInt32();
+          Int16 archiveId = br.ReadInt16();
+          String fileName = br.ReadString();
+          LoadHashFile(ph, sh, fileName, crc, archiveId);
+          i++;
+
+          if (i % 2000 == 0) {
+            Single percentProgress = fs.Length > 0
+              ? Math.Min(1.0F, (Single)fs.Position / fs.Length)
+              : 0.0F;
+            OnHashEvent(new DictionaryEventArgs(DictionaryState.Building, percentProgress));
+          }
+        }
+        catch (EndOfStreamException) {
+          break;
+        }
+      }
+
+      DeriveLegacyBetaFirstSeenHistory();
+    }
+
+    /// <summary>
+    /// The legacy has2 dictionary contains no explicit release timeline. The archive namespace does,
+    /// however, provide one trustworthy historical fact: Jedipedia's archive reader classifies
+    /// assets_*, he32_* and red_* as beta environments. If a hash occurs in any of those archives,
+    /// every duplicate occurrence of that hash can safely be marked as first seen in Beta.
+    ///
+    /// No public patch is inferred here. Modern themed archives do not encode the patch in which a
+    /// file first appeared, and the old patches.xml counters are patcher package counts rather than
+    /// a reliable archive-name-to-live-version mapping.
+    /// </summary>
+    private void DeriveLegacyBetaFirstSeenHistory() {
+      var betaHashes = new HashSet<UInt64>();
+
+      foreach (KeyValuePair<String, SortedList<UInt64, HashData>> archive in m_hashList) {
+        if (!IsBetaArchiveName(archive.Key)) continue;
+        foreach (UInt64 signature in archive.Value.Keys) betaHashes.Add(signature);
+      }
+
+      if (betaHashes.Count == 0) return;
+
+      foreach (SortedList<UInt64, HashData> archive in m_hashList.Values) {
+        for (Int32 i = 0; i < archive.Count; i++) {
+          if (betaHashes.Contains(archive.Keys[i])) archive.Values[i].FirstSeenVersion = "Beta";
+        }
+      }
+    }
+
+    private static Boolean IsBetaArchiveName(String archiveName) {
+      if (String.IsNullOrWhiteSpace(archiveName)) return false;
+      return archiveName.StartsWith("assets_", StringComparison.OrdinalIgnoreCase)
+        || archiveName.StartsWith("he32_", StringComparison.OrdinalIgnoreCase)
+        || archiveName.StartsWith("red_", StringComparison.OrdinalIgnoreCase);
     }
 
     private void LoadHashFile(UInt32 ph, UInt32 sh, String fileName, Int32 crc, Int16 archiveId) {
@@ -281,12 +473,23 @@ namespace nsHashDictionary {
 
     private void LoadHashFile(UInt32 ph, UInt32 sh, String fileName, Int32 crc, String archive) {
       UInt64 sig = (UInt64)ph << 32 | sh;
-
-      if (!m_hashList.ContainsKey(archive)) {
+      if (!m_hashList.ContainsKey(archive))
         m_hashList.Add(archive, new SortedList<UInt64, HashData>());
-      }
-
       m_hashList[archive].Add(sig, new HashData(ph, sh, fileName, crc, archive));
+    }
+
+    private void LoadHashFile(UInt32 ph, UInt32 sh, CompactFileNameStore names, Int32 nameIndex,
+                              Int32 crc, Int16 archiveId, String firstSeenVersion) {
+      String archive = m_archiveList[archiveId];
+      UInt64 sig = (UInt64)ph << 32 | sh;
+      if (!m_hashList.ContainsKey(archive))
+        m_hashList.Add(archive, new SortedList<UInt64, HashData>());
+
+      HashData data = nameIndex >= 0
+        ? new HashData(ph, sh, names, nameIndex, crc, archive)
+        : new HashData(ph, sh, String.Empty, crc, archive);
+      data.FirstSeenVersion = firstSeenVersion;
+      m_hashList[archive].Add(sig, data);
     }
 
     /// <summary>
@@ -346,7 +549,7 @@ namespace nsHashDictionary {
                 bw.Write(id); // Archive Id
               }
 
-              bw.Write(subHashList.Values[j].FileName);
+              bw.Write(subHashList.Values[j].FileNameForSerialization);
 
               if (j % 200 == 0) {
                 OnHashEvent(
@@ -376,7 +579,148 @@ namespace nsHashDictionary {
       }
 
       File.Delete(dictFile);
+
+      // Also publish the compact PFD1 sibling. Older PugTools can keep using has2 while current
+      // builds prefer PFD1 on the next start. Saving the legacy file first deliberately preserves
+      // the existing recovery path if compact generation is interrupted.
+      SaveCompactHashList($"{fullPath}\\Hash");
       OnHashEvent(new DictionaryEventArgs(DictionaryState.Finished, 100f));
+    }
+
+    private void SaveCompactHashList(String hashDirectory) {
+      if (m_hashList.Count > Int16.MaxValue)
+        throw new InvalidDataException("PFD1: archive table exceeds the Int16 id range.");
+
+      String rawPath = Path.Combine(hashDirectory, m_compactHashFile);
+      String gzipPath = rawPath + ".gz";
+      String tempPath = rawPath + ".tmp";
+      String tempGzipPath = gzipPath + ".tmp";
+
+      var nameSet = new HashSet<String>(StringComparer.Ordinal);
+      var patchSet = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+      Int32 rowCount = 0;
+      foreach (SortedList<UInt64, HashData> archive in m_hashList.Values) {
+        rowCount += archive.Count;
+        foreach (HashData data in archive.Values) {
+          String serializedName = data.FileNameForSerialization;
+          if (!String.IsNullOrEmpty(serializedName)) nameSet.Add(serializedName);
+          if (!String.IsNullOrWhiteSpace(data.FirstSeenVersion)) patchSet.Add(data.FirstSeenVersion);
+        }
+      }
+
+      var names = new List<String>(nameSet);
+      names.Sort(StringComparer.Ordinal);
+      var nameIds = new Dictionary<String, Int32>(names.Count, StringComparer.Ordinal);
+      for (Int32 i = 0; i < names.Count; i++) nameIds[names[i]] = i;
+
+      var patches = new List<String>(patchSet);
+      patches.Sort(StringComparer.OrdinalIgnoreCase);
+      if (patches.Count >= UInt16.MaxValue)
+        throw new InvalidDataException("PFD1: patch table exceeds the UInt16 id range.");
+      var patchIds = new Dictionary<String, UInt16>(patches.Count, StringComparer.OrdinalIgnoreCase);
+      for (Int32 i = 0; i < patches.Count; i++) patchIds[patches[i]] = (UInt16)i;
+
+      Int32 poolBytes = 0;
+      Int32 suffixBytes = 0;
+      Int32 maxNameLength = 0;
+      Byte[][] encodedNames = new Byte[names.Count][];
+      Byte[] shared = new Byte[names.Count];
+      Byte[] previous = Array.Empty<Byte>();
+      for (Int32 i = 0; i < names.Count; i++) {
+        Byte[] current = System.Text.Encoding.UTF8.GetBytes(names[i]);
+        encodedNames[i] = current;
+        Int32 prefix = 0;
+        Int32 limit = Math.Min(Math.Min(previous.Length, current.Length), Byte.MaxValue);
+        while (prefix < limit && previous[prefix] == current[prefix]) prefix++;
+        shared[i] = (Byte)prefix;
+        poolBytes = checked(poolBytes + current.Length);
+        suffixBytes = checked(suffixBytes + current.Length - prefix + 1);
+        if (current.Length > maxNameLength) maxNameLength = current.Length;
+        previous = current;
+      }
+
+      try {
+        using (FileStream fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        using (BinaryWriter bw = new BinaryWriter(fs, System.Text.Encoding.UTF8, false)) {
+          bw.Write(CompactMagic);
+          bw.Write(CompactVersion);
+          bw.Write((UInt16)0); // flags
+          bw.Write(m_hashList.Count);
+          bw.Write(names.Count);
+          bw.Write(rowCount);
+          bw.Write(patches.Count);
+          bw.Write(poolBytes);
+          bw.Write(suffixBytes);
+          bw.Write(maxNameLength);
+          bw.Write(0); // reserved
+          bw.Write(0); // reserved
+
+          var reverseArchive = new Dictionary<String, Int16>(m_hashList.Count, StringComparer.Ordinal);
+          for (Int32 i = 0; i < m_hashList.Count; i++) {
+            String archiveName = m_hashList.Keys[i];
+            Int16 id = (Int16)i;
+            Byte[] bytes = System.Text.Encoding.UTF8.GetBytes(archiveName);
+            if (bytes.Length > UInt16.MaxValue)
+              throw new InvalidDataException("PFD1: archive name exceeds 65535 UTF-8 bytes.");
+            bw.Write(id);
+            bw.Write((UInt16)bytes.Length);
+            bw.Write(bytes);
+            reverseArchive[archiveName] = id;
+          }
+
+          for (Int32 i = 0; i < patches.Count; i++) {
+            Byte[] bytes = System.Text.Encoding.ASCII.GetBytes(patches[i]);
+            if (bytes.Length > UInt16.MaxValue)
+              throw new InvalidDataException("PFD1: patch label exceeds 65535 bytes.");
+            bw.Write((UInt16)i);
+            bw.Write((UInt16)bytes.Length);
+            bw.Write(bytes);
+          }
+
+          bw.Write(shared);
+          for (Int32 i = 0; i < encodedNames.Length; i++) {
+            Byte[] bytes = encodedNames[i];
+            Int32 prefix = shared[i];
+            bw.Write(bytes, prefix, bytes.Length - prefix);
+            bw.Write((Byte)0);
+          }
+
+          Int32 written = 0;
+          for (Int32 i = 0; i < m_hashList.Count; i++) {
+            SortedList<UInt64, HashData> archive = m_hashList.Values[i];
+            foreach (KeyValuePair<UInt64, HashData> pair in archive) {
+              HashData data = pair.Value;
+              bw.Write((UInt32)(pair.Key >> 32));
+              bw.Write((UInt32)(pair.Key & 0xFFFFFFFF));
+              bw.Write(data.Crc);
+              bw.Write(reverseArchive[data.ArchiveName]);
+              String serializedName = data.FileNameForSerialization;
+              bw.Write(String.IsNullOrEmpty(serializedName) ? -1 : nameIds[serializedName]);
+              bw.Write(!String.IsNullOrWhiteSpace(data.FirstSeenVersion)
+                       && patchIds.TryGetValue(data.FirstSeenVersion, out UInt16 patchId)
+                ? patchId
+                : UInt16.MaxValue);
+
+              written++;
+              if ((written & 0x7fff) == 0 && rowCount > 0)
+                OnHashEvent(new DictionaryEventArgs(DictionaryState.Building, written / (Single)rowCount));
+            }
+          }
+        }
+
+        using (FileStream input = new FileStream(tempPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        using (FileStream output = new FileStream(tempGzipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        using (GZipStream gzip = new GZipStream(output, CompressionLevel.Optimal)) {
+          input.CopyTo(gzip, 1024 * 1024);
+        }
+
+        if (File.Exists(gzipPath)) File.Delete(gzipPath);
+        File.Move(tempGzipPath, gzipPath);
+      }
+      finally {
+        if (File.Exists(tempPath)) File.Delete(tempPath);
+        if (File.Exists(tempGzipPath)) File.Delete(tempGzipPath);
+      }
     }
 
     public void SaveTextHashList() {
@@ -411,7 +755,7 @@ namespace nsHashDictionary {
               writer.WriteLine("{0:X8}" + '#' + "{1:X8}" + '#' + "{2}" + '#' + "{3:X8}",
                                (UInt32)(hashList.Keys[i] >> 32),
                                (UInt32)(hashList.Keys[i] & 0xFFFFFFFF),
-                               hashList.Values[i].FileName,
+                               hashList.Values[i].FileNameForSerialization,
                                hashList.Values[i].Crc);
 
               if (i % 200 == 0)

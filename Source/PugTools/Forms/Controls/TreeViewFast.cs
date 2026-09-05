@@ -10,13 +10,91 @@ namespace TreeViewFast.Controls {
 
   public class TreeViewFast : TreeView {
     #region Fields
-    private readonly Dictionary<String, TreeNode> _treeNodes = new Dictionary<String, TreeNode>();
+    private Dictionary<String, TreeNode> _treeNodes = new Dictionary<String, TreeNode>();
     #endregion
 
     #region Properties
     #endregion
 
+    /// <summary>
+    /// A completely prepared managed tree. TreeNode instances are created and linked without
+    /// touching the WinForms control, so large trees can be prepared on a worker thread and
+    /// attached to the native TreeView only on the UI thread. The same prepared tree can be
+    /// re-attached after a live filter without sorting and allocating every TreeNode again.
+    /// </summary>
+    internal sealed class PreparedTree {
+      internal Dictionary<String, TreeNode> NodeMap { get; }
+      internal TreeNode[] RootNodes { get; }
+
+      internal PreparedTree(Dictionary<String, TreeNode> nodeMap, TreeNode[] rootNodes) {
+        NodeMap = nodeMap ?? throw new ArgumentNullException(nameof(nodeMap));
+        RootNodes = rootNodes ?? Array.Empty<TreeNode>();
+      }
+    }
+
     #region  Methods
+    internal static PreparedTree PrepareItems<T>(
+      IEnumerable<T> items,
+      Func<T, String> getId,
+      Func<T, String> getParentId,
+      Func<T, String> getDisplayName,
+      Func<T, Int32> getImageIndex = null,
+      Comparison<T> comparison = null
+    ) {
+      if (items == null) throw new ArgumentNullException(nameof(items));
+      if (getId == null) throw new ArgumentNullException(nameof(getId));
+      if (getParentId == null) throw new ArgumentNullException(nameof(getParentId));
+      if (getDisplayName == null) throw new ArgumentNullException(nameof(getDisplayName));
+
+      List<T> sortedItems = items.ToList();
+      if (comparison != null) sortedItems.Sort(comparison);
+      else sortedItems.Sort((x, y) => String.Compare(getId(x), getId(y), StringComparison.Ordinal));
+
+      var nodeMap = new Dictionary<String, TreeNode>(sortedItems.Count, StringComparer.Ordinal);
+      foreach (T item in sortedItems) {
+        String id = getId(item);
+        TreeNode node = new TreeNode {
+          Name = id,
+          Text = getDisplayName(item),
+          Tag = item
+        };
+
+        if (getImageIndex != null) {
+          Int32 imageIndex = getImageIndex(item);
+          node.ImageIndex = imageIndex;
+          node.SelectedImageIndex = imageIndex;
+        }
+
+        nodeMap.Add(id, node);
+      }
+
+      var roots = new List<TreeNode>();
+      foreach (T item in sortedItems) {
+        String id = getId(item);
+        TreeNode node = nodeMap[id];
+        String parentId = getParentId(item);
+
+        if (!String.IsNullOrEmpty(parentId)) {
+          if (nodeMap.TryGetValue(parentId, out TreeNode parentNode))
+            parentNode.Nodes.Add(node);
+          else
+            roots.Add(node);
+        } else {
+          roots.Add(node);
+        }
+      }
+
+      return new PreparedTree(nodeMap, roots.ToArray());
+    }
+
+    internal void LoadPrepared(PreparedTree preparedTree) {
+      if (preparedTree == null) throw new ArgumentNullException(nameof(preparedTree));
+
+      Nodes.Clear();
+      _treeNodes = preparedTree.NodeMap;
+      if (preparedTree.RootNodes.Length > 0) Nodes.AddRange(preparedTree.RootNodes);
+    }
+
     /// <summary>
     /// Load the TreeView with items.
     /// </summary>
@@ -33,7 +111,8 @@ namespace TreeViewFast.Controls {
 
       // Clear view and internal dictionary
       Nodes.Clear();
-      _treeNodes.Clear();
+      // Replace rather than clear: a prepared full-tree snapshot may still own the previous map.
+      _treeNodes = new Dictionary<String, TreeNode>();
 
       // Load internal dictionary with nodes
       foreach (T item in items) {
@@ -100,7 +179,7 @@ namespace TreeViewFast.Controls {
     /// <returns>Item object</returns>
     public T GetParent<T>(String id) where T : class {
       TreeNode parentNode = GetNode(id).Parent;
-      return parentNode == null ? null : (T)Parent.Tag;
+      return parentNode == null ? null : (T)parentNode.Tag;
     }
 
     /// <summary>
@@ -143,7 +222,8 @@ namespace TreeViewFast.Controls {
                                 Func<TreeListItem, String> getDisplayName) {
       // Clear view and internal dictionary
       Nodes.Clear();
-      _treeNodes.Clear();
+      // Replace rather than clear: a prepared full-tree snapshot may still own the previous map.
+      _treeNodes = new Dictionary<String, TreeNode>();
 
       List<String> keys = testDict.Keys.ToList();
       keys.Sort(delegate (String x, String y) {
@@ -257,7 +337,8 @@ namespace TreeViewFast.Controls {
 
       // Clear view and internal dictionary
       Nodes.Clear();
-      _treeNodes.Clear();
+      // Replace rather than clear: a prepared full-tree snapshot may still own the previous map.
+      _treeNodes = new Dictionary<String, TreeNode>();
 
       List<String> keys = assetDict.Keys.ToList();
       keys.Sort();
@@ -305,7 +386,8 @@ namespace TreeViewFast.Controls {
                                 Func<NodeAsset, String> getDisplayName) {
       // Clear view and internal dictionary
       Nodes.Clear();
-      _treeNodes.Clear();
+      // Replace rather than clear: a prepared full-tree snapshot may still own the previous map.
+      _treeNodes = new Dictionary<String, TreeNode>();
 
       List<String> keys = assetDict.Keys.ToList();
       keys.Sort(delegate (String x, String y) {
@@ -377,7 +459,8 @@ namespace TreeViewFast.Controls {
 
       // Clear view and internal dictionary
       Nodes.Clear();
-      _treeNodes.Clear();
+      // Replace rather than clear: a prepared full-tree snapshot may still own the previous map.
+      _treeNodes = new Dictionary<String, TreeNode>();
 
       List<String> keys = testDict.Keys.ToList();
       keys.Sort(delegate (String x, String y) {

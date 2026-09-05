@@ -56,6 +56,7 @@ namespace PugTools {
 
     public Tools() {
       Config.Load();
+      LocalizationResolver.ApplyRequested(Config.Language);
       InitializeComponent();
       txtAssetsPath.Text = Config.AssetsPath;
       chkAssetsUsePTS.Checked = Config.AssetsUsePTS;
@@ -471,6 +472,7 @@ namespace PugTools {
         Boolean usePTS = chkAssetsUsePTS.Checked;
         CurrentAssets =
           TorArchive.AssetHandler.Instance.GetCurrentAssets(txtAssetsPath.Text, usePTS);
+        LocalizationResolver.Apply(CurrentAssets, Config.Language);
         CurrentDom = DomHandler.Instance.GetCurrentDOM(CurrentAssets);
         CurrentDom.Version = PatchVersion;
 

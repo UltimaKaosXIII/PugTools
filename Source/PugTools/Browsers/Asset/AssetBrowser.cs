@@ -18,6 +18,7 @@ using Be.HexEditor;
 using Be.Windows.Forms;
 using ColorCode;
 using DevIL;
+using DrawingColor = System.Drawing.Color;
 using FileFormats;
 using GomLib;
 using NAudio.Wave;
@@ -51,15 +52,30 @@ namespace PugTools {
     private Int32 m_namesFound; // = 0;
     private TreeNode[] m_nodeMatch;
     private ViewGR2 m_panelRender;
+    private DdsPreviewControl m_ddsPreview;
     private Thread m_render;
     private ArrayList m_rootList; // = new ArrayList();
     private Int32 m_searchIndex; // = 0;
     private List<String> m_searchNodes; // = new List<String>();
+    private System.Windows.Forms.Timer m_assetTreeFilterTimer;
+    private CancellationTokenSource m_assetTreeFilterCancellation;
+    private Int32 m_assetTreeFilterGeneration;
+    private const Int32 AssetTreeFilterDisplayLimit = 2500;
+    private const Int32 AssetTreeFilterNodeLimit = 8000;
+    private const Int32 AssetTreeFilterAutoExpandLimit = 100;
+    private AssetSearchEntry[] m_assetSearchIndex = Array.Empty<AssetSearchEntry>();
+    private TreeViewFast.Controls.TreeViewFast.PreparedTree m_fullAssetTree;
+    private TreeViewFast.Controls.TreeViewFast m_assetFilterTree;
     private Int32 m_totalFilesSearched; // = 0;
     private Int32 m_totalNamesFound; // = 0;
     private readonly Boolean m_assetsUsePts;
     private WaveOutEvent m_waveOut;
     private XmlDocument m_xmlDoc;
+    // Jedipedia-style aliases for /resources/world/areas/<id> and
+    // /resources/world/livecontent/systemgenerated/<id>.  The dictionary keys stay numeric so
+    // extraction/navigation paths are unchanged; only the visible folder label and search gain
+    // the authored internal map name (for example 4611686019802841877  hut_main).
+    private readonly Dictionary<UInt64, String> m_worldAreaInternalNames = new Dictionary<UInt64, String>();
 
     // DirectMusic SGT playback. SGTs are decoded to an in-memory PCM WAV so beta
     // Microsoft-ADPCM assets do not depend on an installed Windows ACM codec.
@@ -90,6 +106,9 @@ namespace PugTools {
                           String previousAssetLocation = null, Boolean previousUsePTS = false,
                           Boolean compareFiles = false) {
       InitializeComponent();
+      InitializeDdsPreview();
+      InitializeAssetFilterTreeView();
+      InitializeAssetTreeLiveFilter();
       Config.Load();
 
       m_assetsLocation = assetLocation;
@@ -169,6 +188,10 @@ namespace PugTools {
     }
 
     private void AssetBrowserFormClosed(Object sender, FormClosedEventArgs e) {
+      try { m_assetTreeFilterTimer?.Stop(); m_assetTreeFilterTimer?.Dispose(); } catch { }
+      m_assetTreeFilterTimer = null;
+      try { m_assetTreeFilterCancellation?.Cancel(); m_assetTreeFilterCancellation?.Dispose(); } catch { }
+      m_assetTreeFilterCancellation = null;
       // Do NOT unload the shared hash dictionary here. Unload() calls
       // GC.Collect(), and with the current large SWTOR dictionary this can
       // freeze the entire desktop for seconds/minutes. The main application
@@ -185,6 +208,11 @@ namespace PugTools {
 
         m_panelRender = null;
         m_render = null;
+      }
+
+      if (m_assetFilterTree != null) {
+        try { m_assetFilterTree.Dispose(); } catch { }
+        m_assetFilterTree = null;
       }
 
       if (treeViewFast1 != null) {
@@ -266,8 +294,9 @@ namespace PugTools {
     }
 
     private void AssetBrowserFormResize(Object sender, EventArgs e) {
-      treeViewFast1.Size =
-        new Size(splitContainer2.Panel1.Width, splitContainer2.Panel1.Height - 70);
+      Size treeSize = new Size(splitContainer2.Panel1.Width, splitContainer2.Panel1.Height - 70);
+      if (treeViewFast1 != null) treeViewFast1.Size = treeSize;
+      if (m_assetFilterTree != null) m_assetFilterTree.Size = treeSize;
     }
 
     #endregion
@@ -279,6 +308,7 @@ namespace PugTools {
       System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
 
       m_currentAssets = AssetHandler.Instance.GetCurrentAssets(m_assetsLocation, m_assetsUsePts);
+      LocalizationResolver.Apply(m_currentAssets, Config.Language);
 
       if (m_compareFiles) {
         m_previousAssets =
@@ -316,6 +346,8 @@ namespace PugTools {
     private void BackgroundWorker2Run(Object sender, DoWorkEventArgs e) {
       if (m_closing) return;
 
+      InitializeWorldAreaInternalNames();
+
       if (m_compareFiles && m_previousAssets != null) {
         BuildCompareFileTree();
         return;
@@ -351,6 +383,7 @@ namespace PugTools {
             HashFileInfo hashInfo = new HashFileInfo(file.FileInfo.PrimaryHash,
                                                      file.FileInfo.SecondaryHash,
                                                      file);
+            RegisterWorldAreaInternalName(hashInfo);
 
             if (hashInfo.IsNamed) {
               if (hashInfo.FileName == "metadata.bin"
@@ -522,7 +555,7 @@ namespace PugTools {
 
         if (parentDir.Length == 0) parentDir = "/root";
 
-        String display = temp.Last();
+        String display = GetWorldAreaDirectoryDisplayName(dir, temp.Last());
         TreeListItem asset = new TreeListItem(dir, parentDir, display, empty);
 
         if (!m_assetDict.ContainsKey(dir)) m_assetDict.Add(dir, asset);
@@ -546,6 +579,7 @@ namespace PugTools {
         if (display?.HashInfo == null) continue;
 
         HashFileInfo info = display.HashInfo;
+        RegisterWorldAreaInternalName(info);
         String prefix = difference.State switch {
           BuildFileState.New => "/root/new",
           BuildFileState.Changed => "/root/changed",
@@ -628,7 +662,7 @@ namespace PugTools {
         String parentDir = String.Join("/", temp.Take(temp.Length - 1));
         if (parentDir.Length == 0) parentDir = "/root";
 
-        String display = temp.Last();
+        String display = GetWorldAreaDirectoryDisplayName(dir, temp.Last());
         if (!m_assetDict.ContainsKey(dir))
           m_assetDict.Add(dir, new TreeListItem(dir, parentDir, display, empty));
       }
@@ -637,6 +671,78 @@ namespace PugTools {
       // read-only and deliberately does not change dictionary CRC baselines.
       m_modNewCount = 0;
       backgroundWorker2.ReportProgress(100);
+    }
+
+    private void InitializeWorldAreaInternalNames() {
+      m_worldAreaInternalNames.Clear();
+
+      // Jedipedia's area-id catalog is the quickest complete source for known maps.  Runtime
+      // WorldAreaNames.xml entries can extend it, and an installed area.dat wins below when we
+      // encounter it so renamed/new maps do not require a PugTools update.
+      foreach (WorldAreaCatalogEntry entry in WorldAreaCatalog.Entries) {
+        if (entry == null || String.IsNullOrWhiteSpace(entry.InternalName)) continue;
+        m_worldAreaInternalNames[entry.Id] = entry.InternalName.Trim();
+      }
+
+      foreach (KeyValuePair<UInt64, WorldAreaOverride> pair in WorldAreaNameOverrides.LoadEntries()) {
+        if (pair.Value == null || String.IsNullOrWhiteSpace(pair.Value.InternalName)) continue;
+        m_worldAreaInternalNames[pair.Key] = pair.Value.InternalName.Trim();
+      }
+    }
+
+    private void RegisterWorldAreaInternalName(HashFileInfo info) {
+      if (info == null || !info.IsNamed || info.File == null
+          || !String.Equals(info.FileName, "area.dat", StringComparison.OrdinalIgnoreCase)) return;
+      if (!TryGetWorldAreaIdFromDirectory(info.Directory, out UInt64 areaId)) return;
+
+      String internalName = WorldBrowser.ReadAreaInternalName(info.File);
+      if (!String.IsNullOrWhiteSpace(internalName))
+        m_worldAreaInternalNames[areaId] = internalName.Trim();
+    }
+
+    private static Boolean TryGetWorldAreaIdFromDirectory(String directory, out UInt64 areaId) {
+      areaId = 0;
+      if (String.IsNullOrWhiteSpace(directory)) return false;
+      String[] parts = directory.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+      if (parts.Length < 4 || !UInt64.TryParse(parts[parts.Length - 1], out areaId)) return false;
+
+      Int32 last = parts.Length - 1;
+      Boolean regularArea = last >= 3
+        && String.Equals(parts[last - 1], "areas", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 2], "world", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 3], "resources", StringComparison.OrdinalIgnoreCase);
+      Boolean generatedArea = last >= 4
+        && String.Equals(parts[last - 1], "systemgenerated", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 2], "livecontent", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 3], "world", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 4], "resources", StringComparison.OrdinalIgnoreCase);
+      return regularArea || generatedArea;
+    }
+
+    private static Boolean TryGetWorldAreaIdFromTreeDirectory(String directory, out UInt64 areaId) {
+      areaId = 0;
+      if (String.IsNullOrWhiteSpace(directory)) return false;
+      String[] parts = directory.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+      if (parts.Length < 4 || !UInt64.TryParse(parts[parts.Length - 1], out areaId)) return false;
+
+      Int32 last = parts.Length - 1;
+      Boolean regularArea = last >= 3
+        && String.Equals(parts[last - 1], "areas", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 2], "world", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 3], "resources", StringComparison.OrdinalIgnoreCase);
+      Boolean generatedArea = last >= 4
+        && String.Equals(parts[last - 1], "systemgenerated", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 2], "livecontent", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 3], "world", StringComparison.OrdinalIgnoreCase)
+        && String.Equals(parts[last - 4], "resources", StringComparison.OrdinalIgnoreCase);
+      return regularArea || generatedArea;
+    }
+
+    private String GetWorldAreaDirectoryDisplayName(String directory, String fallback) {
+      if (!TryGetWorldAreaIdFromTreeDirectory(directory, out UInt64 areaId)
+          || !m_worldAreaInternalNames.TryGetValue(areaId, out String internalName)
+          || String.IsNullOrWhiteSpace(internalName)) return fallback;
+      return fallback + "  " + internalName;
     }
 
     private void BackgroundWorker2Completed(Object sender, RunWorkerCompletedEventArgs e) {
@@ -660,21 +766,53 @@ namespace PugTools {
     private void BackgroundWorker3Run(Object sender, DoWorkEventArgs e) {
       if (m_closing) return;
 
-      Task task = Task.Run(new Action(() => {
-        String getId(TreeListItem x) => x.Id;
-        String getParentId(TreeListItem x) => x.ParentId;
-        String getDisplayName(TreeListItem x) => x.DisplayName;
+      // Build the expensive managed representation without touching the WinForms control.
+      // The old implementation called BeginUpdate/LoadItems directly from this worker thread,
+      // which was a cross-thread UI access and still forced every later filter reset to allocate
+      // and sort the complete tree again.
+      m_assetSearchIndex = m_assetDict.Values
+        .Where(item => item?.HashInfo?.File != null)
+        .Select(item => new AssetSearchEntry(
+          item.Id,
+          item.DisplayName,
+          item.HashInfo.IsNamed,
+          item.HashInfo.FirstSeenVersion
+        ))
+        .ToArray();
 
-        treeViewFast1.BeginUpdate();
-        treeViewFast1.LoadItems<TreeListItem>(m_assetDict, getId, getParentId, getDisplayName);
-        treeViewFast1.EndUpdate();
-      }));
+      String getId(TreeListItem x) => x.Id;
+      String getParentId(TreeListItem x) => x.ParentId;
+      String getDisplayName(TreeListItem x) => x.DisplayName;
+      Int32 getImageIndex(TreeListItem x) => x?.HashInfo?.File != null ? 2 : 1;
+      Int32 compare(TreeListItem x, TreeListItem y) {
+        Boolean xFile = x?.HashInfo?.File != null;
+        Boolean yFile = y?.HashInfo?.File != null;
+        if (xFile != yFile) return xFile ? 1 : -1;
+        return String.Compare(x?.Id, y?.Id, StringComparison.Ordinal);
+      }
 
-      task.Wait();
+      m_fullAssetTree = TreeViewFast.Controls.TreeViewFast.PrepareItems(
+        m_assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, compare
+      );
     }
 
     private void BackgroundWorker3Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (m_closing) return;
+
+      if (e.Error != null) {
+        StatusLabel1Text("Unable to build asset tree.");
+        MessageBox.Show(e.Error.Message, "Asset Browser", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        LoadingSwirl1Hide();
+        ProgressBar1Hide();
+        return;
+      }
+
+      treeViewFast1.BeginUpdate();
+      try {
+        if (m_fullAssetTree != null) treeViewFast1.LoadPrepared(m_fullAssetTree);
+      } finally {
+        treeViewFast1.EndUpdate();
+      }
 
       if (treeViewFast1.Nodes.Count > 0) treeViewFast1.Nodes[0].Expand();
       treeViewFast1.Show();
@@ -712,16 +850,10 @@ namespace PugTools {
     }
 
     private void BtnClearSearchClick(Object sender, EventArgs e) {
-      m_searchNodes = new List<String>();
-      m_searchIndex = 0;
-
-      txtSearch.Enabled = true;
-      txtSearch.Text = "";
-
-      btnFindNext.Enabled = false;
-      btnSearch.Enabled = true;
-      btnClearSearch.Enabled = false;
-
+      if (txtSearch == null) return;
+      if (txtSearch.TextLength > 0) txtSearch.Clear();
+      else ApplyAssetTreeLiveFilter();
+      txtSearch.Focus();
     }
 
     private void ButtonsDisable() {
@@ -748,7 +880,7 @@ namespace PugTools {
     private async void BtnExtractClick(Object sender, EventArgs e) {
       m_extractCount = 0;
       m_extractPath = txtExtractPath.Text;
-      TreeNode node = treeViewFast1.SelectedNode;
+      TreeNode node = ActiveAssetTree?.SelectedNode;
 
       if (node == null) {
         MessageBox.Show(
@@ -1041,6 +1173,30 @@ namespace PugTools {
 
     #endregion
 
+    #region DDS Preview
+    private void InitializeDdsPreview() {
+      m_ddsPreview = new DdsPreviewControl {
+        Dock = DockStyle.Fill,
+        Visible = false,
+        BackColor = DrawingColor.White,
+        Checkerboard = true
+      };
+      splitContainer3.Panel1.Controls.Add(m_ddsPreview);
+      m_ddsPreview.BringToFront();
+    }
+
+    private void ConfigureDdsPreviewBackground(String directory) {
+      Boolean solidBackground = !String.IsNullOrEmpty(directory)
+        && (directory.Contains("codex", StringComparison.OrdinalIgnoreCase)
+            || directory.Contains("reputation", StringComparison.OrdinalIgnoreCase)
+            || directory.Contains("tutorials", StringComparison.OrdinalIgnoreCase));
+
+      m_ddsPreview.Checkerboard = !solidBackground;
+      m_ddsPreview.BackColor = solidBackground ? DrawingColor.Black : DrawingColor.White;
+    }
+
+    #endregion
+
     #region LoadingSwirl1
     private void LoadingSwirl1Hide() {
       if (InvokeRequired) Invoke(new Action(LoadingSwirl1Hide));
@@ -1088,6 +1244,8 @@ namespace PugTools {
         // Hide all the viewers
         hexBox1.Visible = false;
         pictureBox1.Visible = false;
+        m_ddsPreview.ClearPreview();
+        m_ddsPreview.Visible = false;
         renderPanel.Visible = false;
         toolStrip1.Visible = false;
         treeViewGrid1.Visible = false;
@@ -1152,8 +1310,10 @@ namespace PugTools {
           switch (asset.HashInfo.Extension.ToUpper()) {
             case "DDS":
               await Task.Run(PreviewAssetDDS);
-              PreviewAssetDDSCheckPath(asset.HashInfo.Directory);
-              pictureBox1.Visible = true;
+              ConfigureDdsPreviewBackground(asset.HashInfo.Directory);
+              splitContainer3.Panel1.AutoScrollPosition = Point.Empty;
+              m_ddsPreview.Visible = true;
+              m_ddsPreview.BringToFront();
               break;
 
             case "PNG":
@@ -1204,6 +1364,29 @@ namespace PugTools {
               await Task.Run(PreviewAssetXML);
               if (m_xmlDoc?.DocumentElement != null) webBrowser1.Visible = true;
               else txtRawView.Visible = true;
+              break;
+
+            case "BIN":
+            case "BKT":
+            case "FBX":
+            case "GOM":
+            case "NODE":
+            case "INFO":
+            case "LIST":
+              m_rootList.Clear();
+              try {
+                String jedipediaExtension = asset.HashInfo.Extension.ToUpperInvariant();
+                String jedipediaFileName = asset.HashInfo.FileName;
+                await Task.Run(() => PreviewAssetJedipediaStructured(jedipediaExtension, jedipediaFileName));
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine(asset.HashInfo.Extension + " Jedipedia structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = asset.HashInfo.Extension + " parse failed: " + ex.Message;
+                m_inputStream.Position = 0;
+                await Task.Run(PreviewAssetHEX);
+                txtRawView.Visible = true;
+              }
               break;
 
             case "NOT":
@@ -1545,7 +1728,13 @@ namespace PugTools {
               "JBA",
               StringComparison.OrdinalIgnoreCase)) {
           toolStripStatusLabel1.Text = "File Loaded.";
-          toolStripStatusLabel2.Text = String.Empty;
+          if (String.Equals(asset.HashInfo.Extension, "DDS", StringComparison.OrdinalIgnoreCase)) {
+            toolStripStatusLabel2.Text = m_ddsPreview.IsCubeMap
+              ? "Cubemap: drag to look around | mouse wheel zoom | double-click reset"
+              : "DDS: mouse wheel zoom | drag to pan | double-click reset";
+          } else {
+            toolStripStatusLabel2.Text = String.Empty;
+          }
         }
 
         toolStripProgressBar1.Visible = false;
@@ -1617,20 +1806,51 @@ namespace PugTools {
       m_rootList = View_DAT.Parse(br, assets, directory, fileName);
     }
 
+    private void PreviewAssetJedipediaStructured(String extension, String fileName) {
+      if (m_inputStream == null) return;
+      m_inputStream.Position = 0;
+      m_rootList = View_JedipediaFormats.Parse(m_inputStream, extension, fileName);
+    }
+
     private void PreviewAssetDDS() {
       try {
-        using (MemoryStream stream = new MemoryStream()) {
-          ImageImporter imp = new ImageImporter();
-          DevIL.Image dds = imp.LoadImageFromStream(ImageType.Dds, m_inputStream);
+        if (m_inputStream == null) return;
+        m_inputStream.Position = 0;
 
-          ImageExporter exp = new ImageExporter();
-          exp.SaveImageToStream(dds, ImageType.Png, stream);
+        using ImageImporter imp = new ImageImporter();
+        using DevIL.Image dds = imp.LoadImageFromStream(ImageType.Dds, m_inputStream);
 
-          Bitmap bmp = new Bitmap(stream);
-          pictureBox1.Invoke(new Action(() => { pictureBox1.Image = bmp; }));
+        if (dds.IsCubeMap || dds.FaceCount > 1) {
+          Dictionary<CubeMapFace, ImageData> faces = new Dictionary<CubeMapFace, ImageData>();
+          CubeMapFace[] cubeFaces = {
+            CubeMapFace.PositiveX, CubeMapFace.NegativeX,
+            CubeMapFace.PositiveY, CubeMapFace.NegativeY,
+            CubeMapFace.PositiveZ, CubeMapFace.NegativeZ
+          };
+
+          foreach (CubeMapFace face in cubeFaces) {
+            ImageData imageData = dds.GetImageData(face, 0);
+            if (imageData != null) faces[face] = imageData;
+          }
+
+          if (faces.Count > 0) {
+            DdsPreviewControl.CubeMapPixels cube = DdsPreviewControl.PrepareCubeMap(faces);
+            m_ddsPreview.Invoke(new Action(() => m_ddsPreview.SetCubeMap(cube)));
+            return;
+          }
         }
+
+        using MemoryStream stream = new MemoryStream();
+        using ImageExporter exp = new ImageExporter();
+        exp.SaveImageToStream(dds, ImageType.Png, stream);
+        stream.Position = 0;
+        using Bitmap decoded = new Bitmap(stream);
+        Bitmap bmp = new Bitmap(decoded);
+        m_ddsPreview.Invoke(new Action(() => m_ddsPreview.SetBitmap(bmp)));
       }
-      catch (Exception) { }
+      catch (Exception ex) {
+        Debug.WriteLine("DDS preview failed: " + ex);
+      }
     }
 
     private void PreviewAssetDDSCheckPath(String directory) {
@@ -2829,11 +3049,340 @@ namespace PugTools {
 
     #endregion
 
+    private TreeViewFast.Controls.TreeViewFast ActiveAssetTree =>
+      m_assetFilterTree != null && m_assetFilterTree.Visible ? m_assetFilterTree : treeViewFast1;
+
+    private void InitializeAssetFilterTreeView() {
+      // Keep the enormous native WinForms TreeView intact while a filter is active. Clearing the
+      // full control destroys every native tree item and was the remaining source of multi-second
+      // UI freezes even after the filename scan itself moved to Task.Run.
+      m_assetFilterTree = new TreeViewFast.Controls.TreeViewFast {
+        BorderStyle = treeViewFast1.BorderStyle,
+        Dock = treeViewFast1.Dock,
+        ImageIndex = treeViewFast1.ImageIndex,
+        ImageList = treeViewFast1.ImageList,
+        Margin = treeViewFast1.Margin,
+        SelectedImageIndex = treeViewFast1.SelectedImageIndex,
+        Size = treeViewFast1.Size,
+        TabIndex = treeViewFast1.TabIndex,
+        Visible = false
+      };
+      m_assetFilterTree.AfterSelect += TreeViewFast1AfterSelect;
+      m_assetFilterTree.KeyDown += TreeViewFast1KeyDown;
+      m_assetFilterTree.MouseHover += TreeViewFast1MouseHover;
+      m_assetFilterTree.MouseUp += TreeViewFast1MouseUp;
+      splitContainer2.Panel1.Controls.Add(m_assetFilterTree);
+      m_assetFilterTree.BringToFront();
+    }
+
+    private void InitializeAssetTreeLiveFilter() {
+      m_assetTreeFilterTimer = new System.Windows.Forms.Timer { Interval = 180 };
+      m_assetTreeFilterTimer.Tick += (_, __) => {
+        m_assetTreeFilterTimer.Stop();
+        ApplyAssetTreeLiveFilter();
+      };
+      txtSearch.TextChanged += (_, __) => {
+        if (m_closing) return;
+        Boolean hasFilter = txtSearch.Enabled && !String.IsNullOrWhiteSpace(txtSearch.Text);
+        btnClearSearch.Enabled = hasFilter;
+        m_assetTreeFilterTimer.Stop();
+        if (hasFilter) m_assetTreeFilterTimer.Start();
+        else ApplyAssetTreeLiveFilter();
+      };
+
+      // Search is now a live hierarchy-preserving filter rather than a jump/find-next workflow.
+      btnSearch.Visible = false;
+      btnFindNext.Visible = false;
+      btnClearSearch.Text = "Clear filter";
+      btnClearSearch.Location = new System.Drawing.Point(9, 37);
+      btnClearSearch.Size = new System.Drawing.Size(335, 27);
+      btnClearSearch.Enabled = false;
+      txtSearch.PlaceholderText = "Filter: words AND, -word excludes, ? unnamed, >/< /= patch first-seen";
+    }
+
+    private readonly struct AssetSearchEntry {
+      internal String Id { get; }
+      internal String DisplayName { get; }
+      internal Boolean IsNamed { get; }
+      internal String FirstSeenVersion { get; }
+
+      internal AssetSearchEntry(String id, String displayName, Boolean isNamed, String firstSeenVersion) {
+        Id = id ?? String.Empty;
+        DisplayName = displayName ?? String.Empty;
+        IsNamed = isNamed;
+        FirstSeenVersion = firstSeenVersion;
+      }
+    }
+
+    private sealed class AssetTreeFilterResult {
+      internal Dictionary<String, TreeListItem> Items { get; }
+      internal List<String> DisplayMatches { get; }
+      internal Int32 TotalMatches { get; }
+      internal Int32 HistoryUnknownCount { get; }
+      internal Boolean IsTruncated { get; }
+      internal TreeViewFast.Controls.TreeViewFast.PreparedTree PreparedTree { get; }
+
+      internal AssetTreeFilterResult(
+        Dictionary<String, TreeListItem> items,
+        List<String> displayMatches,
+        Int32 totalMatches,
+        Int32 historyUnknownCount = 0,
+        Boolean isTruncated = false,
+        TreeViewFast.Controls.TreeViewFast.PreparedTree preparedTree = null
+      ) {
+        Items = items;
+        DisplayMatches = displayMatches;
+        TotalMatches = totalMatches;
+        HistoryUnknownCount = historyUnknownCount;
+        IsTruncated = isTruncated;
+        PreparedTree = preparedTree;
+      }
+    }
+
+    private AssetTreeFilterResult BuildAssetTreeFilter(TreeFilterQuery filter, CancellationToken token) {
+      Dictionary<String, TreeListItem> assets = m_assetDict;
+      if (assets == null) return new AssetTreeFilterResult(
+        new Dictionary<String, TreeListItem>(StringComparer.OrdinalIgnoreCase),
+        new List<String>(),
+        0
+      );
+
+      var displayMatches = new List<String>(AssetTreeFilterDisplayLimit);
+      Int32 totalMatches = 0;
+      Int32 historyUnknownCount = 0;
+      Int32 scanned = 0;
+      Boolean truncated = false;
+      AssetSearchEntry[] searchIndex = m_assetSearchIndex ?? Array.Empty<AssetSearchEntry>();
+
+      // This is deliberately a bounded display search rather than an exact-result-count scan.
+      // Broad queries such as "a" used to keep scanning all ~millions of names merely to compute
+      // a status-bar number after the first 2,500 visible hits had already been found. Stop on the
+      // first additional hit instead and report 2,500+; narrow searches still scan to completion.
+      foreach (AssetSearchEntry entry in searchIndex) {
+        if ((++scanned & 0xff) == 0) token.ThrowIfCancellationRequested();
+
+        Boolean match;
+        if (filter.ShowUnnamedOnly) {
+          match = !entry.IsNamed;
+        } else {
+          Boolean textMatch = entry.IsNamed
+            ? filter.Matches(entry.Id, entry.DisplayName)
+            : filter.RequiredTerms.Count == 0;
+          if (!textMatch) continue;
+
+          if (filter.HasVersionTerms && String.IsNullOrWhiteSpace(entry.FirstSeenVersion)) {
+            historyUnknownCount++;
+            continue;
+          }
+          match = filter.MatchesVersion(entry.FirstSeenVersion);
+        }
+        if (!match) continue;
+
+        totalMatches++;
+        if (displayMatches.Count < AssetTreeFilterDisplayLimit) {
+          displayMatches.Add(entry.Id);
+        } else {
+          truncated = true;
+          break;
+        }
+      }
+
+      token.ThrowIfCancellationRequested();
+
+      var include = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+      var retainedMatches = new List<String>(displayMatches.Count);
+      foreach (String id in displayMatches) {
+        token.ThrowIfCancellationRequested();
+        var path = new List<String>(12);
+        String current = id;
+        while (!String.IsNullOrWhiteSpace(current) && !include.Contains(current)) {
+          path.Add(current);
+          if (!assets.TryGetValue(current, out TreeListItem currentItem)
+              || currentItem == null
+              || String.IsNullOrWhiteSpace(currentItem.ParentId)) break;
+          current = currentItem.ParentId;
+        }
+
+        if (include.Count + path.Count > AssetTreeFilterNodeLimit) {
+          truncated = true;
+          break;
+        }
+        foreach (String pathId in path) include.Add(pathId);
+        retainedMatches.Add(id);
+      }
+      displayMatches = retainedMatches;
+
+      var filtered = new Dictionary<String, TreeListItem>(include.Count, StringComparer.OrdinalIgnoreCase);
+      foreach (String id in include) {
+        if (assets.TryGetValue(id, out TreeListItem item) && item != null)
+          filtered[id] = item;
+      }
+
+      // Prepare the small result tree on this worker thread as well. The UI thread only attaches
+      // the already-linked roots to the dedicated result TreeView; it never sorts/allocates the
+      // result hierarchy and, crucially, never clears the gigantic full TreeView.
+      String getId(TreeListItem x) => x.Id;
+      String getParentId(TreeListItem x) => x.ParentId;
+      String getDisplayName(TreeListItem x) => x.DisplayName;
+      Int32 getImageIndex(TreeListItem x) => x?.HashInfo?.File != null ? 2 : 1;
+      Int32 compare(TreeListItem x, TreeListItem y) {
+        Boolean xFile = x?.HashInfo?.File != null;
+        Boolean yFile = y?.HashInfo?.File != null;
+        if (xFile != yFile) return xFile ? 1 : -1;
+        return String.Compare(x?.Id, y?.Id, StringComparison.Ordinal);
+      }
+      TreeViewFast.Controls.TreeViewFast.PreparedTree prepared =
+        TreeViewFast.Controls.TreeViewFast.PrepareItems(
+          filtered.Values, getId, getParentId, getDisplayName, getImageIndex, compare
+        );
+
+      return new AssetTreeFilterResult(
+        filtered, displayMatches, totalMatches, historyUnknownCount, truncated, prepared
+      );
+    }
+
+    private async void ApplyAssetTreeLiveFilter() {
+      if (m_closing || m_assetDict == null || treeViewFast1 == null || txtSearch == null) return;
+      if (InvokeRequired) { BeginInvoke(new Action(ApplyAssetTreeLiveFilter)); return; }
+
+      TreeFilterQuery filter = TreeFilterQuery.Parse(txtSearch.Text, true);
+      String query = filter.RawText;
+      String selectedId = ActiveAssetTree?.SelectedNode?.Name;
+
+      CancellationTokenSource previous = m_assetTreeFilterCancellation;
+      var cancellation = new CancellationTokenSource();
+      m_assetTreeFilterCancellation = cancellation;
+      try { previous?.Cancel(); previous?.Dispose(); } catch { }
+      Int32 generation = ++m_assetTreeFilterGeneration;
+
+      if (filter.IsEmpty) {
+        ApplyAssetTreeFilterResult(
+          filter,
+          selectedId,
+          new AssetTreeFilterResult(m_assetDict, new List<String>(), 0)
+        );
+        return;
+      }
+
+      // Feedback is immediate while the expensive part runs off-thread. Without this separation
+      // TextChanged used to scan and rebuild the entire SWTOR tree on the UI thread after every
+      // debounce tick, which makes the whole application appear hung for broad queries.
+      StatusLabel1Text("Filtering assets ...");
+
+      AssetTreeFilterResult result;
+      try {
+        result = await Task.Run(
+          () => BuildAssetTreeFilter(filter, cancellation.Token),
+          cancellation.Token
+        );
+      }
+      catch (OperationCanceledException) {
+        return;
+      }
+      catch (ObjectDisposedException) {
+        return;
+      }
+
+      if (m_closing || cancellation.IsCancellationRequested
+          || generation != m_assetTreeFilterGeneration
+          || !String.Equals(query, (txtSearch.Text ?? String.Empty).Trim(), StringComparison.Ordinal)) return;
+
+      ApplyAssetTreeFilterResult(filter, selectedId, result);
+    }
+
+    private void ApplyAssetTreeFilterResult(
+      TreeFilterQuery filter,
+      String selectedId,
+      AssetTreeFilterResult result
+    ) {
+      if (m_closing || treeViewFast1 == null || m_assetFilterTree == null) return;
+
+      String query = filter?.RawText ?? String.Empty;
+      if (filter == null || filter.IsEmpty) {
+        // Do not call Nodes.Clear()/LoadPrepared() here. The full native tree has remained alive
+        // and untouched behind the result view, so clearing the filter is now only a visibility
+        // swap instead of destruction/recreation of hundreds of thousands of Win32 tree items.
+        m_assetFilterTree.Visible = false;
+        treeViewFast1.Visible = true;
+        treeViewFast1.BringToFront();
+        btnClearSearch.Enabled = false;
+        StatusLabel1Text(
+          m_compareFiles
+            ? "Comparison loaded. Showing New, Changed and Removed files only."
+            : "Showing all assets."
+        );
+        return;
+      }
+
+      if (result == null || result.PreparedTree == null) return;
+      Dictionary<String, TreeListItem> filtered = result.Items;
+      List<String> directMatches = result.DisplayMatches;
+
+      m_assetFilterTree.BeginUpdate();
+      try {
+        // Clearing this control is cheap: it contains at most the bounded filter result, never the
+        // full SWTOR asset tree.
+        m_assetFilterTree.LoadPrepared(result.PreparedTree);
+
+        if (directMatches.Count <= AssetTreeFilterAutoExpandLimit) {
+          var expanded = new HashSet<String>(StringComparer.Ordinal);
+          foreach (String id in directMatches) {
+            if (!result.PreparedTree.NodeMap.TryGetValue(id, out TreeNode node)) continue;
+            for (TreeNode parent = node.Parent; parent != null; parent = parent.Parent) {
+              if (expanded.Add(parent.Name)) parent.Expand();
+            }
+          }
+        } else {
+          // For broad filters, expanding thousands of paths produces another native TreeView storm.
+          // Show the top-level result folders and let the user narrow the query or expand manually.
+          foreach (TreeNode root in m_assetFilterTree.Nodes) root.Expand();
+        }
+
+        if (!String.IsNullOrWhiteSpace(selectedId) && filtered.ContainsKey(selectedId)) {
+          try { m_assetFilterTree.SelectedNode = m_assetFilterTree.GetNode(selectedId); } catch { }
+        }
+      } finally {
+        m_assetFilterTree.EndUpdate();
+      }
+
+      treeViewFast1.Visible = false;
+      m_assetFilterTree.Visible = true;
+      m_assetFilterTree.BringToFront();
+
+      btnClearSearch.Enabled = txtSearch.Enabled && query.Length > 0;
+      String historyNote = filter.HasVersionTerms && result.HistoryUnknownCount > 0
+        ? " " + result.HistoryUnknownCount.ToString("n0")
+          + " otherwise matching files encountered before the display limit have no local first-seen history."
+        : String.Empty;
+
+      if (result.IsTruncated) {
+        String countText = result.TotalMatches > AssetTreeFilterDisplayLimit
+          ? AssetTreeFilterDisplayLimit.ToString("n0") + "+"
+          : result.TotalMatches.ToString("n0");
+        StatusLabel1Text(
+          "Filter: " + countText + " matches. Showing first "
+          + directMatches.Count.ToString("n0") + " (" + filtered.Count.ToString("n0")
+          + " nodes including folders); type more characters to narrow the result." + historyNote
+        );
+      } else {
+        StatusLabel1Text(
+          "Filter: " + result.TotalMatches.ToString("n0") + " matches ("
+          + filtered.Count.ToString("n0") + " nodes including folders)." + historyNote
+        );
+      }
+    }
+
     #region Search
     private async void Search() {
       StatusLabel1Text("Performing Search ...");
       m_searchNodes ??= new List<String>();
-      m_searchNodes = m_assetDict.Keys.Where(d => d.Contains(txtSearch.Text)).ToList();
+      String search = txtSearch.Text ?? String.Empty;
+      m_searchNodes = m_assetDict
+        .Where(pair => pair.Key.IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0
+          || (!String.IsNullOrWhiteSpace(pair.Value?.DisplayName)
+              && pair.Value.DisplayName.IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0))
+        .Select(pair => pair.Key)
+        .ToList();
 
       if (m_searchNodes.Count > 0) {
         txtSearch.Enabled = false;
@@ -3458,8 +4007,8 @@ namespace PugTools {
 
     #region TreeViewFast1
     private void TreeViewFast1AfterSelect(Object sender, TreeViewEventArgs e) {
-      TreeNode node = treeViewFast1.SelectedNode;
-      TreeListItem asset = (TreeListItem)node.Tag;
+      TreeNode node = e?.Node ?? (sender as TreeViewFast.Controls.TreeViewFast)?.SelectedNode;
+      if (node?.Tag is not TreeListItem asset) return;
 
       Text = "Asset Browser - " + asset.Id.ToString();
 
@@ -3500,6 +4049,12 @@ namespace PugTools {
           "Path",
           info.Directory
         });
+        if (!String.IsNullOrWhiteSpace(info.FirstSeenVersion)) {
+          dt.Rows.Add(new String[] {
+            "First Seen",
+            info.FirstSeenVersion
+          });
+        }
         if (m_compareFiles && asset.CompareState != BuildFileState.None) {
           dt.Rows.Add(new String[] {
             "State",
@@ -3597,15 +4152,13 @@ namespace PugTools {
     }
 
     private void TreeViewFast1MouseHover(Object sender, EventArgs e) {
-      if (!m_closing) treeViewFast1.Focus();
+      if (!m_closing && sender is TreeViewFast.Controls.TreeViewFast tree) tree.Focus();
     }
 
     private void TreeViewFast1MouseUp(Object sender, MouseEventArgs e) {
-      if (e.Button == MouseButtons.Right) {
-        treeViewFast1.SelectedNode = treeViewFast1.GetNodeAt(e.X, e.Y);
-
-        if (treeViewFast1.SelectedNode != null)
-          contextMenuStrip1.Show(treeViewFast1, e.Location);
+      if (e.Button == MouseButtons.Right && sender is TreeViewFast.Controls.TreeViewFast tree) {
+        tree.SelectedNode = tree.GetNodeAt(e.X, e.Y);
+        if (tree.SelectedNode != null) contextMenuStrip1.Show(tree, e.Location);
       }
     }
 
@@ -3665,8 +4218,16 @@ namespace PugTools {
 
     #region TxtSearch
     private void TxtSearchKeyDown(Object sender, KeyEventArgs e) {
-      if (e.KeyCode == Keys.Enter && !String.IsNullOrEmpty(txtSearch.Text))
-        Search();
+      if (e.KeyCode == Keys.Enter) {
+        m_assetTreeFilterTimer?.Stop();
+        ApplyAssetTreeLiveFilter();
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+      } else if (e.KeyCode == Keys.Escape && !String.IsNullOrEmpty(txtSearch.Text)) {
+        txtSearch.Clear();
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+      }
     }
 
     #endregion
@@ -3753,6 +4314,8 @@ namespace PugTools {
     internal void HideViewers() {
       hexBox1.Visible = false;
       pictureBox1.Visible = false;
+      m_ddsPreview.ClearPreview();
+      m_ddsPreview.Visible = false;
       renderPanel.Visible = false;
       treeViewGrid1.Visible = false;
       txtRawView.Visible = false;

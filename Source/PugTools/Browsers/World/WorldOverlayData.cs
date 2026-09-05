@@ -46,6 +46,10 @@ namespace PugTools {
     public int UtilityType { get; set; }
     public string Profession { get; set; }
     public string[] VendorPackages { get; set; } = System.Array.Empty<string>();
+    // A service NPC can also own a conversation. Keep that fact independent from Kind so a vendor/trainer/taxi
+    // does not lose its quest/conversation marker merely because the primary interaction classification prefers the
+    // more specific service action. This mirrors the client better than forcing one mutually exclusive UI identity.
+    public bool HasConversation => ConversationId != 0 || !string.IsNullOrWhiteSpace(Conversation);
     public readonly List<WorldMissionBoardNotice> MissionBoardNotices = new List<WorldMissionBoardNotice>();
     public bool MissionBoardLoaded { get; set; }
     public string MissionBoardError { get; set; }
@@ -113,6 +117,12 @@ namespace PugTools {
     // Conversation previews synthesize the local player even though no AREA AssetInstance exists for them. The
     // renderer treats this placement like an ordinary animated NPC, but skips authored-instance/dPVS gates.
     public bool ConversationVirtual { get; set; }
+    // A preview-built actor starts out of sight until the conversation's staging (or a Set Mark beat) gives it a
+    // position. This mirrors Jedipedia's cnvUnplaced flag and avoids briefly drawing cast NPCs at the world origin.
+    public bool ConversationUnplaced { get; set; }
+    // Transform-only host for cinematic VFX actors that intentionally have no visible character body. Unlike a real
+    // NPC placement this frame must not receive PugTools' fixed GR2 character 180-degree draw correction.
+    public bool ConversationFxAnchor { get; set; }
     // Optional locomotion clips resolved from the body type's Morpheme/anim_library network. A routed NPC should not
     // slide through the world while its skeleton keeps playing the idle pose.
     public WorldNpcAnimationClip WalkAnimation { get; set; }
@@ -176,6 +186,16 @@ namespace PugTools {
     public readonly List<WorldSpnDynPart> Parts = new List<WorldSpnDynPart>();
   }
 
+  internal sealed class WorldSpnFxPart {
+    public string Path { get; set; }
+    public SlimDX.Matrix LocalMatrix { get; set; } = SlimDX.Matrix.Identity;
+    // Empty means the effect is not controlled by a DYN state (for example plcUsableVFX). Otherwise this mirrors
+    // Jedipedia viewerFxDynEffects: one authored visibility answer for every state of the assembly.
+    public readonly Dictionary<string, bool> StateVisibility = new Dictionary<string, bool>(System.StringComparer.OrdinalIgnoreCase);
+    // Ship-window effects opt out of ordinary metre-based SPN culling and are driven as one picture by ShipVfx.
+    public bool ShipVfx { get; set; }
+  }
+
   internal sealed class WorldSpnDynLight {
     public SlimDX.Matrix LocalMatrix { get; set; } = SlimDX.Matrix.Identity;
     public string LightType { get; set; } = "OMNI";
@@ -223,5 +243,6 @@ namespace PugTools {
     public readonly List<GR2> Models = new List<GR2>();
     public readonly List<WorldSpnDynState> DynStates = new List<WorldSpnDynState>();
     public readonly List<WorldSpnDynLight> DynLights = new List<WorldSpnDynLight>();
+    public readonly List<WorldSpnFxPart> DynEffects = new List<WorldSpnFxPart>();
   }
 }

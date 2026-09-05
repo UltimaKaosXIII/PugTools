@@ -172,9 +172,14 @@ namespace PugTools {
     private readonly Dictionary<GR2, Dictionary<WorldNpcAnimationClip, NpcSkinState>> npcSkinStates = new Dictionary<GR2, Dictionary<WorldNpcAnimationClip, NpcSkinState>>();
     private Dictionary<string, GR2> utilityMarkerModels = new Dictionary<string, GR2>(StringComparer.OrdinalIgnoreCase);
     private List<WorldNpcPlacement> npcPlacements = new List<WorldNpcPlacement>();
-    // The game has no authored AREA instance for the local conversation player. Keep the stand-in separate from the
-    // static population snapshot so playback can attach/detach it without racing a full spatial-index rebuild.
+    // Conversation playback can synthesize the local player AND actors that the scene brings with it even though no
+    // AREA instance exists for them. Keep those stand-ins separate from the static population snapshot so playback can
+    // attach/detach them without racing a full spatial-index rebuild. An immutable snapshot is what the render thread
+    // enumerates; the UI/player thread can replace it atomically as cast members are added.
     private volatile WorldNpcPlacement worldConversationVirtualPlayer;
+    private volatile WorldNpcPlacement[] worldConversationVirtualActors = Array.Empty<WorldNpcPlacement>();
+    private readonly object worldConversationVirtualActorLock = new object();
+    private readonly HashSet<WorldNpcPlacement> worldConversationVirtualActorSet = new HashSet<WorldNpcPlacement>();
     private readonly List<WorldNpcPlacement> worldConversationVirtualResources = new List<WorldNpcPlacement>();
     // Population-heavy worlds can contain thousands of NPC templates. Walking the whole list several times per
     // frame (draw, depth-visibility, nameplates) was still CPU-bound even after render-distance culling. Keep a tiny
@@ -224,6 +229,10 @@ namespace PugTools {
     private readonly Vector4[] npcNameplateVisibilitySamples = new Vector4[NpcNameplateMaxCount];
     private readonly byte[] npcNameplateVisibilityReadback = new byte[NpcNameplateMaxCount * 4];
     private readonly HashSet<WorldNpcPlacement> npcNameplateVisible = new HashSet<WorldNpcPlacement>();
+    // Only NPCs that actually participated in the current nameplate depth query may reuse its visibility result.
+    // Conversation NPCs without an authored text nameplate still need their quest icon; treating "not queried"
+    // as "occluded" was the regression that made those overhead quest symbols disappear.
+    private readonly HashSet<WorldNpcPlacement> npcNameplateVisibilityQueried = new HashSet<WorldNpcPlacement>();
     private int npcNameplateVisibilityFrame;
     private int npcNameplateVisibilityAskedAt = Int32.MinValue / 2;
     private bool npcNameplateVisibilityFailed;
@@ -233,6 +242,17 @@ namespace PugTools {
     // viewport snapshot for both projection and depth sampling or they visibly slide while the sidebar is resized.
     private int npcNameplateViewportWidth = -1;
     private int npcNameplateViewportHeight = -1;
+
+    // Optional SWTOR-style area title. The technical room is the transition trigger; the visible text is the
+    // localized map-page title when available, with the room name as the explicit fallback requested for old/beta
+    // data that has no matching str.sys.worldmap entry.
+    private string locationBannerLastRoomName = String.Empty;
+    private string locationBannerLastDisplayName = String.Empty;
+    private string locationBannerText = String.Empty;
+    private float locationBannerStartedAt = -1000f;
+    private const float LocationBannerFadeInSeconds = .30f;
+    private const float LocationBannerHoldSeconds = 2.65f;
+    private const float LocationBannerFadeOutSeconds = 1.05f;
 
     private Texture2D objectOcclusionVisibilityTexture;
     private RenderTargetView objectOcclusionVisibilityTarget;
@@ -321,6 +341,7 @@ namespace PugTools {
         : new Dictionary<string, GR2>(utilityModels, StringComparer.OrdinalIgnoreCase);
       npcPlacements = npcData == null ? new List<WorldNpcPlacement>() : new List<WorldNpcPlacement>(npcData);
       spnPlacements = spnData == null ? new List<WorldSpnPlacement>() : new List<WorldSpnPlacement>(spnData);
+      BuildShipVfxRegistry();
       BuildNpcSpatialIndex();
       BuildSpnSpatialIndex();
       npcGeometryPrepared = false;
@@ -329,6 +350,7 @@ namespace PugTools {
         (p.Route != null || (p.SpawnPoints != null && p.SpawnPoints.Count > 0))).ToList();
       npcFactionHint = Int32.MinValue;
       npcNameplateVisible.Clear();
+      npcNameplateVisibilityQueried.Clear();
       npcNameplateHasVisibility = false;
       npcNameplateVisibilityFrame = 0;
       npcNameplateVisibilityAskedAt = Int32.MinValue / 2;
@@ -349,11 +371,39 @@ namespace PugTools {
     }
 
     internal void SetWorldConversationVirtualPlayer(WorldNpcPlacement placement) {
-      worldConversationVirtualPlayer = placement;
-      if (placement != null && !worldConversationVirtualResources.Contains(placement)) worldConversationVirtualResources.Add(placement);
+      lock (worldConversationVirtualActorLock) {
+        if (worldConversationVirtualPlayer != null) worldConversationVirtualActorSet.Remove(worldConversationVirtualPlayer);
+        worldConversationVirtualPlayer = placement;
+        if (placement != null) {
+          worldConversationVirtualActorSet.Add(placement);
+          if (!worldConversationVirtualResources.Contains(placement)) worldConversationVirtualResources.Add(placement);
+        }
+        worldConversationVirtualActors = worldConversationVirtualActorSet.ToArray();
+      }
       // Its GR2s are prepared lazily by DrawModel/TryDrawAnimatedNpcModel just like streamed population models.
       // No population snapshot or dPVS index mutation is necessary.
     }
+
+    internal void AddWorldConversationVirtualActor(WorldNpcPlacement placement) {
+      if (placement == null) return;
+      lock (worldConversationVirtualActorLock) {
+        worldConversationVirtualActorSet.Add(placement);
+        if (!worldConversationVirtualResources.Contains(placement)) worldConversationVirtualResources.Add(placement);
+        worldConversationVirtualActors = worldConversationVirtualActorSet.ToArray();
+      }
+    }
+
+    internal void ClearWorldConversationVirtualActors() {
+      lock (worldConversationVirtualActorLock) {
+        worldConversationVirtualActorSet.Clear();
+        worldConversationVirtualActors = Array.Empty<WorldNpcPlacement>();
+        worldConversationVirtualPlayer = null;
+      }
+      // GPU resources stay in worldConversationVirtualResources until the AREA changes. Releasing them immediately
+      // from the WinForms playback thread can race an in-flight D3D draw; the existing area teardown owns disposal.
+    }
+
+    private bool HasWorldConversationVirtualActors => worldConversationVirtualActors != null && worldConversationVirtualActors.Length > 0;
 
     private void ReleaseWorldConversationVirtualResources() {
       var released = new HashSet<GR2>();
@@ -371,6 +421,10 @@ namespace PugTools {
       foreach (WorldNpcPlacement placement in worldConversationVirtualResources) if (placement != null) npcClothStates.Remove(placement);
       worldConversationVirtualResources.Clear();
       worldConversationVirtualPlayer = null;
+      lock (worldConversationVirtualActorLock) {
+        worldConversationVirtualActorSet.Clear();
+        worldConversationVirtualActors = Array.Empty<WorldNpcPlacement>();
+      }
     }
 
     private static int NpcSpatialCell(float coordinate) => (int)Math.Floor(coordinate / NpcSpatialCellSize);
@@ -394,12 +448,12 @@ namespace PugTools {
     }
 
     private IEnumerable<WorldNpcPlacement> NearbyNpcPlacements(float range) {
-      WorldNpcPlacement virtualPlayer = worldConversationVirtualPlayer;
+      WorldNpcPlacement[] virtualActors = worldConversationVirtualActors ?? Array.Empty<WorldNpcPlacement>();
       bool havePopulation = npcPlacements != null && npcPlacements.Count > 0;
-      if (!havePopulation && virtualPlayer == null) yield break;
+      if (!havePopulation && virtualActors.Length == 0) yield break;
       if (camera == null || npcSpatialGrid.Count == 0) {
         if (havePopulation) foreach (WorldNpcPlacement placement in npcPlacements) yield return placement;
-        if (virtualPlayer != null) yield return virtualPlayer;
+        foreach (WorldNpcPlacement placement in virtualActors) if (placement != null) yield return placement;
         yield break;
       }
       // One-cell padding covers character bounds and authored spawn offsets. The exact distance/frustum tests below
@@ -411,7 +465,7 @@ namespace PugTools {
         if (npcSpatialGrid.TryGetValue((x, z), out List<WorldNpcPlacement> bucket))
           foreach (WorldNpcPlacement placement in bucket) yield return placement;
       foreach (WorldNpcPlacement placement in npcSpatialFallback) yield return placement;
-      if (virtualPlayer != null) yield return virtualPlayer;
+      foreach (WorldNpcPlacement placement in virtualActors) if (placement != null) yield return placement;
     }
 
     private static int SpnSpatialCell(float coordinate) => (int)Math.Floor(coordinate / SpnSpatialCellSize);
@@ -490,6 +544,8 @@ namespace PugTools {
         npcTextFont.RegisterFont("world-npc-item", 11f, "Arial");
         npcTextFont.RegisterFont("world-selection", 12f, "Arial", SlimDX.DirectWrite.FontWeight.Bold);
         npcTextFont.RegisterFont("world-taxi", 12f, "Consolas", SlimDX.DirectWrite.FontWeight.Bold);
+        npcTextFont.RegisterFont("world-location", 28f, "Arial", SlimDX.DirectWrite.FontWeight.Bold);
+        npcTextFont.RegisterFont("world-location-line", 13f, "Arial", SlimDX.DirectWrite.FontWeight.Bold);
         npcTextFontsRegistered = true;
       } catch (Exception ex) {
         System.Diagnostics.Debug.WriteLine("NPC nameplate renderer unavailable: " + ex.Message);
@@ -838,7 +894,7 @@ namespace PugTools {
     }
 
     private static bool NpcLayerVisible(WorldNpcPlacement placement, WorldRenderSettings s) {
-      return placement?.ConversationHidden != true && s != null &&
+      return placement?.ConversationHidden != true && placement?.ConversationUnplaced != true && s != null &&
         (placement?.ConversationVirtual == true || s.ShowNpcs || (s.ShowTaxiTerminals && IsTaxiNpc(placement)));
     }
 
@@ -851,9 +907,9 @@ namespace PugTools {
     }
 
     private void DrawJedipediaNpcs(Matrix vp, HashSet<string> visible, WorldRenderSettings s, AreaEnvironmentScheme cameraEnv, bool sceneShadows) {
-      WorldNpcPlacement virtualPlayer = worldConversationVirtualPlayer;
-      if ((!s.ShowNpcs && !s.ShowTaxiTerminals && virtualPlayer == null) ||
-          ((npcPlacements == null || npcPlacements.Count == 0) && virtualPlayer == null)) return;
+      bool haveVirtualActors = HasWorldConversationVirtualActors;
+      if ((!s.ShowNpcs && !s.ShowTaxiTerminals && !haveVirtualActors) ||
+          ((npcPlacements == null || npcPlacements.Count == 0) && !haveVirtualActors)) return;
       EnsureNpcGeometryPrepared();
       Room activeRoom = null;
       foreach (WorldNpcPlacement placement in NearbyNpcPlacements(NpcMaxRenderDistance)) {
@@ -981,6 +1037,7 @@ namespace PugTools {
             if (!animatePart || !TryDrawAnimatedNpcModel(part.Model, partWorld, vp, s, partClip, partTime, null, blueGlow))
               DrawModel(part.Model, partWorld, vp, s, false, null, -1, blueGlow);
           }
+          DrawSpnFxEffects(placement, world, vp, animateMotion, false);
           continue;
         }
 
@@ -997,7 +1054,9 @@ namespace PugTools {
           if (!animateModel || !TryDrawAnimatedNpcModel(model, world, vp, s, placement.Animation, animationTime, null, placementBlueGlow))
             DrawModel(model, world, vp, s, false, null, -1, placementBlueGlow);
         }
+        DrawSpnFxEffects(placement, world, vp, animateMotion, false);
       }
+      DrawShipVfxEffects(vp, s);
     }
 
     private Matrix NpcNameplateWorld(WorldNpcPlacement placement) {
@@ -1245,6 +1304,12 @@ namespace PugTools {
 
     private WorldSpnDynState ActiveSpnDynState(WorldSpnPlacement placement, bool animateStates = true) {
       if (placement?.DynStates == null || placement.DynStates.Count == 0) return null;
+      // Jedipedia shipVfx overrides the generic shared two-second state clock: hydra scripts hold these assemblies at
+      // one destination and explicitly sequence the globe/backdrop/tunnel during a jump.
+      if (TryGetShipVfxStateName(placement, out string shipState)) {
+        WorldSpnDynState matched = placement.DynStates.FirstOrDefault(x => String.Equals(x?.Name, shipState, StringComparison.OrdinalIgnoreCase));
+        if (matched != null) return matched;
+      }
       if (!animateStates || placement.DynStates.Count == 1) return placement.DynStates[0];
       int index = (int)Math.Floor(elapsed / SpnVariantSeconds) % placement.DynStates.Count;
       if (index < 0) index += placement.DynStates.Count;
@@ -2342,7 +2407,11 @@ namespace PugTools {
     }
 
     private void DrawNpcNameplates(Matrix labelViewProj, Matrix depthViewProj, HashSet<string> visible, WorldRenderSettings s) {
-      if ((!s.ShowNpcs && !s.ShowTaxiTerminals) || (!s.ShowNpcNames && !s.ShowNpcItems) || !npcTextFontsRegistered || npcTextFont == null || npcTextSprite == null) return;
+      if ((!s.ShowNpcs && !s.ShowTaxiTerminals) || (!s.ShowNpcNames && !s.ShowNpcItems) || !npcTextFontsRegistered || npcTextFont == null || npcTextSprite == null) {
+        npcNameplateVisibilityQueried.Clear();
+        npcNameplateHasVisibility = false;
+        return;
+      }
 
       // IMPORTANT: never use ClientWidth/ClientHeight below. SetSize() is called by the WinForms splitter thread and
       // changes those fields before the render thread reaches OnResize(). During an interactive sidebar drag this can
@@ -2417,6 +2486,8 @@ namespace PugTools {
       int nameplateBudget = Math.Min(NpcNameplateMaxCount, Math.Max(1, viewportWidth));
       if (entries.Count > nameplateBudget) entries.RemoveRange(nameplateBudget, entries.Count - nameplateBudget);
 
+      npcNameplateVisibilityQueried.Clear();
+      foreach (NpcNameplateEntry entry in entries) if (entry?.Placement != null) npcNameplateVisibilityQueried.Add(entry.Placement);
       bool useOcclusion = UpdateNpcNameplateVisibility(entries, viewportWidth, viewportHeight);
       foreach (NpcNameplateEntry entry in entries) {
         WorldNpcPlacement placement = entry.Placement;
@@ -2557,6 +2628,131 @@ namespace PugTools {
       if (NpcAttitudeKind(rep) < 0 || NpcAttitudeKind(imp) < 0) return "Hostile";
       if (NpcAttitudeKind(rep) > 0 || NpcAttitudeKind(imp) > 0) return "Friendly";
       return rep ?? imp;
+    }
+
+    private static string CleanLocationBannerText(string value) {
+      if (String.IsNullOrWhiteSpace(value)) return null;
+      string text = System.Net.WebUtility.HtmlDecode(value ?? String.Empty);
+      // SWTOR stringtables commonly use HTML-style breaks. Do not show the literal "<br>" in the renderer;
+      // preserve it as a real line break so names such as "Korriban<br>Valley of the Dark Lords" keep the
+      // authored two-line layout.
+      text = System.Text.RegularExpressions.Regex.Replace(text, @"<\s*br\s*/?\s*>", "\n", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+      text = text.Replace("\\n", "\n").Replace("\r\n", "\n").Replace('\r', '\n');
+      text = System.Text.RegularExpressions.Regex.Replace(text, @"<[^>]+>", String.Empty);
+      string[] lines = text.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries)
+        .Select(line => System.Text.RegularExpressions.Regex.Replace(line, @"\s+", " ").Trim())
+        .Where(line => !String.IsNullOrWhiteSpace(line))
+        .ToArray();
+      return lines.Length == 0 ? null : String.Join("\n", lines);
+    }
+
+    private string ResolveLocationBannerDisplayName(Room room, Vector3 position, WorldRenderSettings settings) {
+      if (room == null || IsEverywhereRoom(room)) return null;
+      string roomName = CleanLocationBannerText(room.RoomName);
+      if (settings?.UseRoomNamesForLocationBanner == true) return roomName;
+      try {
+        AreaMapPage worldPage = ResolveInteractiveWorldPage();
+        AreaMapPage page = ResolveInteractiveAreaPage(position, worldPage) ?? worldPage;
+        string displayName = CleanLocationBannerText(page?.DisplayName);
+        if (!String.IsNullOrWhiteSpace(displayName)) return displayName;
+      } catch { }
+      return roomName;
+    }
+
+    private void UpdateLocationBanner(Room room, WorldRenderSettings settings) {
+      string roomName = room == null || IsEverywhereRoom(room) ? String.Empty : (room.RoomName ?? String.Empty).Trim();
+      if (settings?.ShowRoomLocationBanner != true) {
+        // Enabling the option should not immediately announce the room the user was already standing in. Keep the
+        // current cell as the baseline while disabled; the first *subsequent* transition is the first announcement.
+        locationBannerLastRoomName = roomName;
+        locationBannerLastDisplayName = ResolveLocationBannerDisplayName(room, camera?.Position ?? new Vector3(), settings) ?? String.Empty;
+        locationBannerText = String.Empty;
+        return;
+      }
+      if (String.IsNullOrWhiteSpace(roomName)) return;
+      if (String.Equals(locationBannerLastRoomName, roomName, StringComparison.OrdinalIgnoreCase)) return;
+
+      string display = ResolveLocationBannerDisplayName(room, camera?.Position ?? new Vector3(), settings);
+      locationBannerLastRoomName = roomName;
+      if (String.IsNullOrWhiteSpace(display)) return;
+
+      // Map-name mode behaves like the game: a planet can consist of many technical streaming rooms covered by the
+      // same visible SWTOR map region, so those rooms are coalesced. Room-name mode is intentionally different and
+      // announces every change of the .room name, as requested for inspecting streaming-room boundaries.
+      if (settings?.UseRoomNamesForLocationBanner != true &&
+          String.Equals(locationBannerLastDisplayName, display, StringComparison.OrdinalIgnoreCase)) return;
+      locationBannerLastDisplayName = display;
+      locationBannerText = display;
+      locationBannerStartedAt = Timer?.TotalTime ?? 0f;
+    }
+
+    private void DrawWorldLocationBanner(WorldRenderSettings settings) {
+      if (settings?.ShowRoomLocationBanner != true || settings.Mode == WorldRenderMode.Map || String.IsNullOrWhiteSpace(locationBannerText) ||
+          !npcTextFontsRegistered || npcTextFont == null || npcTextSprite == null || Device == null) return;
+
+      float now = Timer?.TotalTime ?? locationBannerStartedAt;
+      float elapsed = Math.Max(0f, now - locationBannerStartedAt);
+      float fadeOutStart = LocationBannerFadeInSeconds + LocationBannerHoldSeconds;
+      float total = fadeOutStart + LocationBannerFadeOutSeconds;
+      if (elapsed >= total) { locationBannerText = String.Empty; return; }
+
+      float alpha = elapsed < LocationBannerFadeInSeconds
+        ? elapsed / Math.Max(.001f, LocationBannerFadeInSeconds)
+        : (elapsed <= fadeOutStart ? 1f : 1f - (elapsed - fadeOutStart) / Math.Max(.001f, LocationBannerFadeOutSeconds));
+      alpha = Math.Max(0f, Math.Min(1f, alpha));
+
+      int viewportWidth = Math.Max(1, (int)Viewport.Width);
+      int viewportHeight = Math.Max(1, (int)Viewport.Height);
+      if (viewportWidth != npcNameplateViewportWidth || viewportHeight != npcNameplateViewportHeight) {
+        npcNameplateViewportWidth = viewportWidth;
+        npcNameplateViewportHeight = viewportHeight;
+        try { npcTextSprite.RefreshViewport(); } catch { }
+      }
+
+      string normalizedTitle = CleanLocationBannerText(locationBannerText);
+      if (String.IsNullOrWhiteSpace(normalizedTitle)) return;
+      string[] lines = normalizedTitle.ToUpperInvariant().Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+      int maxTitleChars = Math.Max(18, (int)((viewportWidth * .74f) / 15.0f));
+      for (int i = 0; i < lines.Length; i++) {
+        string line = (lines[i] ?? String.Empty).Trim();
+        if (line.Length > maxTitleChars) line = SelectionOverlayEllipsis(line, maxTitleChars);
+        lines[i] = line;
+      }
+      lines = lines.Where(line => !String.IsNullOrWhiteSpace(line)).Take(3).ToArray();
+      if (lines.Length == 0) return;
+
+      // Match SWTOR's floating world labels: saturated cyan/blue text with a strong dark outline. The old pale-grey
+      // title and decorative side rules made this look like a generic desktop overlay rather than an in-game label.
+      float lineHeight = 34f;
+      float blockHeight = lines.Length * lineHeight;
+      float y = Math.Max(36f, viewportHeight * .17f - blockHeight * .5f);
+      Color4 outline = new Color4(alpha * .96f, .005f, .025f, .035f);
+      Color4 blue = new Color4(alpha, .00f, .66f, .86f);
+      Color4 highlight = new Color4(alpha * .45f, .02f, .82f, 1.00f);
+
+      for (int i = 0; i < lines.Length; i++) {
+        float lineY = y + i * lineHeight;
+        string line = lines[i];
+        // Eight-way outline, then a faint one-pixel cyan lift and the solid SWTOR-blue face.
+        DrawCenteredLocationText(line, lineY - 2f, outline, "world-location");
+        DrawCenteredLocationText(line, lineY + 2f, outline, "world-location");
+        DrawCenteredLocationText(line, lineY, outline, "world-location", -2f);
+        DrawCenteredLocationText(line, lineY, outline, "world-location", 2f);
+        DrawCenteredLocationText(line, lineY - 1f, outline, "world-location", -1f);
+        DrawCenteredLocationText(line, lineY - 1f, outline, "world-location", 1f);
+        DrawCenteredLocationText(line, lineY + 1f, outline, "world-location", -1f);
+        DrawCenteredLocationText(line, lineY + 1f, outline, "world-location", 1f);
+        DrawCenteredLocationText(line, lineY - 1f, highlight, "world-location");
+        DrawCenteredLocationText(line, lineY, blue, "world-location");
+      }
+      npcTextSprite.Flush();
+    }
+
+    private void DrawCenteredLocationText(string text, float y, Color4 color, string font, float xOffset = 0f) {
+      if (String.IsNullOrWhiteSpace(text)) return;
+      float charWidth = String.Equals(font, "world-location", StringComparison.Ordinal) ? 15.0f : 7.0f;
+      float width = Math.Min(Math.Max(1f, Viewport.Width) * .96f, text.Length * charWidth);
+      npcTextFont.DrawString(font, text, new Vector2(Math.Max(2f, (Viewport.Width - width) * .5f + xOffset), y), color);
     }
 
     private void DrawNpcText(string text, Vector2 pos, Color4 color, string font) {
@@ -2993,6 +3189,8 @@ namespace PugTools {
       spnSpatialGrid.Clear();
       spnSpatialFallback.Clear();
       spnPlacements = new List<WorldSpnPlacement>();
+      BuildShipVfxRegistry();
+      ClearWorldFxRuntime();
       npcGeometryPrepared = false;
       spnGeometryPrepared = false;
       walkingSpnPlatforms = new List<WorldSpnPlacement>();

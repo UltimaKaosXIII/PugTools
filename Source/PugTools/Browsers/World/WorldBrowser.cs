@@ -14,6 +14,7 @@ using GomLib;
 using GomLib.Models;
 using SlimDX;
 using Newtonsoft.Json;
+using nsHashDictionary;
 using TorArchive;
 using File = TorArchive.File;
 //using TreeViewFast.Controls;
@@ -88,6 +89,8 @@ namespace PugTools {
     private ToolStripMenuItem btnWorldVolumeList;
     private ToolStripMenuItem btnWorldUtilities;
     private ToolStripMenuItem btnWorldNpcs;
+    private ToolStripMenuItem btnWorldRooms;
+    private string worldRoomFilterText = String.Empty;
     private ToolStripMenuItem btnWorldWalkingMode;
     private ToolStripMenuItem btnWorldStats;
     private bool worldModelInspectPending;
@@ -129,7 +132,12 @@ namespace PugTools {
     private float miniMapZoom = 1f;
     private float miniMapCenterX, miniMapCenterZ;
     private const float MiniMapMaxZoom = 32f;
+    private const float MiniMapDefaultFollowZoom = 2f;
     private bool miniMapMoving, miniMapResizing, miniMapPanning, miniMapSuppressClick;
+    private bool miniMapFollowRefreshPending;
+    private bool miniMapFollowRestoreView;
+    private bool miniMapFollowFullExtentActive;
+    private float miniMapFollowRestoreZoom = 1f;
     private bool worldFullMapActive;
     private Point miniMapDragStart, miniMapPanelStart, miniMapPanStart;
     private Size miniMapResizeStart;
@@ -137,6 +145,7 @@ namespace PugTools {
     private System.Windows.Forms.Timer worldOverlayTimer;
     private ToolStripStatusLabel toolStripPositionStatus;
     private ToolStripStatusLabel toolStripPhaseStatus;
+    private ToolStripDropDownButton toolStripShipDestinationStatus;
     private ToolStripStatusLabel toolStripRoomStatus;
     private ToolStripStatusLabel toolStripPerfStatus;
     private Label phaseBannerLabel;
@@ -195,8 +204,11 @@ namespace PugTools {
     private Dictionary<ulong, string> mapAreas = new Dictionary<ulong, string>();
     private Dictionary<string, NodeAsset> loadedAssetDict;
     private Dictionary<ulong, WorldAreaOverride> worldAreaOverrides = new Dictionary<ulong, WorldAreaOverride>();
+    private readonly Dictionary<ulong, string> worldAreaInternalNames = new Dictionary<ulong, string>();
 
-    private static string ReadAreaInternalName(File areaFile) {
+    // Shared with the Asset Browser so both trees use the authored area.dat name when the
+    // installed client knows more than the bundled Jedipedia catalog.
+    internal static string ReadAreaInternalName(File areaFile) {
       if (areaFile == null) return null;
       try {
         using Stream stream = areaFile.OpenCopyInMemory();
@@ -228,30 +240,45 @@ namespace PugTools {
     private void BackgroundWorker1_DoWork(object sender, DoWorkEventArgs e) {
       List<object> args = e.Argument as List<object>;
       currentAssets = AssetHandler.Instance.GetCurrentAssets((string)args[0], (bool)args[1]);
+      ResetWorldLegacyPrototypeNameIndex();
+      LocalizationResolver.Apply(currentAssets, Config.Language);
       currentDom = DomHandler.Instance.GetCurrentDOM(currentAssets);
       //this.currentDom.ami.Load();
 
-      mapAreaData = currentDom.GetObject("mapareasdata").Data.Get<List<object>>("utlDatatableRows");
-      StringTable strTable = currentDom.StringTable.Find("str.sys.worldmap");
+      // mapareasdata exists in most releases, but early 32-bit/Beta GOMs may omit its resolved name or the table
+      // entirely.  Treat it as an optional convenience index rather than a prerequisite for opening the World
+      // Browser.  The installed area.dat scan below is the authoritative fallback.
+      mapAreaData = new List<object>();
+      try {
+        GomObject mapAreasNode = WorldResolveGomObject("mapareasdata");
+        object rawRows = WorldInteractionDataValue(mapAreasNode?.Data, "utlDatatableRows", "4611686018434320018");
+        mapAreaData.AddRange(WorldInteractionListEntries(rawRows));
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("World mapareasdata unavailable: " + ex.Message);
+      }
+      StringTable strTable = null;
+      try { strTable = currentDom.StringTable.Find("str.sys.worldmap"); } catch { }
 
-      foreach (List<object> area in mapAreaData) {
-        ulong id = ulong.Parse(area[0].ToString());
-        string name;
-
-        if ((string)area[1] != "") {
-          long nameId = long.Parse(area[1].ToString());
-          name = strTable.GetText(nameId, string.Empty);
-          if (name == "")
-            name = id.ToString();
-        } else {
-          name = id.ToString();
+      foreach (object rawArea in mapAreaData) {
+        List<object> row = WorldInteractionListEntries(rawArea);
+        if (row.Count == 0 && rawArea is List<object> directRow) row = directRow;
+        if (row.Count < 1) continue;
+        ulong id = WonkUInt64(row[0]);
+        if (id == 0) continue;
+        string name = id.ToString();
+        if (row.Count > 1 && row[1] != null && !String.IsNullOrWhiteSpace(row[1].ToString())) {
+          long nameId = WonkInt64(row[1]);
+          try {
+            string localized = strTable?.GetText(nameId, String.Empty);
+            if (!String.IsNullOrWhiteSpace(localized)) name = localized;
+          } catch { }
         }
-
         mapAreas[id] = name;
       }
 
       Dictionary<string, NodeAsset> newAssetDict = new Dictionary<string, NodeAsset>();
       worldAreaOverrides = WorldAreaNameOverrides.LoadEntries();
+      worldAreaInternalNames.Clear();
       var detectedAreaNames = new List<(ulong Id, string InternalName, string Category, string Group)>();
 
       // mapareasdata is not a complete world list: class phases, old/development maps and some newer areas are
@@ -261,6 +288,11 @@ namespace PugTools {
       var candidateIds = new HashSet<ulong>(mapAreas.Keys);
       foreach (WorldAreaCatalogEntry entry in WorldAreaCatalog.Entries) candidateIds.Add(entry.Id);
       foreach (ulong id in worldAreaOverrides.Keys) candidateIds.Add(id);
+      // RED/HE32/assets_* releases contain development and removed worlds that are not in any current map-area
+      // table/catalog. Recover those IDs only for a detected pre-64-bit client so the established Retail/64-bit
+      // world list remains unchanged.
+      if (WorldUsesLegacyContent)
+        foreach (ulong installedAreaId in DiscoverInstalledWorldAreaIds()) candidateIds.Add(installedAreaId);
 
       foreach (ulong id in candidateIds.OrderBy(x => x)) {
         WorldAreaCatalogEntry catalogEntry = WorldAreaCatalog.Entries.FirstOrDefault(x => x.Id == id);
@@ -281,6 +313,7 @@ namespace PugTools {
         string internalName = catalogEntry?.InternalName;
         if (String.IsNullOrWhiteSpace(internalName)) internalName = userEntry?.InternalName;
         if (String.IsNullOrWhiteSpace(internalName)) internalName = ReadAreaInternalName(areaFile);
+        if (!String.IsNullOrWhiteSpace(internalName)) worldAreaInternalNames[id] = internalName.Trim();
 
         string defaultCategory = catalogEntry?.Category ?? WorldAreaNameOverrides.UnassignedCategory;
         string defaultGroup = catalogEntry?.Group ?? String.Empty;
@@ -307,6 +340,58 @@ namespace PugTools {
       newAssetDict.Add("/", new NodeAsset("/", "", "Worlds", null));
       loadedAssetDict = newAssetDict;
     }
+
+    private IEnumerable<ulong> DiscoverInstalledWorldAreaIds() {
+      var result = new HashSet<ulong>();
+      if (currentAssets?.Libraries == null) return result;
+      foreach (TorArchive.Library library in currentAssets.Libraries) {
+        try { if (!library.Loaded) library.Load(); } catch { continue; }
+        foreach (TorArchive.Archive archive in library.Archives.Values) {
+          if (archive == null) continue;
+          bool sawAreaNames = false;
+          IEnumerable<HashData> namedFiles = null;
+          try { namedFiles = HashDictionaryInstance.Instance.Dictionary.EnumerateArchiveFiles(archive.StrippedFileName); }
+          catch { }
+          if (namedFiles != null) foreach (HashData named in namedFiles) {
+            int before = result.Count;
+            TryAddInstalledWorldAreaId(named?.FileName, result);
+            if (result.Count != before) sawAreaNames = true;
+          }
+
+          // Some RED/HE32 filename packs were catalogued under a different archive family.  Only for an explicitly
+          // legacy DOM, probe the global hash dictionary as a read-only name oracle.  Do this here instead of changing
+          // HashFileInfo globally: Retail/64-bit file naming and CRC semantics therefore remain completely untouched.
+          if (!sawAreaNames && WorldUsesLegacyContent) {
+            foreach (TorArchive.File file in archive.EnumerateFiles()) {
+              try {
+                HashData global = HashDictionaryInstance.Instance.Dictionary.SearchHashList(
+                  file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash);
+                if (global == null || String.IsNullOrWhiteSpace(global.FileName)) continue;
+                TryAddInstalledWorldAreaId(global.FileName, result);
+              } catch { }
+            }
+          }
+        }
+      }
+      return result;
+    }
+
+    private static void TryAddInstalledWorldAreaId(string rawPath, HashSet<ulong> result) {
+      if (result == null || String.IsNullOrWhiteSpace(rawPath)) return;
+      string path = rawPath.Replace('\\', '/').Trim().ToLowerInvariant();
+      if (!path.EndsWith("/area.dat", StringComparison.OrdinalIgnoreCase)) return;
+      string[] parts = path.Trim('/').Split('/');
+      for (int i = 0; i + 2 < parts.Length; i++) {
+        if (!String.Equals(parts[i], "world", StringComparison.OrdinalIgnoreCase)) continue;
+        int idIndex = -1;
+        if (i + 2 < parts.Length && String.Equals(parts[i + 1], "areas", StringComparison.OrdinalIgnoreCase)) idIndex = i + 2;
+        else if (i + 3 < parts.Length && String.Equals(parts[i + 1], "livecontent", StringComparison.OrdinalIgnoreCase) &&
+                 String.Equals(parts[i + 2], "systemgenerated", StringComparison.OrdinalIgnoreCase)) idIndex = i + 3;
+        if (idIndex >= 0 && idIndex < parts.Length && UInt64.TryParse(parts[idIndex], out ulong id) && id != 0) result.Add(id);
+        return;
+      }
+    }
+
 
     private void BackgroundWorker1_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e) {
       if (e.Error != null) {
@@ -459,6 +544,7 @@ namespace PugTools {
       public NodeAsset Asset;
       public WorldAreaCatalogEntry Catalog;
       public WorldAreaOverride Override;
+      public string InternalName;
       public string Category;
       public string Group;
       public int CategoryOrder;
@@ -484,20 +570,36 @@ namespace PugTools {
       if (String.IsNullOrWhiteSpace(needle)) return true;
       string q = needle.Trim();
       bool Has(string candidate) => !String.IsNullOrWhiteSpace(candidate) && candidate.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0;
-      return Has(item.Id.ToString()) || Has(item.Asset?.displayName) || Has(item.Override?.Name) || Has(item.Override?.InternalName)
+      return Has(item.Id.ToString()) || Has(item.Asset?.displayName) || Has(item.InternalName) || Has(item.Override?.Name) || Has(item.Override?.InternalName)
         || Has(item.Catalog?.InternalName) || Has(item.Catalog?.Comment) || Has(item.Category) || Has(item.Group);
     }
 
     private TreeNode CreateWorldTreeLeaf(WorldTreeEntry item) {
+      string internalName = item.InternalName;
+      string technicalLabel = item.Id.ToString();
+      if (!String.IsNullOrWhiteSpace(internalName)) technicalLabel += "  " + internalName;
+
+      // Match Jedipedia's file tree: numeric area id first, authored internal name directly beside it.
+      // Keep PugTools' friendly/localized label as a suffix where it adds information.
+      string friendly = item.Asset?.displayName ?? String.Empty;
+      if (!String.IsNullOrWhiteSpace(internalName)) {
+        string suffix = " - " + internalName;
+        if (friendly.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+          friendly = friendly.Substring(0, friendly.Length - suffix.Length).Trim();
+      }
+      if (!String.IsNullOrWhiteSpace(friendly)
+          && !String.Equals(friendly, item.Id.ToString(), StringComparison.OrdinalIgnoreCase)
+          && !String.Equals(friendly, internalName, StringComparison.OrdinalIgnoreCase))
+        technicalLabel += " — " + friendly;
+
       var node = new TreeNode {
         Name = "/" + item.Id,
-        Text = item.Asset.displayName,
+        Text = technicalLabel,
         Tag = item.Asset,
         ImageIndex = 2,
         SelectedImageIndex = 2
       };
       string comment = StripJedipediaMarkup(item.Catalog?.Comment);
-      string internalName = !String.IsNullOrWhiteSpace(item.Override?.InternalName) ? item.Override.InternalName : item.Catalog?.InternalName;
       string folder = String.IsNullOrWhiteSpace(item.Group) ? item.Category : item.Category + " / " + item.Group;
       node.ToolTipText = folder
         + (String.IsNullOrWhiteSpace(comment) ? String.Empty : Environment.NewLine + comment)
@@ -524,8 +626,10 @@ namespace PugTools {
           && String.Equals(catalog.Category, category, StringComparison.OrdinalIgnoreCase)
           && String.Equals(catalog.Group ?? String.Empty, group ?? String.Empty, StringComparison.OrdinalIgnoreCase)
             ? catalog.EntryOrder : Int32.MaxValue;
+        worldAreaInternalNames.TryGetValue(id, out string internalName);
+        if (String.IsNullOrWhiteSpace(internalName)) internalName = !String.IsNullOrWhiteSpace(userEntry?.InternalName) ? userEntry.InternalName : catalog?.InternalName;
         items.Add(new WorldTreeEntry {
-          Id = id, Asset = kvp.Value, Catalog = catalog, Override = userEntry,
+          Id = id, Asset = kvp.Value, Catalog = catalog, Override = userEntry, InternalName = internalName,
           Category = String.IsNullOrWhiteSpace(category) ? WorldAreaNameOverrides.UnassignedCategory : category,
           Group = group ?? String.Empty,
           CategoryOrder = WorldCategoryOrder(category), GroupOrder = WorldGroupOrder(category, group), EntryOrder = entryOrder
@@ -793,6 +897,13 @@ namespace PugTools {
       AddWorldDropDownToggle(visibilityMenu, "Object occlusion culling", worldSettings.EnableObjectOcclusionCulling, v => worldSettings.EnableObjectOcclusionCulling = v);
       btnWorldLayersMenu.DropDownItems.Add(visibilityMenu);
 
+      btnWorldRooms = new ToolStripMenuItem("Rooms") {
+        ToolTipText = "Show or hide individual SWTOR AREA rooms. This manual layer is independent of portal/dPVS culling."
+      };
+      KeepCheckMenuOpen(btnWorldRooms);
+      btnWorldRooms.DropDownOpening += (_, __) => RebuildWorldRoomsMenu();
+      btnWorldLayersMenu.DropDownItems.Add(btnWorldRooms);
+
       btnWorldDecorationHooks = new ToolStripMenuItem("Decoration hooks") {
         CheckOnClick = true,
         Checked = worldSettings.ShowDecorationHooks,
@@ -818,6 +929,12 @@ namespace PugTools {
         SetStatusLabel(btnWorldWalkingMode.Checked ? "Walking mode: WASD, Shift = run, Space = jump, wheel = speed" : "Free-fly camera enabled");
       };
       btnWorldNavigationMenu.DropDownItems.Add(btnWorldWalkingMode);
+      AddWorldDropDownToggle(btnWorldNavigationMenu, "Area title on room change", worldSettings.ShowRoomLocationBanner,
+        v => worldSettings.ShowRoomLocationBanner = v,
+        "Show the SWTOR-style localized area/map-page title when entering a different room. Disabled by default; if no localized area title exists, the current room name is shown.");
+      AddWorldDropDownToggle(btnWorldNavigationMenu, "Use room names instead of map names", worldSettings.UseRoomNamesForLocationBanner,
+        v => worldSettings.UseRoomNamesForLocationBanner = v,
+        "Use the technical name from the current .room file for the location banner. In this mode every room-name change is announced, even when several rooms belong to the same SWTOR map area.");
       InitializeTaxiRoutesMenu();
       InitializeSpaceFlypathMenu();
       var fit = new ToolStripMenuItem("Fit area");
@@ -914,6 +1031,102 @@ namespace PugTools {
       worldToolbar.BringToFront();
       LayoutWorldRenderPanel();
       splitContainer3.Panel1.Resize += (_, __) => LayoutWorldRenderPanel();
+    }
+
+    private void RebuildWorldRoomsMenu() {
+      if (btnWorldRooms == null) return;
+      foreach (ToolStripItem old in btnWorldRooms.DropDownItems.Cast<ToolStripItem>().ToArray()) old.Dispose();
+      btnWorldRooms.DropDownItems.Clear();
+
+      List<string> names = area?.RoomList == null
+        ? new List<string>()
+        : area.RoomList.Where(r => r != null && !String.IsNullOrWhiteSpace(r.RoomName))
+            .Select(r => r.RoomName.Trim()).Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+      if (names.Count == 0 || panelRender == null) {
+        btnWorldRooms.Text = "Rooms";
+        btnWorldRooms.DropDownItems.Add(new ToolStripMenuItem("(load an area first)") { Enabled = false });
+        return;
+      }
+
+      int visibleCount = names.Count(x => panelRender.IsRoomManuallyVisible(x));
+      btnWorldRooms.Text = visibleCount == names.Count ? "Rooms" : "Rooms (" + visibleCount + "/" + names.Count + ")";
+
+      var filterLabel = new ToolStripLabel("Filter rooms:");
+      var filterBox = new ToolStripTextBox {
+        AutoSize = false,
+        Width = 300,
+        Text = worldRoomFilterText ?? String.Empty,
+        ToolTipText = "Live substring filter. Matches anywhere inside the room name."
+      };
+      filterBox.TextBox.Enter += (_, __) => { worldTextInputActive = true; worldRenderInputActive = false; };
+      filterBox.TextBox.Leave += (_, __) => worldTextInputActive = false;
+      btnWorldRooms.DropDownItems.Add(filterLabel);
+      btnWorldRooms.DropDownItems.Add(filterBox);
+      btnWorldRooms.DropDownItems.Add(new ToolStripSeparator());
+
+      var showAll = new ToolStripMenuItem("Show all rooms");
+      showAll.Click += (_, __) => {
+        panelRender?.SetAllRoomsManuallyVisible(true);
+        updatingWorldToolbar = true;
+        try { foreach (ToolStripMenuItem roomItem in btnWorldRooms.DropDownItems.OfType<ToolStripMenuItem>().Where(x => x.Tag is string)) roomItem.Checked = true; }
+        finally { updatingWorldToolbar = false; }
+        btnWorldRooms.Text = "Rooms";
+        InvalidateMiniMapSnapshot();
+      };
+      var hideAll = new ToolStripMenuItem("Hide all rooms");
+      hideAll.Click += (_, __) => {
+        panelRender?.SetAllRoomsManuallyVisible(false);
+        updatingWorldToolbar = true;
+        try { foreach (ToolStripMenuItem roomItem in btnWorldRooms.DropDownItems.OfType<ToolStripMenuItem>().Where(x => x.Tag is string)) roomItem.Checked = false; }
+        finally { updatingWorldToolbar = false; }
+        btnWorldRooms.Text = "Rooms (0/" + names.Count + ")";
+        InvalidateMiniMapSnapshot();
+      };
+      btnWorldRooms.DropDownItems.Add(showAll);
+      btnWorldRooms.DropDownItems.Add(hideAll);
+      btnWorldRooms.DropDownItems.Add(new ToolStripSeparator());
+
+      var roomItems = new List<ToolStripMenuItem>(names.Count);
+      foreach (string roomName in names) {
+        string captured = roomName;
+        var item = new ToolStripMenuItem(captured) {
+          CheckOnClick = true,
+          Checked = panelRender.IsRoomManuallyVisible(captured),
+          Tag = captured,
+          ToolTipText = "Toggle every renderable object owned by this AREA room."
+        };
+        item.CheckedChanged += (_, __) => {
+          if (updatingWorldToolbar || panelRender == null) return;
+          panelRender.SetRoomManuallyVisible(captured, item.Checked);
+          int nowVisible = names.Count(x => panelRender.IsRoomManuallyVisible(x));
+          btnWorldRooms.Text = nowVisible == names.Count ? "Rooms" : "Rooms (" + nowVisible + "/" + names.Count + ")";
+          InvalidateMiniMapSnapshot();
+        };
+        roomItems.Add(item);
+        btnWorldRooms.DropDownItems.Add(item);
+      }
+
+      void ApplyRoomFilter() {
+        string query = (filterBox.Text ?? String.Empty).Trim();
+        int matches = 0;
+        foreach (ToolStripMenuItem item in roomItems) {
+          string roomName = item.Tag as string ?? item.Text ?? String.Empty;
+          bool match = query.Length == 0 || roomName.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0;
+          item.Visible = match;
+          if (match) matches++;
+        }
+        filterLabel.Text = query.Length == 0 ? "Filter rooms:" : "Filter rooms (" + matches + "/" + names.Count + "):";
+      }
+      filterBox.TextChanged += (_, __) => { worldRoomFilterText = filterBox.Text ?? String.Empty; ApplyRoomFilter(); };
+      ApplyRoomFilter();
+      filterBox.KeyDown += (_, e) => {
+        if (e.KeyCode == Keys.Escape && !String.IsNullOrEmpty(filterBox.Text)) {
+          filterBox.Text = String.Empty;
+          e.Handled = true;
+          e.SuppressKeyPress = true;
+        }
+      };
     }
 
     private ToolStripMenuItem AddWorldDropDownToggle(ToolStripDropDownItem menu, string text, bool initialValue, Action<bool> setter, string tooltip = null) {
@@ -1111,9 +1324,9 @@ namespace PugTools {
         // convenient on German/European systems (for example: 123,4; 567,8; 9,1).
         string[] parts = raw.IndexOf(';') >= 0
           ? raw.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
-          : raw.IndexOf(',') >= 0
-            ? raw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
-            : raw.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+          // Current Jedipedia accepts commas, whitespace, or any mixture. Preserve semicolon handling above for
+          // decimal-comma locales, then make pasted coordinate readouts equally forgiving here.
+          : raw.Split(new[] { ',', ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length != 2 && parts.Length != 3) {
           MessageBox.Show(dialog, "Enter X, Y or X, Y, Z. Semicolons may be used with decimal commas.", "Teleport", MessageBoxButtons.OK, MessageBoxIcon.Warning);
           input.Focus(); input.SelectAll(); return false;
@@ -1695,6 +1908,21 @@ namespace PugTools {
       var result = new List<object>();
       if (raw == null) return result;
       if (raw is string) { result.Add(raw); return result; }
+      if (raw is GomObjectData gomList) {
+        // RED/HE32 serializes many GOM arrays as anonymous object-data maps instead of IDictionary. Preserve the
+        // same authored index order as the retail branch below; the modern representation is otherwise untouched.
+        var indexed = new List<Tuple<long, int, object>>();
+        int sequence = 0;
+        foreach (KeyValuePair<string, object> entry in gomList.Dictionary) {
+          string key = entry.Key ?? String.Empty;
+          if (String.Equals(key, "_count", StringComparison.OrdinalIgnoreCase)) { sequence++; continue; }
+          long index;
+          bool numeric = Int64.TryParse(key, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out index);
+          indexed.Add(Tuple.Create(numeric ? index : Int64.MaxValue, sequence++, entry.Value));
+        }
+        foreach (Tuple<long, int, object> item in indexed.OrderBy(x => x.Item1).ThenBy(x => x.Item2)) result.Add(item.Item3);
+        return result;
+      }
       if (raw is System.Collections.IDictionary dictionary) {
         // GOM lists are commonly exposed as an index-keyed dictionary plus an optional _count member. Preserve the
         // authored list order explicitly; IDictionary enumeration order is not a format guarantee and older .NET
@@ -1751,20 +1979,20 @@ namespace PugTools {
     private GomObject FindWonkPackagesPrototype() {
       if (currentDom == null) return null;
       try {
-        GomObject direct = currentDom.GetObject("wnkPackagesPrototype");
+        GomObject direct = WorldResolveGomObject("wnkPackagesPrototype");
         if (direct?.Data != null && WonkDataValue(direct.Data, "wnkPackages", "4611686061108531209") != null) return direct;
       } catch { }
 
       // Client revisions have moved/aliased a few prototype object names. The field stable ID has not changed, so
       // resolve by content as a fallback instead of silently dropping to the duplicated map-note button labels.
       try {
-        IEnumerable<string> names = currentDom.GetAllInstanceNames().Keys;
+        IEnumerable<string> names = WorldKnownPrototypeNames();
         foreach (string name in names.Where(x => !String.IsNullOrWhiteSpace(x) &&
           (x.IndexOf("wnk", StringComparison.OrdinalIgnoreCase) >= 0 ||
            x.IndexOf("wonka", StringComparison.OrdinalIgnoreCase) >= 0 ||
            x.IndexOf("elev", StringComparison.OrdinalIgnoreCase) >= 0))) {
           try {
-            GomObject candidate = currentDom.GetObject(name);
+            GomObject candidate = WorldResolveGomObject(name);
             if (candidate?.Data != null && WonkDataValue(candidate.Data, "wnkPackages", "4611686061108531209") != null) return candidate;
           } catch { }
         }
@@ -1912,7 +2140,7 @@ namespace PugTools {
         packageId = placeable?.WonkaPackageId ?? 0;
       } catch { }
       if (packageId == 0) {
-        try { packageId = WonkInt64(currentDom.GetObject(selectedFqn)?.Data.ValueOrDefault<object>("wnkPackageID", null)); } catch { }
+        try { packageId = WonkInt64(WorldInteractionDataValue(WorldResolveGomObject(selectedFqn)?.Data, "wnkPackageID", "4611686061108531204")); } catch { }
       }
       if (packageId == 0) return false;
 
@@ -1939,6 +2167,13 @@ namespace PugTools {
             packageId = resolved?.WonkaPackageId ?? 0;
             if (packageId != 0) break;
           } catch { }
+          if (packageId == 0 && WorldUsesLegacyContent) {
+            try {
+              GomObject rawNote = WorldResolveGomObject(candidate);
+              packageId = WonkInt64(WorldInteractionDataValue(rawNote?.Data, "mpnMetadataInt", "4611686226320720002"));
+              if (packageId != 0) break;
+            } catch { }
+          }
         }
       }
       if (packageId == 0 && worldSpnPlacements != null) {
@@ -2556,6 +2791,11 @@ namespace PugTools {
         TextAlign = ContentAlignment.MiddleLeft,
         ToolTipText = "Current SWTOR phs phase (INSTANCE_REGION or implicit area phase)"
       };
+      toolStripShipDestinationStatus = new ToolStripDropDownButton("Ship: --") {
+        Visible = false,
+        ToolTipText = "Choose what is visible through the ship cockpit/window (Jedipedia shipVfx)."
+      };
+      toolStripShipDestinationStatus.DropDownOpening += (_, __) => RebuildShipDestinationMenu();
       toolStripPerfStatus = new ToolStripStatusLabel("FPS: --   Occ S/D: 0/0") {
         Spring = false,
         Visible = btnWorldStats?.Checked == true,
@@ -2569,8 +2809,9 @@ namespace PugTools {
       int insertIndex = Math.Max(0, statusStrip1.Items.Count - 1);
       statusStrip1.Items.Insert(insertIndex, toolStripPositionStatus);
       statusStrip1.Items.Insert(insertIndex + 1, toolStripPhaseStatus);
-      statusStrip1.Items.Insert(insertIndex + 2, toolStripPerfStatus);
-      statusStrip1.Items.Insert(insertIndex + 3, toolStripRoomStatus);
+      statusStrip1.Items.Insert(insertIndex + 2, toolStripShipDestinationStatus);
+      statusStrip1.Items.Insert(insertIndex + 3, toolStripPerfStatus);
+      statusStrip1.Items.Insert(insertIndex + 4, toolStripRoomStatus);
 
       phaseBannerLabel = new Label {
         AutoSize = true,
@@ -2595,6 +2836,7 @@ namespace PugTools {
         Vector3 position = panelRender?.CurrentDisplayPosition ?? new Vector3();
         toolStripPositionStatus.Text = string.Format(System.Globalization.CultureInfo.InvariantCulture, "Position: {0:0}, {1:0}, {2:0}", position.X, position.Y, position.Z);
         toolStripPhaseStatus.Text = "Phase: " + (String.IsNullOrWhiteSpace(phase) ? "none" : phase);
+        RefreshShipDestinationStatus();
         if (toolStripPerfStatus != null && toolStripPerfStatus.Visible) toolStripPerfStatus.Text = panelRender?.CurrentRenderStats ?? "FPS: --   Occ S/D: 0/0";
         if (btnWorldSelectedObject?.Enabled == true && String.IsNullOrWhiteSpace(panelRender?.SelectedWorldModelSummary)) UpdateWorldSelectedObjectMenu();
         toolStripRoomStatus.Text = "Current room: " + room;
@@ -2603,10 +2845,44 @@ namespace PugTools {
         UpdateSpaceCombatEncounterTimeline();
         if (miniMapPanel != null && miniMapPanel.Visible) {
           if(panelRender?.MiniMapNeedsAutoScopeRefresh()==true) RefreshMiniMapForCamera();
+          FollowMiniMapPlayer();
           miniMapPicture?.Invalidate();
         }
       };
       worldOverlayTimer.Start();
+    }
+
+    private void RefreshShipDestinationStatus(View_AREA.WorldShipVfxStatus status = null) {
+      if (toolStripShipDestinationStatus == null) return;
+      status ??= panelRender?.GetShipVfxStatus(false);
+      if (status == null) { toolStripShipDestinationStatus.Visible = false; return; }
+      toolStripShipDestinationStatus.Visible = !worldInterfaceHidden;
+      toolStripShipDestinationStatus.Enabled = !status.Jumping;
+      string label = status.Jumping ? "Traveling…" : (!String.IsNullOrWhiteSpace(status.Label) ? status.Label : "Off");
+      toolStripShipDestinationStatus.Text = "Ship: " + label;
+    }
+
+    private void RebuildShipDestinationMenu() {
+      if (toolStripShipDestinationStatus == null) return;
+      View_AREA.WorldShipVfxStatus status = panelRender?.GetShipVfxStatus(true);
+      toolStripShipDestinationStatus.DropDownItems.Clear();
+      if (status == null) return;
+      void AddDestination(string place, string label) {
+        var item = new ToolStripMenuItem(String.IsNullOrWhiteSpace(label) ? (String.IsNullOrWhiteSpace(place) ? "Off" : place) : label) {
+          Checked = String.Equals(status.Place ?? String.Empty, place ?? String.Empty, StringComparison.OrdinalIgnoreCase),
+          CheckOnClick = false,
+          Tag = place ?? String.Empty
+        };
+        item.Click += (_, __) => {
+          View_AREA.WorldShipVfxStatus changed = panelRender?.SelectShipVfxDestination(item.Tag as string ?? String.Empty);
+          RefreshShipDestinationStatus(changed);
+        };
+        toolStripShipDestinationStatus.DropDownItems.Add(item);
+      }
+      AddDestination(String.Empty, String.IsNullOrWhiteSpace(status.OffLabel) ? "Off" : status.OffLabel);
+      if (status.Places.Count > 0) toolStripShipDestinationStatus.DropDownItems.Add(new ToolStripSeparator());
+      foreach (View_AREA.WorldShipVfxDestination destination in status.Places)
+        if (destination != null && !String.IsNullOrWhiteSpace(destination.Place)) AddDestination(destination.Place, destination.Label);
     }
 
     private void UpdatePhaseBanner(string phase) {
@@ -2707,10 +2983,28 @@ namespace PugTools {
         catch { bitmap.Dispose(); }
         return;
       }
+      bool hadImage = miniMapImage != null;
+      float previousZoom = miniMapZoom;
+      bool restoringFollowView = miniMapFollowRestoreView;
       miniMapImage?.Dispose();
       miniMapImage = bitmap;
+      miniMapFollowRefreshPending = false;
+      // A forced full-extent refresh is attempted only once for the current page. A normal page/scope snapshot clears
+      // the flag again, so malformed/incomplete area bounds cannot cause an endless render-refresh loop.
+      miniMapFollowFullExtentActive = restoringFollowView;
       miniMapMinX = minX; miniMapMaxX = maxX; miniMapMinZ = minZ; miniMapMaxZ = maxZ;
-      miniMapZoom = 1f; miniMapCenterX = (minX + maxX) * .5f; miniMapCenterZ = (minZ + maxZ) * .5f;
+      miniMapZoom = restoringFollowView
+        ? Math.Max(1f, Math.Min(MiniMapMaxZoom, miniMapFollowRestoreZoom))
+        : (hadImage ? Math.Max(1f, Math.Min(MiniMapMaxZoom, previousZoom)) : MiniMapDefaultFollowZoom);
+      miniMapCenterX = (minX + maxX) * .5f; miniMapCenterZ = (minZ + maxZ) * .5f;
+      if (panelRender != null) {
+        panelRender.GetMapPose(out float playerX, out float playerZ, out _, out _);
+        if (Single.IsFinite(playerX) && Single.IsFinite(playerZ)) {
+          miniMapCenterX = playerX; miniMapCenterZ = playerZ;
+          MiniMapVisibleWorldBounds(out _, out _, out _, out _);
+        }
+      }
+      miniMapFollowRestoreView = false;
       UpdateMiniMapTitle();
       RefreshMiniMapModeControls();
       ResizeMiniMapToImageAspect();
@@ -2749,8 +3043,9 @@ namespace PugTools {
       float zoom = Math.Max(1f, Math.Min(MiniMapMaxZoom, miniMapZoom));
       float visibleW = fullW / zoom, visibleH = fullH / zoom;
       float halfW = visibleW * .5f, halfH = visibleH * .5f;
-      miniMapCenterX = Math.Max(miniMapMinX + halfW, Math.Min(miniMapMaxX - halfW, miniMapCenterX));
-      miniMapCenterZ = Math.Max(miniMapMinZ + halfH, Math.Min(miniMapMaxZ - halfH, miniMapCenterZ));
+      // Do not clamp the minimap centre to the cached page bounds.  The player marker is supposed to stay in the
+      // exact centre even at an authored map edge.  Painting clips the backing bitmap to the available source area
+      // and leaves the uncovered part as the normal minimap background until a neighbouring/expanded page arrives.
       minX = miniMapCenterX - halfW; maxX = miniMapCenterX + halfW;
       minZ = miniMapCenterZ - halfH; maxZ = miniMapCenterZ + halfH;
     }
@@ -2764,6 +3059,58 @@ namespace PugTools {
       float w = (maxX - minX) / fullW * miniMapImage.Width;
       float h = (maxZ - minZ) / fullH * miniMapImage.Height;
       return new RectangleF(x, y, Math.Max(1f, w), Math.Max(1f, h));
+    }
+
+
+    private void DrawMiniMapBackingImage(Graphics graphics, Rectangle destination, RectangleF requestedSource) {
+      if (graphics == null || miniMapImage == null || destination.IsEmpty) return;
+      if (requestedSource.IsEmpty) { graphics.DrawImage(miniMapImage, destination); return; }
+
+      RectangleF imageBounds = new RectangleF(0f, 0f, miniMapImage.Width, miniMapImage.Height);
+      RectangleF clippedSource = RectangleF.Intersect(requestedSource, imageBounds);
+      if (clippedSource.Width <= 0f || clippedSource.Height <= 0f) return;
+
+      float scaleX = destination.Width / Math.Max(.0001f, requestedSource.Width);
+      float scaleY = destination.Height / Math.Max(.0001f, requestedSource.Height);
+      RectangleF clippedDestination = new RectangleF(
+        destination.Left + (clippedSource.Left - requestedSource.Left) * scaleX,
+        destination.Top + (clippedSource.Top - requestedSource.Top) * scaleY,
+        clippedSource.Width * scaleX,
+        clippedSource.Height * scaleY);
+      graphics.DrawImage(miniMapImage, clippedDestination, clippedSource, GraphicsUnit.Pixel);
+    }
+
+    // Keep the player in the exact centre of the minimap, matching the in-game behaviour.  A drag may temporarily
+    // move the view while the mouse button is held, but following resumes on the first overlay tick after release.
+    private void FollowMiniMapPlayer() {
+      if (miniMapImage == null || panelRender == null || miniMapPanning ||
+          miniMapMaxX <= miniMapMinX || miniMapMaxZ <= miniMapMinZ) return;
+
+      panelRender.GetMapPose(out float playerX, out float playerZ, out _, out _);
+      if (!Single.IsFinite(playerX) || !Single.IsFinite(playerZ)) return;
+
+      // Recenter before doing any cache/page work, so even the frame which triggers an expanded backing snapshot
+      // keeps the marker in the exact middle instead of drifting to the edge while the new image is rendered.
+      miniMapCenterX = playerX;
+      miniMapCenterZ = playerZ;
+
+      // The generated world-map backing image can use PugTools' smart-cropped main-area extent. If the player walks
+      // beyond that crop while no authored child map becomes active, request one full-area backing snapshot once.
+      // If that expanded page still does not cover the position, keep following anyway and simply show background
+      // outside the cached art instead of letting the player marker leave the centre.
+      if (panelRender.MiniMapIsWorldScope &&
+          (playerX < miniMapMinX || playerX > miniMapMaxX || playerZ < miniMapMinZ || playerZ > miniMapMaxZ) &&
+          !miniMapFollowFullExtentActive) {
+        if (!miniMapFollowRefreshPending) {
+          miniMapFollowRefreshPending = true;
+          miniMapFollowRestoreView = true;
+          miniMapFollowRestoreZoom = miniMapZoom;
+          miniMapTitle.Text = "Minimap — rendering…";
+          panelRender.RequestMiniMapSnapshot(true, true);
+        }
+        return;
+      }
+
     }
 
     private void UpdateMiniMapTitle() {
@@ -2786,8 +3133,14 @@ namespace PugTools {
       miniMapZoom = Math.Max(1f, Math.Min(MiniMapMaxZoom, miniMapZoom * (float)Math.Pow(1.25, notch)));
       float fullW = miniMapMaxX - miniMapMinX, fullH = miniMapMaxZ - miniMapMinZ;
       float newW = fullW / miniMapZoom, newH = fullH / miniMapZoom;
-      miniMapCenterX = anchorX - (u - .5f) * newW;
-      miniMapCenterZ = anchorZ - (v - .5f) * newH;
+      if (panelRender != null) {
+        panelRender.GetMapPose(out float playerX, out float playerZ, out _, out _);
+        if (Single.IsFinite(playerX) && Single.IsFinite(playerZ)) { miniMapCenterX = playerX; miniMapCenterZ = playerZ; }
+        else { miniMapCenterX = anchorX - (u - .5f) * newW; miniMapCenterZ = anchorZ - (v - .5f) * newH; }
+      } else {
+        miniMapCenterX = anchorX - (u - .5f) * newW;
+        miniMapCenterZ = anchorZ - (v - .5f) * newH;
+      }
       MiniMapVisibleWorldBounds(out _, out _, out _, out _);
       UpdateMiniMapTitle();
       miniMapPicture.Invalidate();
@@ -2804,7 +3157,7 @@ namespace PugTools {
         return;
       }
       RectangleF src = MiniMapSourceRectangle();
-      if (src.IsEmpty) e.Graphics.DrawImage(miniMapImage, dst); else e.Graphics.DrawImage(miniMapImage, dst, src, GraphicsUnit.Pixel);
+      DrawMiniMapBackingImage(e.Graphics, dst, src);
       if (panelRender == null || miniMapMaxX <= miniMapMinX || miniMapMaxZ <= miniMapMinZ) return;
       MiniMapVisibleWorldBounds(out float visibleMinX, out float visibleMaxX, out float visibleMinZ, out float visibleMaxZ);
 
@@ -2905,19 +3258,6 @@ namespace PugTools {
       return null;
     }
 
-    private static bool WorldMapIconNeedsHorizontalFlip(string iconName) {
-      string fileName = WorldMapIconFileName(iconName);
-      if (String.IsNullOrWhiteSpace(fileName)) return false;
-      // Bundled SWTOR/Jedipedia icons already have the authored orientation. The newer service/filter icons are
-      // generated locally and need one horizontal correction in screen space.
-      switch (fileName.ToLowerInvariant()) {
-        case "mpn-explorationquest.png": case "mpn-vendor.png": case "mpn-crewtrainer.png": case "mpn-classtrainer.png":
-        case "mpn-resource.png": case "mpn-mailbox.png": case "mpn-enhancement.png": case "mpn-guildbank.png":
-        case "mpn-bank.png": case "mpn-auction.png": case "mpn-missionboard.png": case "mpn-default.png": return true;
-        default: return false;
-      }
-    }
-
     private Image GetWorldMapIcon(string iconName) {
       return GetWorldMapIconFile(WorldMapIconFileName(iconName));
     }
@@ -2957,15 +3297,6 @@ namespace PugTools {
         try {
           graphics.TranslateTransform(centerX, centerY);
           graphics.RotateTransform(-note.Rotation.Y);
-          graphics.DrawImage(icon, -icon.Width * .5f, -icon.Height * .5f, icon.Width, icon.Height);
-        } finally { graphics.Restore(state); }
-        return;
-      }
-      if (WorldMapIconNeedsHorizontalFlip(note.Icon)) {
-        System.Drawing.Drawing2D.GraphicsState state = graphics.Save();
-        try {
-          graphics.TranslateTransform(centerX, centerY);
-          graphics.ScaleTransform(-1f, 1f);
           graphics.DrawImage(icon, -icon.Width * .5f, -icon.Height * .5f, icon.Width, icon.Height);
         } finally { graphics.Restore(state); }
         return;
@@ -3127,6 +3458,8 @@ namespace PugTools {
       if (e.Button != MouseButtons.Left) return;
       miniMapPanning = false;
       if (miniMapPicture != null) miniMapPicture.Capture = false;
+      FollowMiniMapPlayer();
+      miniMapPicture?.Invalidate();
     }
 
     private void MiniMapPicture_MouseClick(object sender, MouseEventArgs e) {
@@ -3545,34 +3878,78 @@ namespace PugTools {
     }
     */
 
+    private static List<float> WorldFloatVector(object raw) {
+      var result = new List<float>();
+      foreach (object value in WorldInteractionListEntries(raw)) {
+        try { result.Add(Convert.ToSingle(value, System.Globalization.CultureInfo.InvariantCulture)); }
+        catch { }
+      }
+      return result;
+    }
+
     private void LoadWorldMapPages(FileFormats.Area targetArea, ulong areaId) {
       if (targetArea == null || currentDom == null) return;
       try {
-        GomObject mapDataObj = currentDom.GetObject("world.areas." + areaId + ".mapdata");
-        List<object> pages = mapDataObj?.Data.ValueOrDefault<List<object>>("mapDataContainerMapDataList", null);
-        if (pages == null) return;
-        foreach (GomObjectData page in pages.OfType<GomObjectData>()) {
-          string mapName = page.ValueOrDefault<string>("mapName", null);
-          if (string.IsNullOrWhiteSpace(mapName)) continue;
-          List<float> min = page.ValueOrDefault<List<float>>("mapPageMinCoord", null);
-          List<float> max = page.ValueOrDefault<List<float>>("mapPageMaxCoord", null);
-          if (min == null || min.Count < 3 || max == null || max.Count < 3) continue;
-          List<float> miniMin = page.ValueOrDefault<List<float>>("mapPageMiniMinCoord", null);
-          List<float> miniMax = page.ValueOrDefault<List<float>>("mapPageMiniMaxCoord", null);
-          string mapPrefix = areaId == 36268000006UL || areaId == 3758002374UL ? "livecontent/systemgenerated" : "areas";
-          string image = "/resources/world/" + mapPrefix + "/" + areaId + "/" + mapName + "_r.dds";
-          using File imageFile = currentAssets.FindFile(image);
+        // In RED/HE32 the prototype is often present by id but absent from the GOM name lookup.  Resolve the
+        // deterministic FQN fold and read fields by both modern name and numeric field id.
+        GomObject mapDataObj = WorldResolveGomObject("world.areas." + areaId + ".mapdata");
+        if (mapDataObj == null) return;
+        object rawPages = WorldInteractionDataValue(mapDataObj.Data, "mapDataContainerMapDataList", "4611686042955270002");
+        List<object> pages = WorldInteractionListEntries(rawPages);
+        if (pages.Count == 0) return;
+
+        foreach (object rawPage in pages) {
+          GomObjectData page = WorldInteractionObjectData(rawPage);
+          if (page == null) continue;
+          string mapName = WorldInteractionText(WorldInteractionDataValue(page, "mapName", "4611686020073980011"));
+          if (String.IsNullOrWhiteSpace(mapName)) continue;
+          List<float> min = WorldFloatVector(WorldInteractionDataValue(page, "mapPageMinCoord", "4611686020073980015"));
+          List<float> max = WorldFloatVector(WorldInteractionDataValue(page, "mapPageMaxCoord", "4611686020073980016"));
+          if (min.Count < 3 || max.Count < 3) continue;
+          List<float> miniMin = WorldFloatVector(WorldInteractionDataValue(page, "mapPageMiniMinCoord", "4611686035821970007"));
+          List<float> miniMax = WorldFloatVector(WorldInteractionDataValue(page, "mapPageMiniMaxCoord", "4611686035821970006"));
+
+          // Preserve the existing 64-bit path preference first (including its two systemgenerated exceptions), then
+          // add the alternate location and the pre-release unsuffixed DDS as fallbacks for 32-bit/Beta clients.
+          bool retailSystemGenerated = areaId == 36268000006UL || areaId == 3758002374UL;
+          string preferredPrefix = retailSystemGenerated ? "livecontent/systemgenerated" : "areas";
+          string alternatePrefix = retailSystemGenerated ? "areas" : "livecontent/systemgenerated";
+          string[] imageCandidates = {
+            "/resources/world/" + preferredPrefix + "/" + areaId + "/" + mapName + "_r.dds",
+            "/resources/world/" + alternatePrefix + "/" + areaId + "/" + mapName + "_r.dds",
+            "/resources/world/" + preferredPrefix + "/" + areaId + "/" + mapName + ".dds",
+            "/resources/world/" + alternatePrefix + "/" + areaId + "/" + mapName + ".dds"
+          };
+          string image = imageCandidates[0];
+          bool hasImage = false;
+          foreach (string candidate in imageCandidates) {
+            using File imageFile = currentAssets.FindFile(candidate);
+            if (imageFile == null) continue;
+            image = candidate;
+            hasImage = true;
+            break;
+          }
+
+          long pageGuid = WonkInt64(WorldInteractionDataValue(page, "mapPageGUID", "4611686020668180062"));
+          string pageDisplayName = null;
+          try {
+            StringTable worldMapStrings = currentDom.StringTable.Find("str.sys.worldmap");
+            string localized = worldMapStrings?.GetText(pageGuid, "MapPage." + mapName);
+            if (!String.IsNullOrWhiteSpace(localized)) pageDisplayName = localized.Trim();
+          } catch { }
+
           targetArea.MapPages.Add(new AreaMapPage {
-            Guid = page.ValueOrDefault<long>("mapPageGUID", 0),
-            SId = page.ValueOrDefault<long>("mapNameSId", 0),
-            ParentId = page.ValueOrDefault<long>("mapParentNameSId", 0),
+            Guid = pageGuid,
+            SId = WonkInt64(WorldInteractionDataValue(page, "mapNameSId", "4611686141823655043")),
+            ParentId = WonkInt64(WorldInteractionDataValue(page, "mapParentNameSId", "4611686141823655046")),
             MapName = mapName,
+            DisplayName = pageDisplayName,
             ImagePath = image,
-            HasImage = imageFile != null,
+            HasImage = hasImage,
             Min = new SlimDX.Vector3(min[0], min[1], min[2]),
             Max = new SlimDX.Vector3(max[0], max[1], max[2]),
-            MiniMapMin = miniMin != null && miniMin.Count >= 3 ? new SlimDX.Vector2(miniMin[0], miniMin[2]) : new SlimDX.Vector2(min[0], min[2]),
-            MiniMapMax = miniMax != null && miniMax.Count >= 3 ? new SlimDX.Vector2(miniMax[0], miniMax[2]) : new SlimDX.Vector2(max[0], max[2])
+            MiniMapMin = miniMin.Count >= 3 ? new SlimDX.Vector2(miniMin[0], miniMin[2]) : new SlimDX.Vector2(min[0], min[2]),
+            MiniMapMax = miniMax.Count >= 3 ? new SlimDX.Vector2(miniMax[0], miniMax[2]) : new SlimDX.Vector2(max[0], max[2])
           });
         }
       } catch (Exception ex) {
@@ -3622,34 +3999,88 @@ namespace PugTools {
     }
 
     private void EnrichWorldMapNotes() {
-      if (area?.MapNotes == null || area.MapNotes.Count == 0 || currentDom?.MapNoteLoader == null) return;
+      if (area?.MapNotes == null || area.MapNotes.Count == 0 || currentDom == null) return;
       foreach (AreaMapNote note in area.MapNotes) {
         if (note == null || String.IsNullOrWhiteSpace(note.Fqn)) continue;
         GomLib.Models.MapNote resolved = null;
+        GomObject rawNode = null;
         string fqn = note.Fqn.Trim().Trim('.');
         foreach (string candidate in new[] {
           fqn,
           fqn.StartsWith("mpn.", StringComparison.OrdinalIgnoreCase) ? fqn : "mpn." + fqn
         }.Distinct(StringComparer.OrdinalIgnoreCase)) {
           try {
-            resolved = currentDom.MapNoteLoader.Load(candidate);
+            resolved = currentDom.MapNoteLoader?.Load(candidate);
             if (resolved != null) break;
           } catch { }
+          try {
+            rawNode = WorldResolveGomObject(candidate);
+            if (rawNode != null) {
+              resolved = currentDom.MapNoteLoader?.Load(rawNode);
+              if (resolved != null) break;
+            }
+          } catch { }
         }
-        if (resolved == null) continue;
-        if (!String.IsNullOrWhiteSpace(resolved.Icon)) note.Icon = resolved.Icon.Trim();
-        if (!String.IsNullOrWhiteSpace(resolved.Name)) note.Label = resolved.Name.Trim();
-        note.LocalizedName = resolved.LocalizedName == null ? null : new Dictionary<string, string>(resolved.LocalizedName, StringComparer.OrdinalIgnoreCase);
-        note.Condition = resolved.Condition.ToString();
-        note.WonkaPackageId = resolved.WonkaPackageId;
-        note.WonkaDestinationId = resolved.WonkaDestinationId;
-        note.AssetId = resolved.AssetID;
-        if (resolved.MapLink != null) {
-          note.MapLinkAreaId = resolved.MapLink.AreaId;
-          note.MapLinkMapNameSId = resolved.MapLink.MapNameSId;
-          note.MapLinkSubmapNameSId = resolved.MapLink.SubmapNameSId;
+
+        if (rawNode == null) {
+          string candidate = fqn.StartsWith("mpn.", StringComparison.OrdinalIgnoreCase) ? fqn : "mpn." + fqn;
+          rawNode = WorldResolveGomObject(candidate);
         }
-        EnrichWorldMapNoteQuestInfo(note, resolved);
+
+        if (resolved != null) {
+          if (!String.IsNullOrWhiteSpace(resolved.Icon)) note.Icon = resolved.Icon.Trim();
+          if (!String.IsNullOrWhiteSpace(resolved.Name)) note.Label = resolved.Name.Trim();
+          note.LocalizedName = resolved.LocalizedName == null ? null : new Dictionary<string, string>(resolved.LocalizedName, StringComparer.OrdinalIgnoreCase);
+          note.Condition = resolved.Condition.ToString();
+          note.WonkaPackageId = resolved.WonkaPackageId;
+          note.WonkaDestinationId = resolved.WonkaDestinationId;
+          note.AssetId = resolved.AssetID;
+          if (resolved.MapLink != null) {
+            note.MapLinkAreaId = resolved.MapLink.AreaId;
+            note.MapLinkMapNameSId = resolved.MapLink.MapNameSId;
+            note.MapLinkSubmapNameSId = resolved.MapLink.SubmapNameSId;
+          }
+          EnrichWorldMapNoteQuestInfo(note, resolved);
+        }
+
+        // MapNoteLoader was written around the modern class shape. Keep a raw numeric-field pass behind it only for
+        // detected pre-64-bit content so the established Retail/64-bit enrichment path stays byte-for-byte in control.
+        if (WorldUsesLegacyContent && rawNode != null) EnrichWorldMapNoteLegacyRaw(note, rawNode);
+      }
+    }
+
+    private void EnrichWorldMapNoteLegacyRaw(AreaMapNote note, GomObject node) {
+      if (note == null || node?.Data == null) return;
+      try {
+        string icon = WorldInteractionText(WorldInteractionDataValue(node.Data, "mpnIconAsset", "4611686041936871466"));
+        if (!String.IsNullOrWhiteSpace(icon)) note.Icon = icon.Trim();
+        long assetId = WonkInt64(WorldInteractionDataValue(node.Data, "mpnAssetID", "4611686058671931193"));
+        if (assetId != 0) note.AssetId = assetId;
+        long packageId = WonkInt64(WorldInteractionDataValue(node.Data, "mpnMetadataInt", "4611686226320720002"));
+        if (packageId != 0) note.WonkaPackageId = packageId;
+        ulong destinationId = WonkUInt64(WorldInteractionDataValue(node.Data, "mpnMetadataID", "4611686226320720003"));
+        if (destinationId != 0) note.WonkaDestinationId = destinationId;
+        object condition = WorldInteractionDataValue(node.Data, "mpnConditionEType", "4611686078179865199");
+        if (condition != null && String.IsNullOrWhiteSpace(note.Condition)) note.Condition = condition.ToString();
+
+        object rawMapLink = WorldInteractionDataValue(node.Data, "mpnMapLink", "4611686142517280007");
+        GomObjectData mapLink = WorldInteractionObjectData(rawMapLink);
+        if (mapLink != null) {
+          ulong linkedArea = WonkUInt64(WorldInteractionDataValue(mapLink, "mapLinkAreaId", "4611686142517280003"));
+          long linkedMap = WonkInt64(WorldInteractionDataValue(mapLink, "mapLinkMapNameSId", "4611686142517280004"));
+          long linkedSubmap = WonkInt64(WorldInteractionDataValue(mapLink, "mapLinkSubmapNameSId", "4611686142517280005"));
+          if (linkedArea != 0) note.MapLinkAreaId = linkedArea;
+          if (linkedMap != 0) note.MapLinkMapNameSId = linkedMap;
+          if (linkedSubmap != 0) note.MapLinkSubmapNameSId = linkedSubmap;
+        }
+
+        object locMap = WorldInteractionDataValue(node.Data, "locTextRetrieverMap", "4611686102842470023");
+        if (String.IsNullOrWhiteSpace(note.Label)) {
+          string localized = WorldLocMapText(locMap, WorldLocNameSlot, node.Name ?? note.Fqn);
+          if (!String.IsNullOrWhiteSpace(localized)) note.Label = localized.Trim();
+        }
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Legacy map-note enrichment failed (" + (note.Fqn ?? "?") + "): " + ex.Message);
       }
     }
 

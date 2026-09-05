@@ -74,6 +74,9 @@ namespace FileFormats {
     public string TriggerClassType { get; private set; }
     public string TriggerParam { get; private set; }
     public string TriggerTag { get; private set; }
+    // FxSpecName on /engine/fxplaceable.fxp and other .fxp room placements. Jedipedia resolves this relative
+    // to /resources/art/fx/fxspec and runs it as an authored ambient world effect.
+    public string FxSpecName { get; private set; }
     public bool TriggerEllipsoid { get; private set; }
     public bool PathFollowerPending { get; set; }
     public bool PathFollowerAnimated { get; set; }
@@ -177,6 +180,7 @@ namespace FileFormats {
         case "portaltarget": PortalTarget=text; return;
         case "triggerparam": TriggerParam=text; return;
         case "tag": TriggerTag=text; return;
+        case "fxspecname": FxSpecName=text; return;
         case "ellipsoid": TriggerEllipsoid=ParseTextBool(text); return;
         case "environmentmaterialindex": case "envmaterialindex": if(Int32.TryParse(text,System.Globalization.NumberStyles.Integer,System.Globalization.CultureInfo.InvariantCulture,out int env))EnvironmentMaterialIndex=env; return;
         case "viewability":
@@ -299,6 +303,14 @@ namespace FileFormats {
       // Same placement LODFactor consumed by Jedipedia's instanceLodFactor(). Zero intentionally requests the
       // coarsest visual LOD; malformed/negative values are clamped by the renderer.
       if (name == 0x1D30CC76 && type == 4) { LodFactor = br.ReadSingle(); return; }
+
+      // .fxp ambient placement effect. This is DAT_ROOM_FXP_PROP.FX_SPEC_NAME in Jedipedia's room reader.
+      if (name == 0xC2676F38 && (type == 8 || type == 9)) { // FxSpecName
+        object fxSpecValue = ReadGenericProperty(ref br, type);
+        FxSpecName = fxSpecValue is byte[] fxSpecBytes ? DecodeText(fxSpecBytes) : fxSpecValue?.ToString();
+        ParsedProperties[name] = fxSpecValue;
+        return;
+      }
 
       // /engine/follower.fol movement properties. Path and Speed are stored as strings in shipped room DATs;
       // TurnRate is a float. Keep the parsed values in ParsedProperties as well because the inspector/data viewer

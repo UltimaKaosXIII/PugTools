@@ -172,17 +172,40 @@ namespace GomLib.ModelLoader {
         cnv.QuestProgressed.AddRange(dialogNode.QuestsProgressed);
       }
 
-      var treeRootNodeMap = obj.Data.ValueOrDefault("cnvTreeRootNode_Prototype", new object());
-      var rootNodeList = ((GomObjectData)treeRootNodeMap).ValueOrDefault("cnvChildNodes", new List<object>());
-      for (int i = 0; i < rootNodeList.Count; i++) {
-        long childNodeId = (long)rootNodeList[i];
-        cnv.RootNodes.Add(i, childNodeId);
+      // Retail/current data stores one ClassView in cnvTreeRootNode_Prototype. RED/Beta stores a
+      // one-entry List in cnvTreeRootNodes_Prototype instead. Keep the retail field as the strict
+      // first path and only inspect the plural legacy field when the singular root is absent or has
+      // an unexpected shape. This prevents the old format fallback from changing 64-bit behaviour.
+      GomObjectData treeRootNodeData = obj.Data.ValueOrDefault<object>("cnvTreeRootNode_Prototype", null) as GomObjectData;
+      if (treeRootNodeData == null) {
+        object legacyRootContainer = obj.Data.ValueOrDefault<object>("cnvTreeRootNodes_Prototype", null);
+        if (legacyRootContainer is List<object> legacyRootList)
+          treeRootNodeData = legacyRootList.OfType<GomObjectData>().FirstOrDefault();
+        else if (legacyRootContainer is Dictionary<object, object> legacyRootMap)
+          treeRootNodeData = legacyRootMap.Values.OfType<GomObjectData>().FirstOrDefault();
+        else if (legacyRootContainer is GomObjectData legacyRootData) {
+          // Some historic readers expose the serialized list/map wrapper as GomObjectData.
+          treeRootNodeData = legacyRootData.Dictionary.Values.OfType<GomObjectData>().FirstOrDefault() ?? legacyRootData;
+        }
+      }
+      if (treeRootNodeData != null) {
+        var rootNodeList = treeRootNodeData.ValueOrDefault("cnvChildNodes", new List<object>());
+        for (int i = 0; i < rootNodeList.Count; i++) {
+          object rawChild = rootNodeList[i];
+          long childNodeId;
+          try { childNodeId = rawChild is ulong unsignedChild ? unchecked((long)unsignedChild) : Convert.ToInt64(rawChild); }
+          catch { continue; }
+          cnv.RootNodes.Add(i, childNodeId);
+        }
       }
 
       var treeLinkNodeMap = obj.Data.ValueOrDefault("cnvTreeLinkNodes_Prototype", new Dictionary<object, object>());
       foreach (var nodeLinkKvp in treeLinkNodeMap) {
         long target = ((GomObjectData)nodeLinkKvp.Value).ValueOrDefault<long>("cnvLinkTarget", 0);
-        cnv.NodeLinkList.Add((long)nodeLinkKvp.Key, target);
+        long linkId;
+        try { linkId = nodeLinkKvp.Key is ulong unsignedLink ? unchecked((long)unsignedLink) : Convert.ToInt64(nodeLinkKvp.Key); }
+        catch { continue; }
+        cnv.NodeLinkList.Add(linkId, target);
       }
 
       cnv.DefaultSpeakerId = obj.Data.ValueOrDefault<ulong>("cnvDefaultSpeaker", 0);
