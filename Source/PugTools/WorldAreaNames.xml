@@ -1,14 +1,14 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <AreaNames>
   <!--
     PugTools World Browser metadata. This file is editable both in the source tree and beside PugTools.exe.
     name="..." overrides the displayed name. category="..." and group="..." control the folders in the world list.
-    The current Jedipedia grouping is prefilled below. Areas discovered later that have no assignment are added as
-    category="Unassigned" group="" and therefore appear directly in the Unassigned folder.
+    The current Jedipedia grouping is prefilled below. Newly discovered ordinary areas with no assignment use
+    category="Unassigned" group=""; livecontent/systemgenerated areas default to Live Content / System Generated.
     internalName is informational and may be refreshed from area.dat.
   -->
-  <Area id="3758002374" name="" internalName="Character Selection" category="Solo phases" group="Other areas" />
-  <Area id="36268000006" name="" internalName="DebugSystem" category="Inaccessible areas" group="Empty areas" />
+  <Area id="3758002374" name="" internalName="Character Selection" category="Live Content" group="System Generated" />
+  <Area id="36268000006" name="" internalName="DebugSystem" category="Live Content" group="System Generated" />
   <Area id="4611686018427650020" name="" internalName="tat_main" category="Open world" group="Original planets" />
   <Area id="4611686019013922786" name="" internalName="LockSystem" category="Inaccessible areas" group="Empty areas" />
   <Area id="4611686019047870293" name="" internalName="coruscant_main" category="Open world" group="Original planets" />

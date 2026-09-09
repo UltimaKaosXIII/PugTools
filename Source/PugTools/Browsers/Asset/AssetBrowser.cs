@@ -53,6 +53,10 @@ namespace PugTools {
     private TreeNode[] m_nodeMatch;
     private ViewGR2 m_panelRender;
     private DdsPreviewControl m_ddsPreview;
+    private EffectSpecPreviewControl m_effectSpecPreview;
+    private MaterialSpecPreviewControl m_materialSpecPreview;
+    private StructuredTextAssetPreviewControl m_structuredTextPreview;
+    private AudioBankPreviewControl m_audioBankPreview;
     private Thread m_render;
     private ArrayList m_rootList; // = new ArrayList();
     private Int32 m_searchIndex; // = 0;
@@ -71,6 +75,10 @@ namespace PugTools {
     private readonly Boolean m_assetsUsePts;
     private WaveOutEvent m_waveOut;
     private XmlDocument m_xmlDoc;
+    private readonly Object m_previewTextureDecodeLock = new Object();
+    // HashDictionary is process-wide. Multiple Asset Browser windows may coexist, but two
+    // Filename Finder passes must not mutate its SortedLists at the same time.
+    private static readonly Object s_filenameFinderLock = new Object();
     // Jedipedia-style aliases for /resources/world/areas/<id> and
     // /resources/world/livecontent/systemgenerated/<id>.  The dictionary keys stay numeric so
     // extraction/navigation paths are unchanged; only the visible folder label and search gain
@@ -93,6 +101,7 @@ namespace PugTools {
     private Boolean m_jbaActive;
     private System.Windows.Forms.Timer m_jbaUiTimer;
     private ToolStripButton m_jbaSkeletonButton;
+    private ToolStripComboBox m_jbaSpeedCombo;
     private JBAAppearanceIndex m_jbaAppearanceIndex;
     private DataObjectModel m_jbaDom;
     private readonly Object m_jbaDependencyLock = new Object();
@@ -107,8 +116,13 @@ namespace PugTools {
                           Boolean compareFiles = false) {
       InitializeComponent();
       InitializeDdsPreview();
+      InitializeEffectSpecPreview();
+      InitializeMaterialSpecPreview();
+      InitializeStructuredTextPreview();
+      InitializeAudioBankPreview();
       InitializeAssetFilterTreeView();
       InitializeAssetTreeLiveFilter();
+      InitializeIdenticalFilesContextMenu();
       Config.Load();
 
       m_assetsLocation = assetLocation;
@@ -144,6 +158,25 @@ namespace PugTools {
         toolStrip1.Items.Insert(jbaProgressIndex, m_jbaSkeletonButton);
       else
         toolStrip1.Items.Add(m_jbaSkeletonButton);
+
+      m_jbaSpeedCombo = new ToolStripComboBox {
+        AutoSize = false,
+        Width = 62,
+        DropDownStyle = ComboBoxStyle.DropDownList,
+        ToolTipText = "JBA playback speed",
+        Visible = false
+      };
+      m_jbaSpeedCombo.Items.AddRange(new Object[] { "0.25x", "0.5x", "1x", "1.5x", "2x", "4x" });
+      m_jbaSpeedCombo.SelectedItem = "1x";
+      m_jbaSpeedCombo.SelectedIndexChanged += JbaSpeedComboSelectedIndexChanged;
+      Int32 jbaSpeedIndex = toolStrip1.Items.IndexOf(toolStrip1ProgressBar1);
+      if (jbaSpeedIndex >= 0) toolStrip1.Items.Insert(jbaSpeedIndex, m_jbaSpeedCombo);
+      else toolStrip1.Items.Add(m_jbaSpeedCombo);
+
+      // ToolStripProgressBar itself does not expose a Click event in the same
+      // useful way as a normal ProgressBar.  Its hosted control does, which lets
+      // the JBA viewer scrub directly to a frame without adding another timeline.
+      toolStrip1ProgressBar1.ProgressBar.MouseDown += JbaProgressBarMouseDown;
 
       m_sgtSaveButton = new ToolStripButton {
         AutoSize = true,
@@ -192,22 +225,30 @@ namespace PugTools {
       m_assetTreeFilterTimer = null;
       try { m_assetTreeFilterCancellation?.Cancel(); m_assetTreeFilterCancellation?.Dispose(); } catch { }
       m_assetTreeFilterCancellation = null;
-      // Do NOT unload the shared hash dictionary here. Unload() calls
-      // GC.Collect(), and with the current large SWTOR dictionary this can
-      // freeze the entire desktop for seconds/minutes. The main application
-      // can keep this shared cache alive.
+      // Do NOT unload the shared hash dictionary here. It is process-wide and can contain
+      // millions of rows; another open browser may still be using it. The main application keeps
+      // this cache alive and decides once, at process shutdown, whether filename changes are saved.
 
       if (m_panelRender != null) {
-        m_panelRender.StopRender();
-
-        Boolean renderStopped = m_render == null || !m_render.IsAlive || m_render.Join(750);
-        if (renderStopped) {
-          try { m_panelRender.Clear(); } catch { }
-          try { m_panelRender.Dispose(); } catch { }
-        }
-
+        ViewGR2 renderer = m_panelRender;
+        Thread renderThread = m_render;
         m_panelRender = null;
         m_render = null;
+
+        try { renderer.StopRender(); } catch { }
+
+        // D3D resource release can take a noticeable amount of time on some
+        // drivers. Never make FormClosed wait for it. The render loop has
+        // already been told to stop; finish cleanup off the WinForms thread.
+        ThreadPool.QueueUserWorkItem(_ => {
+          Boolean stopped = renderThread == null || !renderThread.IsAlive;
+          if (!stopped) {
+            try { stopped = renderThread.Join(5000); } catch { }
+          }
+          if (!stopped) return; // Prefer a bounded leak to freezing the whole app.
+          try { renderer.Clear(); } catch { }
+          try { renderer.Dispose(); } catch { }
+        });
       }
 
       if (m_assetFilterTree != null) {
@@ -243,8 +284,16 @@ namespace PugTools {
 
       try { m_inputStream?.Dispose(); } catch { }
       m_inputStream = null;
+      try { m_effectSpecPreview?.Dispose(); } catch { }
+      m_effectSpecPreview = null;
+      try { m_materialSpecPreview?.Dispose(); } catch { }
+      m_materialSpecPreview = null;
+      try { m_structuredTextPreview?.Dispose(); } catch { }
+      m_structuredTextPreview = null;
 
       m_assetDict = null;
+      m_assetSearchIndex = Array.Empty<AssetSearchEntry>();
+      m_fullAssetTree = null;
 
       /*
       if (Directory.Exists(@".\Temp\")) {
@@ -268,29 +317,20 @@ namespace PugTools {
       }
       */
 
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
     }
 
     private void AssetBrowserFormClosing(Object sender, FormClosingEventArgs e) {
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
       m_closing = true;
 
-      // Stop high-frequency work immediately, before controls and D3D handles
-      // are destroyed.
+      // Stop high-frequency/background work before controls and D3D handles
+      // are destroyed. Tree preparation and live filtering both observe these
+      // cancellation signals and can now terminate during a large sort/build.
+      try { m_assetTreeFilterCancellation?.Cancel(); } catch { }
+      try { m_assetTreeFilterTimer?.Stop(); } catch { }
       try { m_panelRender?.StopRender(); } catch { }
       try {
         if (m_audioPlaying) m_waveOut?.Stop();
       } catch { }
-
-      if (m_hashData.Dictionary.NeedsSave && (m_modNewCount > 2 || m_foundNewFileCount > 0)) {
-        DialogResult save = MessageBox.Show(
-          "The hash dictionary needs to be saved. \nThere were " + m_foundNewFileCount.ToString()
-            + " new files found this session.\n\nSave the dictionary changes?", "Save Dictionary?",
-          MessageBoxButtons.YesNo
-        );
-
-        if (save == DialogResult.Yes) m_hashData.Dictionary.SaveBinaryHashList();
-      }
     }
 
     private void AssetBrowserFormResize(Object sender, EventArgs e) {
@@ -304,8 +344,6 @@ namespace PugTools {
     #region Background Wokers Methods
     private void BackgroundWorker1Run(Object sender, DoWorkEventArgs e) {
       if (m_closing) return;
-
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
 
       m_currentAssets = AssetHandler.Instance.GetCurrentAssets(m_assetsLocation, m_assetsUsePts);
       LocalizationResolver.Apply(m_currentAssets, Config.Language);
@@ -380,9 +418,9 @@ namespace PugTools {
 
           foreach (TorArchive.File file in archive.Value.EnumerateFiles()) {
             if (m_closing) return;
-            HashFileInfo hashInfo = new HashFileInfo(file.FileInfo.PrimaryHash,
-                                                     file.FileInfo.SecondaryHash,
-                                                     file);
+            HashFileInfo hashInfo = new HashFileInfo(
+              file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file, true, false
+            );
             RegisterWorldAreaInternalName(hashInfo);
 
             if (hashInfo.IsNamed) {
@@ -540,6 +578,7 @@ namespace PugTools {
       );
 
       foreach (String dir in fileDirs) {
+        if (m_closing) return;
         String[] temp = dir.Split('/');
         Int32 intLength = temp.Length;
 
@@ -550,6 +589,7 @@ namespace PugTools {
         }
       }
       foreach (String dir in allDirs) {
+        if (m_closing) return;
         String[] temp = dir.Split('/');
         String parentDir = String.Join("/", temp.Take(temp.Length - 1));
 
@@ -566,11 +606,12 @@ namespace PugTools {
       HashSet<String> allDirs = new HashSet<String>();
       HashSet<String> fileDirs = new HashSet<String>();
       List<BuildFileDifference> differences =
-        BuildAssetComparer.Compare(m_currentAssets, m_previousAssets);
+        BuildAssetComparer.Compare(m_currentAssets, m_previousAssets, true, () => m_closing);
 
       Int32 newCount = 0;
       Int32 changedCount = 0;
       Int32 removedCount = 0;
+      Int32 unchangedCount = 0;
 
       foreach (BuildFileDifference difference in differences) {
         if (m_closing) return;
@@ -584,6 +625,7 @@ namespace PugTools {
           BuildFileState.New => "/root/new",
           BuildFileState.Changed => "/root/changed",
           BuildFileState.Removed => "/root/removed",
+          BuildFileState.Unchanged => "/root/unchanged",
           _ => "/root"
         };
 
@@ -627,6 +669,9 @@ namespace PugTools {
           case BuildFileState.Removed:
             removedCount++;
             break;
+          case BuildFileState.Unchanged:
+            unchangedCount++;
+            break;
         }
       }
 
@@ -648,8 +693,15 @@ namespace PugTools {
           "/root/removed", "/root", "Removed Files (" + removedCount + ")", empty
         )
       );
+      m_assetDict.Add(
+        "/root/unchanged",
+        new TreeListItem(
+          "/root/unchanged", "/root", "Unchanged Files (" + unchangedCount + ")", empty
+        )
+      );
 
       foreach (String dir in fileDirs) {
+        if (m_closing) return;
         String[] temp = dir.Split('/');
         for (Int32 i = 0; i <= temp.Length; i++) {
           String output = String.Join("/", temp, 0, i);
@@ -658,6 +710,7 @@ namespace PugTools {
       }
 
       foreach (String dir in allDirs) {
+        if (m_closing) return;
         String[] temp = dir.Split('/');
         String parentDir = String.Join("/", temp.Take(temp.Length - 1));
         if (parentDir.Length == 0) parentDir = "/root";
@@ -792,7 +845,8 @@ namespace PugTools {
       }
 
       m_fullAssetTree = TreeViewFast.Controls.TreeViewFast.PrepareItems(
-        m_assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, compare
+        m_assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, compare,
+        () => m_closing
       );
     }
 
@@ -822,7 +876,7 @@ namespace PugTools {
 
       loadingSwirl1.Hide();
       toolStripStatusLabel1.Text = m_compareFiles
-        ? "Comparison loaded. Showing New, Changed and Removed files only."
+        ? "Comparison loaded. Showing New, Changed, Removed and Unchanged files."
         : "Loading Complete.";
       toolStripProgressBar1.Visible = false;
       toolStripProgressBar1.Value = 0;
@@ -831,8 +885,6 @@ namespace PugTools {
       ButtonsEnable();
 
       txtSearch.Focus();
-
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
     }
 
     #endregion
@@ -1197,6 +1249,207 @@ namespace PugTools {
 
     #endregion
 
+    #region Effect Spec Preview
+    private void InitializeEffectSpecPreview() {
+      m_effectSpecPreview = new EffectSpecPreviewControl {
+        Dock = DockStyle.Fill,
+        Visible = false,
+        TextureLoader = LoadEffectTextureBitmap,
+        PrtTextLoader = LoadEffectPrtText,
+        ResourceExists = MaterialResourceExists,
+        OpenResourceRequested = NavigateToEffectResource
+      };
+      splitContainer3.Panel1.Controls.Add(m_effectSpecPreview);
+      m_effectSpecPreview.BringToFront();
+    }
+
+    private void InitializeMaterialSpecPreview() {
+      m_materialSpecPreview = new MaterialSpecPreviewControl {
+        Dock = DockStyle.Fill,
+        Visible = false,
+        TextureLoader = LoadEffectTextureBitmap,
+        ResourceExists = MaterialResourceExists,
+        OpenResourceRequested = NavigateToEffectResource
+      };
+      splitContainer3.Panel1.Controls.Add(m_materialSpecPreview);
+      m_materialSpecPreview.BringToFront();
+    }
+
+    private void InitializeStructuredTextPreview() {
+      m_structuredTextPreview = new StructuredTextAssetPreviewControl {
+        Dock = DockStyle.Fill,
+        Visible = false,
+        ResourceExists = MaterialResourceExists,
+        OpenResourceRequested = NavigateToEffectResource
+      };
+      splitContainer3.Panel1.Controls.Add(m_structuredTextPreview);
+      m_structuredTextPreview.BringToFront();
+    }
+
+    private void InitializeAudioBankPreview() {
+      m_audioBankPreview = new AudioBankPreviewControl {
+        Dock = DockStyle.Fill,
+        Visible = false,
+        ResourceExists = MaterialResourceExists,
+        OpenResourceRequested = NavigateToEffectResource,
+        PlayEmbeddedRequested = PlayAudioBankEmbedded
+      };
+      splitContainer3.Panel1.Controls.Add(m_audioBankPreview);
+      m_audioBankPreview.BringToFront();
+    }
+
+    private Boolean MaterialResourceExists(String requestedPath) {
+      if (String.IsNullOrWhiteSpace(requestedPath)) return false;
+      Assets assets = m_currentAssets ?? m_previousAssets;
+      if (assets == null) return false;
+      String normalized = requestedPath.Trim().Replace('\\', '/');
+      if (!normalized.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase))
+        normalized = "/resources/" + normalized.TrimStart('/');
+      using TorArchive.File file = assets.FindFile(normalized);
+      return file != null;
+    }
+
+    private String ReadCurrentPreviewTextSmart() {
+      if (m_inputStream == null) return String.Empty;
+      m_inputStream.Position = 0;
+      using MemoryStream copy = new MemoryStream();
+      m_inputStream.CopyTo(copy);
+      Byte[] bytes = copy.ToArray();
+      m_inputStream.Position = 0;
+      if (bytes.Length == 0) return String.Empty;
+
+      // SWTOR text assets are not consistently encoded. In particular FXSPEC files are often
+      // UTF-16LE (sometimes without a BOM) and some end in an extra NUL code unit. Reading those
+      // as UTF-8 produces "<\0..." and XmlDocument then fails at line 1, position 2. This mirrors
+      // Jedipedia's FXSPEC reader: detect UTF-16 from BOM/alternating NUL bytes and strip the
+      // optional BOM/trailing zero before handing the text to the structured parsers.
+      Encoding encoding = Encoding.UTF8;
+      Int32 offset = 0;
+      if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
+        encoding = Encoding.UTF8;
+        offset = 3;
+      } else if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
+        encoding = Encoding.Unicode;
+        offset = 2;
+      } else if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
+        encoding = Encoding.BigEndianUnicode;
+        offset = 2;
+      } else if (bytes.Length >= 4) {
+        Int32 evenZero = 0, oddZero = 0, sample = Math.Min(bytes.Length, 256);
+        for (Int32 i = 0; i < sample; i++) {
+          if (bytes[i] != 0) continue;
+          if ((i & 1) == 0) evenZero++; else oddZero++;
+        }
+        if (oddZero >= 2 && oddZero > evenZero * 2) encoding = Encoding.Unicode;
+        else if (evenZero >= 2 && evenZero > oddZero * 2) encoding = Encoding.BigEndianUnicode;
+      }
+
+      Int32 byteCount = bytes.Length - offset;
+      if ((encoding == Encoding.Unicode || encoding == Encoding.BigEndianUnicode)
+          && (byteCount & 1) != 0 && bytes[bytes.Length - 1] == 0) {
+        // A few cooked text files append a single zero byte rather than a complete UTF-16 NUL
+        // code unit. Ignore that dangling byte so the decoder does not append U+FFFD.
+        byteCount--;
+      }
+      String text = encoding.GetString(bytes, offset, byteCount);
+      if (text.Length > 0 && text[0] == '\uFEFF') text = text.Substring(1);
+      // Text specs must not contain NULs. Shipped FXSPECs commonly have one at EOF; removing any
+      // remaining NUL also makes BOM-less UTF-16 edge cases fail soft rather than poison XML parsing.
+      if (text.IndexOf('\0') >= 0) text = text.Replace("\0", String.Empty);
+      return text;
+    }
+
+    private String ReadCurrentPreviewText() {
+      return ReadCurrentPreviewTextSmart();
+    }
+
+    private String LoadEffectPrtText(String requestedPath) {
+      if (String.IsNullOrWhiteSpace(requestedPath)) return null;
+      Assets assets = m_currentAssets ?? m_previousAssets;
+      if (assets == null) return null;
+      String normalized = requestedPath.Trim().Replace('\\', '/');
+      if (!normalized.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase))
+        normalized = "/resources/" + normalized.TrimStart('/');
+      using TorArchive.File file = assets.FindFile(normalized);
+      if (file == null) return null;
+      using Stream stream = file.OpenCopyInMemory();
+      using var reader = new StreamReader(stream, Encoding.UTF8, true, 8192, false);
+      return reader.ReadToEnd();
+    }
+
+    private Bitmap LoadEffectTextureBitmap(String requestedPath) {
+      if (String.IsNullOrWhiteSpace(requestedPath)) return null;
+      Assets assets = m_currentAssets ?? m_previousAssets;
+      if (assets == null) return null;
+
+      String normalized = requestedPath.Replace('\\', '/');
+      if (!normalized.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase))
+        normalized = "/resources/" + normalized.TrimStart('/');
+
+      var candidates = new List<String> { normalized };
+      if (!normalized.EndsWith(".dds", StringComparison.OrdinalIgnoreCase)) {
+        String withoutExtension = Path.ChangeExtension(normalized, null);
+        candidates.Add(withoutExtension + ".dds");
+        candidates.Add(withoutExtension + ".tiny.dds");
+      } else if (!normalized.EndsWith(".tiny.dds", StringComparison.OrdinalIgnoreCase)) {
+        candidates.Add(normalized.Substring(0, normalized.Length - 4) + ".tiny.dds");
+      }
+
+      foreach (String candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase)) {
+        using TorArchive.File file = assets.FindFile(candidate);
+        if (file == null) continue;
+        // DevIL uses process-global native state and is not guaranteed to be re-entrant. The material
+        // inspector may request its sphere maps while the selected texture preview is decoding, so
+        // serialize only the native decode section while keeping all callers off the UI thread.
+        lock (m_previewTextureDecodeLock) {
+          using Stream stream = file.OpenCopyInMemory();
+          using ImageImporter importer = new ImageImporter();
+          using DevIL.Image image = importer.LoadImageFromStream(ImageType.Dds, stream);
+          using MemoryStream png = new MemoryStream();
+          using ImageExporter exporter = new ImageExporter();
+          exporter.SaveImageToStream(image, ImageType.Png, png);
+          png.Position = 0;
+          using Bitmap decoded = new Bitmap(png);
+          return new Bitmap(decoded);
+        }
+      }
+      return null;
+    }
+
+    private void NavigateToEffectResource(String requestedPath) {
+      if (m_assetDict == null || treeViewFast1 == null || String.IsNullOrWhiteSpace(requestedPath)) return;
+      String normalized = requestedPath.Trim().Replace('\\', '/');
+      if (!normalized.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase))
+        normalized = "/resources/" + normalized.TrimStart('/');
+      normalized = normalized.ToLowerInvariant();
+      String id = "/root/named" + normalized;
+
+      if (!m_assetDict.ContainsKey(id)) {
+        StatusLabel2Text("Referenced asset is not present in the loaded build: " + normalized);
+        return;
+      }
+
+      if (!String.IsNullOrEmpty(txtSearch.Text)) {
+        txtSearch.Clear();
+        ApplyAssetTreeLiveFilter();
+      }
+      try {
+        TreeNode node = treeViewFast1.GetNode(id);
+        if (node == null) {
+          StatusLabel2Text("Referenced asset exists but its tree node is not available: " + normalized);
+          return;
+        }
+        treeViewFast1.SelectedNode = node;
+        node.EnsureVisible();
+        treeViewFast1.Focus();
+      }
+      catch (Exception ex) {
+        StatusLabel2Text("Could not navigate to referenced asset: " + ex.Message);
+      }
+    }
+
+    #endregion
+
     #region LoadingSwirl1
     private void LoadingSwirl1Hide() {
       if (InvokeRequired) Invoke(new Action(LoadingSwirl1Hide));
@@ -1212,6 +1465,7 @@ namespace PugTools {
 
     #region Preview Methods
     private async void PreviewAsset(TreeListItem asset) {
+      if (m_closing || asset?.HashInfo?.File == null) return;
       if (asset.HashInfo.File != null) {
 
         // A preview owns its playback source. Tear down SGT cleanly and tell the
@@ -1228,6 +1482,10 @@ namespace PugTools {
         if (m_jbaSkeletonButton != null) {
           m_jbaSkeletonButton.Checked = false;
           m_jbaSkeletonButton.Visible = false;
+        }
+        if (m_jbaSpeedCombo != null) {
+          m_jbaSpeedCombo.Visible = false;
+          m_jbaSpeedCombo.SelectedItem = "1x";
         }
         if (m_sgtSaveButton != null) m_sgtSaveButton.Visible = false;
         m_panelRender?.SetShowSkeleton(false);
@@ -1246,6 +1504,14 @@ namespace PugTools {
         pictureBox1.Visible = false;
         m_ddsPreview.ClearPreview();
         m_ddsPreview.Visible = false;
+        m_effectSpecPreview?.ClearPreview();
+        if (m_effectSpecPreview != null) m_effectSpecPreview.Visible = false;
+        m_materialSpecPreview?.ClearPreview();
+        if (m_materialSpecPreview != null) m_materialSpecPreview.Visible = false;
+        m_structuredTextPreview?.ClearPreview();
+        if (m_structuredTextPreview != null) m_structuredTextPreview.Visible = false;
+        m_audioBankPreview?.ClearPreview();
+        if (m_audioBankPreview != null) m_audioBankPreview.Visible = false;
         renderPanel.Visible = false;
         toolStrip1.Visible = false;
         treeViewGrid1.Visible = false;
@@ -1263,12 +1529,31 @@ namespace PugTools {
         treeViewGrid1.SelectedIndices.Clear();
 
         if (m_render != null) {
-          m_panelRender.StopRender();
-          m_render.Join();
-          m_panelRender.Clear();
+          Thread previousRender = m_render;
+          try { m_panelRender?.StopRender(); } catch { }
+          Boolean stopped = !previousRender.IsAlive;
+          if (!stopped) {
+            try { stopped = previousRender.Join(1000); } catch { }
+          }
+          if (!stopped) {
+            // Never freeze the UI because the D3D driver is still returning from Present().
+            // The renderer has already received StopRender(); leave its resources alone until
+            // the render thread actually exits instead of Clear() racing DrawScene/Present.
+            toolStripStatusLabel1.Text = "Previous 3D preview is still stopping.";
+            loadingSwirl1.Visible = false;
+            toolStripProgressBar1.Visible = false;
+            return;
+          }
+          m_render = null;
+          try { m_panelRender?.Clear(); } catch { }
         }
 
         await Task.Run(() => PreviewAssetLoadObject(asset.HashInfo.File));
+        if (m_closing || IsDisposed || Disposing) {
+          try { m_inputStream?.Dispose(); } catch { }
+          m_inputStream = null;
+          return;
+        }
 
         // DynamicFileByteProvider byteProvider = new DynamicFileByteProvider(this.inputStream);
         // hexBox1.ByteProvider = byteProvider;
@@ -1277,6 +1562,9 @@ namespace PugTools {
         m_rootList = new ArrayList();
 
         string selectedAssetPath = ((asset.HashInfo.Directory ?? String.Empty).TrimEnd('/', '\\') + "/" + asset.HashInfo.FileName).Replace("//", "/");
+        String declaredExtension = (asset.HashInfo.Extension ?? String.Empty).Trim().TrimStart('.').ToUpperInvariant();
+        String previewExtension = JedipediaFileTypeResolver.Resolve(m_inputStream, declaredExtension);
+        Boolean previewTypeWasDetected = !String.Equals(previewExtension, declaredExtension, StringComparison.OrdinalIgnoreCase);
         bool heroScriptList = selectedAssetPath.Equals("/resources/systemgenerated/scriptdef.list", StringComparison.OrdinalIgnoreCase)
                            || selectedAssetPath.Equals("/resources/systemgenerated/scripts.list", StringComparison.OrdinalIgnoreCase);
 
@@ -1307,7 +1595,7 @@ namespace PugTools {
             txtRawView.Visible = true;
           }
         } else {
-          switch (asset.HashInfo.Extension.ToUpper()) {
+          switch (previewExtension) {
             case "DDS":
               await Task.Run(PreviewAssetDDS);
               ConfigureDdsPreviewBackground(asset.HashInfo.Directory);
@@ -1321,20 +1609,97 @@ namespace PugTools {
               pictureBox1.Visible = true;
               break;
 
+            case "MANIFEST": {
+              String manifestText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_structuredTextPreview.LoadManifest(selectedAssetPath, manifestText);
+              m_structuredTextPreview.Visible = true;
+              m_structuredTextPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              return;
+            }
+
+            case "TBL": {
+              String tableText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_structuredTextPreview.LoadTbl(selectedAssetPath, tableText);
+              m_structuredTextPreview.Visible = true;
+              m_structuredTextPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              return;
+            }
+
+            case "RUL": {
+              String ruleText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_structuredTextPreview.LoadRul(selectedAssetPath, ruleText);
+              m_structuredTextPreview.Visible = true;
+              m_structuredTextPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              return;
+            }
+
+            case "AAM": {
+              String aamText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_rootList.Clear();
+              try {
+                await Task.Run(() => m_rootList = ViewAAM.Parse(aamText, selectedAssetPath));
+                FinishStructuredTreePreview();
+              }
+              catch (Exception ex) {
+                System.Diagnostics.Debug.WriteLine("AAM structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = "AAM parse failed: " + ex.Message;
+                await Task.Run(PreviewAssetXML);
+                if (m_xmlDoc?.DocumentElement != null) webBrowser1.Visible = true;
+                else txtRawView.Visible = true;
+              }
+              break;
+            }
+
+            case "LST": {
+              Boolean guiXmlList = selectedAssetPath.Equals("/resources/guixml/_heguixml.lst", StringComparison.OrdinalIgnoreCase)
+                                 || selectedAssetPath.Equals("/resources/guixml/guixml.lst", StringComparison.OrdinalIgnoreCase);
+              if (guiXmlList) {
+                String listText = await Task.Run(ReadCurrentPreviewTextSmart);
+                m_structuredTextPreview.LoadLst(selectedAssetPath, listText);
+                m_structuredTextPreview.Visible = true;
+                m_structuredTextPreview.BringToFront();
+                LoadingSwirl1Hide();
+                ProgressBar1Hide();
+                toolStripStatusLabel1.Text = "LST GUI XML list";
+                toolStripStatusLabel2.Text = "Double-click an entry to open the referenced GUI XML asset.";
+                return;
+              }
+
+              await Task.Run(PreviewAssetXML);
+              if (m_xmlDoc?.DocumentElement != null) webBrowser1.Visible = true;
+              else txtRawView.Visible = true;
+              break;
+            }
+
+            case "TXT": {
+              if (selectedAssetPath.Equals("/resources/version.txt", StringComparison.OrdinalIgnoreCase)) {
+                String versionText = await Task.Run(ReadCurrentPreviewTextSmart);
+                m_structuredTextPreview.LoadVersionTxt(selectedAssetPath, versionText);
+                m_structuredTextPreview.Visible = true;
+                m_structuredTextPreview.BringToFront();
+                LoadingSwirl1Hide();
+                ProgressBar1Hide();
+                toolStripStatusLabel1.Text = "Client version metadata";
+                toolStripStatusLabel2.Text = "Parsed key/value metadata from /resources/version.txt.";
+                return;
+              }
+
+              await Task.Run(PreviewAssetXML);
+              if (m_xmlDoc?.DocumentElement != null) webBrowser1.Visible = true;
+              else txtRawView.Visible = true;
+              break;
+            }
+
             case "XML":
-            case "MAT":
-            case "TEX":
-            case "EMT":
-            case "EPP":
-            case "FXSPEC":
-            case "RUL":
-            case "MANIFEST":
             case "SVY":
-            case "TBL":
             case "LOD":
-            case "TXT":
             case "INI":
-            case "LST":
             case "TAB":
             case "ABL":
             case "CAM":
@@ -1375,24 +1740,67 @@ namespace PugTools {
             case "LIST":
               m_rootList.Clear();
               try {
-                String jedipediaExtension = asset.HashInfo.Extension.ToUpperInvariant();
+                String jedipediaExtension = previewExtension;
                 String jedipediaFileName = asset.HashInfo.FileName;
                 await Task.Run(() => PreviewAssetJedipediaStructured(jedipediaExtension, jedipediaFileName));
                 FinishStructuredTreePreview();
               }
               catch (Exception ex) {
-                System.Diagnostics.Debug.WriteLine(asset.HashInfo.Extension + " Jedipedia structured preview failed: " + ex);
-                toolStripStatusLabel2.Text = asset.HashInfo.Extension + " parse failed: " + ex.Message;
+                System.Diagnostics.Debug.WriteLine(previewExtension + " structured preview failed: " + ex);
+                toolStripStatusLabel2.Text = previewExtension + " parse failed: " + ex.Message;
                 m_inputStream.Position = 0;
                 await Task.Run(PreviewAssetHEX);
                 txtRawView.Visible = true;
               }
               break;
 
-            case "NOT":
-              await Task.Run(PreviewAssetNOT);
-              webBrowser1.Visible = true;
+            case "MAT": {
+              String materialText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_materialSpecPreview.LoadMat(selectedAssetPath, materialText);
+              m_materialSpecPreview.Visible = true;
+              m_materialSpecPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              toolStripStatusLabel1.Text = "MAT material inspector";
+              toolStripStatusLabel2.Text = "Select a texture input for interactive DDS preview; double-click references to open assets.";
               break;
+            }
+
+            case "TEX": {
+              String textureObjectText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_materialSpecPreview.LoadTex(selectedAssetPath, textureObjectText);
+              m_materialSpecPreview.Visible = true;
+              m_materialSpecPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              toolStripStatusLabel1.Text = "TEX texture-object inspector";
+              toolStripStatusLabel2.Text = "Sampler/address/compression parameters plus linked DDS/tiny DDS.";
+              break;
+            }
+
+            case "EMT": {
+              String environmentMaterialText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_materialSpecPreview.LoadEmt(selectedAssetPath, environmentMaterialText);
+              m_materialSpecPreview.Visible = true;
+              m_materialSpecPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              toolStripStatusLabel1.Text = "EMT environment-material inspector";
+              toolStripStatusLabel2.Text = "BlendDiffuse / BlendNormal references are resolved directly from the loaded build.";
+              break;
+            }
+
+            case "NOT": {
+              String mapNotesText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_structuredTextPreview.LoadMapNotes(selectedAssetPath, mapNotesText);
+              m_structuredTextPreview.Visible = true;
+              m_structuredTextPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              toolStripStatusLabel1.Text = "Map notes";
+              toolStripStatusLabel2.Text = "Structured map-note metadata; double-click a row to open a related map DDS when available.";
+              return;
+            }
 
             case "DAT": {
               // area.dat and room .dat files now get the same structured view as
@@ -1596,10 +2004,30 @@ namespace PugTools {
               }
               break;
 
-            case "PRT":
-              await Task.Run(PreviewAssetRAW);
-              txtRawView.Visible = true;
+            case "PRT": {
+              String effectText = await Task.Run(ReadCurrentPreviewText);
+              m_effectSpecPreview.LoadPrt(selectedAssetPath, effectText);
+              m_effectSpecPreview.Visible = true;
+              m_effectSpecPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              toolStripStatusLabel1.Text = "PRT particle inspector";
+              toolStripStatusLabel2.Text = "Graph: wheel zoom, drag to pan, double-click resource to open; Simulation uses the World PRT runtime.";
               break;
+            }
+
+            case "FXSPEC":
+            case "EPP": {
+              String effectText = await Task.Run(ReadCurrentPreviewText);
+              m_effectSpecPreview.LoadXmlEffect(previewExtension, selectedAssetPath, effectText);
+              m_effectSpecPreview.Visible = true;
+              m_effectSpecPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              toolStripStatusLabel1.Text = previewExtension + " effect inspector";
+              toolStripStatusLabel2.Text = "Graph: wheel zoom, drag to pan, double-click resource to open; missing references are marked.";
+              break;
+            }
 
             case "JBA":
               await Task.Run(() => PreviewAssetJBA(asset.HashInfo.Directory, asset.HashInfo.FileName));
@@ -1622,17 +2050,17 @@ namespace PugTools {
               treeViewGrid1.Visible = true;
               break;
 
-            case "BNK":
-              m_rootList.Clear();
-              await Task.Run(PreviewAssetBNK);
-              treeViewGrid1.Roots = m_rootList;
-              treeViewGrid1.ExpandAll();
-              treeViewGrid1.AutoResizeColumns(ColumnHeaderAutoResizeStyle.ColumnContent);
+            case "BNK": {
+              FileFormat_BNK bank = await Task.Run(ParseCurrentBnk);
+              m_audioBankPreview.LoadBank(selectedAssetPath, bank);
+              m_audioBankPreview.Visible = true;
+              m_audioBankPreview.BringToFront();
               loadingSwirl1.Visible = false;
               toolStripProgressBar1.Visible = false;
-              toolStrip1.Visible = true;
-              treeViewGrid1.Visible = true;
+              toolStripStatusLabel1.Text = "BNK Wwise semantic graph";
+              toolStripStatusLabel2.Text = "Event → Action → HIRC object → embedded/streamed WEM. Double-click media to play/open.";
               break;
+            }
 
             case "ACB":
               m_rootList.Clear();
@@ -1724,14 +2152,19 @@ namespace PugTools {
         // from its UI callback. Do not overwrite it with the generic message
         // after the background preview task completes.
         if (!String.Equals(
-              asset.HashInfo.Extension,
+              previewExtension,
               "JBA",
               StringComparison.OrdinalIgnoreCase)) {
           toolStripStatusLabel1.Text = "File Loaded.";
-          if (String.Equals(asset.HashInfo.Extension, "DDS", StringComparison.OrdinalIgnoreCase)) {
+          if (String.Equals(previewExtension, "DDS", StringComparison.OrdinalIgnoreCase)) {
             toolStripStatusLabel2.Text = m_ddsPreview.IsCubeMap
               ? "Cubemap: drag to look around | mouse wheel zoom | double-click reset"
               : "DDS: mouse wheel zoom | drag to pan | double-click reset";
+          } else if (previewTypeWasDetected) {
+            String listed = String.IsNullOrWhiteSpace(declaredExtension) ? "unknown" : declaredExtension;
+            toolStripStatusLabel2.Text = "Content type detected as " + previewExtension + " (listed as " + listed + ").";
+          } else if (String.Equals(previewExtension, "AAM", StringComparison.OrdinalIgnoreCase)) {
+            toolStripStatusLabel2.Text = "Animation Actor Model: inputs, MPH network selection, actions, events, tracks, switches and masks.";
           } else {
             toolStripStatusLabel2.Text = String.Empty;
           }
@@ -1796,6 +2229,23 @@ namespace PugTools {
         }
         catch (Exception) { }
       }
+    }
+
+    private FileFormat_BNK ParseCurrentBnk() {
+      if (m_inputStream == null) return null;
+      m_inputStream.Position = 0;
+      using BinaryReader br = new BinaryReader(m_inputStream, Encoding.UTF8, true);
+      return new FileFormat_BNK(br, true);
+    }
+
+    private async void PlayAudioBankEmbedded(ViewWEM wem) {
+      if (wem == null) return;
+      if (m_audioPlaying) {
+        m_audioPlaying = false;
+        try { m_waveOut?.Stop(); } catch { }
+      }
+      toolStrip1.Visible = true;
+      await PreviewAssetWEM(wem);
     }
 
     private void PreviewAssetDAT(String directory, String fileName, Assets assets) {
@@ -2429,6 +2879,11 @@ namespace PugTools {
             m_jbaSkeletonButton.Visible = true;
             m_jbaSkeletonButton.ToolTipText = "Show animation skeleton and bone names";
           }
+          if (m_jbaSpeedCombo != null) {
+            m_jbaSpeedCombo.Visible = true;
+            m_jbaSpeedCombo.SelectedItem = "1x";
+          }
+          m_panelRender.SetAnimationSpeed(1.0F);
           m_panelRender.SetShowSkeleton(false);
 
           toolStrip1ProgressBar1.Minimum = 0;
@@ -2982,9 +3437,7 @@ namespace PugTools {
     private void PreviewAssetXML() {
       if (InvokeRequired) Invoke(PreviewAssetXML);
       else {
-        m_inputStream.Position = 0;
-        using StreamReader reader = new StreamReader(m_inputStream, Encoding.UTF8, true, 4096, true);
-        String output = reader.ReadToEnd().Replace("\0", "");
+        String output = ReadCurrentPreviewTextSmart();
 
         txtRawView.ReadOnly = false;
         txtRawView.Text = output;
@@ -3037,7 +3490,10 @@ namespace PugTools {
     }
 
     private void RenderPanelMouseWheel(Object sender, MouseEventArgs e) {
-      throw new NotImplementedException();
+      // D3DPanelApp normally subscribes the renderer directly.  Keep this
+      // WinForms handler functional as a fallback instead of throwing if the
+      // designer/event wiring invokes it.
+      m_panelRender?.ZoomByWheelDelta(e.Delta);
     }
 
     private void RenderPanelResize(Object sender, EventArgs e) {
@@ -3233,7 +3689,8 @@ namespace PugTools {
       }
       TreeViewFast.Controls.TreeViewFast.PreparedTree prepared =
         TreeViewFast.Controls.TreeViewFast.PrepareItems(
-          filtered.Values, getId, getParentId, getDisplayName, getImageIndex, compare
+          filtered.Values, getId, getParentId, getDisplayName, getImageIndex, compare,
+          () => m_closing || token.IsCancellationRequested
         );
 
       return new AssetTreeFilterResult(
@@ -3308,7 +3765,7 @@ namespace PugTools {
         btnClearSearch.Enabled = false;
         StatusLabel1Text(
           m_compareFiles
-            ? "Comparison loaded. Showing New, Changed and Removed files only."
+            ? "Comparison loaded. Showing New, Changed, Removed and Unchanged files."
             : "Showing all assets."
         );
         return;
@@ -3699,77 +4156,260 @@ namespace PugTools {
       return;
     }
 
+    /// <summary>
+    /// Jedipedia derives a surprising number of otherwise unknown paths from small shipped index
+    /// files instead of brute forcing names. Pull the same cheap references into the candidate set:
+    /// the Scaleform GUI .lst files contain literal GUI XML names, while stb.manifest lists every
+    /// global string table stem. Final acceptance still happens only after exact PH+SH validation.
+    /// </summary>
+    private void HarvestJedipediaReferenceLists(HashSet<String> candidates) {
+      if (candidates == null || m_currentAssets == null) return;
+
+      foreach (String listPath in new[] {
+        "/resources/guixml/_heguixml.lst",
+        "/resources/guixml/guixml.lst"
+      }) {
+        try {
+          using TorArchive.File listFile = m_currentAssets.FindFile(listPath);
+          if (listFile == null) continue;
+          using Stream stream = listFile.OpenCopyInMemory();
+          using var reader = new StreamReader(stream, Encoding.UTF8, true, 8192, false);
+          Int32 read = 0;
+          while (!reader.EndOfStream && read++ < 100000) {
+            String name = reader.ReadLine()?.Trim();
+            if (String.IsNullOrWhiteSpace(name)) continue;
+            String normalized = name.Replace('\\', '/').TrimStart('/');
+            if (normalized.StartsWith("resources/", StringComparison.OrdinalIgnoreCase))
+              normalized = normalized.Substring("resources/".Length);
+            if (!normalized.StartsWith("guixml/", StringComparison.OrdinalIgnoreCase))
+              normalized = "guixml/" + normalized;
+            candidates.Add(("/resources/" + normalized).Replace("//", "/").ToLowerInvariant());
+          }
+        }
+        catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("Filename Finder LST harvest failed for " + listPath + ": " + ex.Message);
+        }
+      }
+
+      try {
+        using TorArchive.File manifestFile = m_currentAssets.FindFile("/resources/gamedata/str/stb.manifest");
+        if (manifestFile != null) {
+          using Stream stream = manifestFile.OpenCopyInMemory();
+          using var reader = new StreamReader(stream, Encoding.UTF8, true, 8192, false);
+          String manifestText = reader.ReadToEnd();
+          var doc = new XmlDocument();
+          doc.LoadXml(manifestText);
+          Int32 count = 0;
+          foreach (XmlElement file in doc.GetElementsByTagName("file").OfType<XmlElement>()) {
+            if (count++ >= 100000) break;
+            String stem = file.GetAttribute("val")?.Trim();
+            if (String.IsNullOrWhiteSpace(stem)) continue;
+            stem = stem.Replace('.', '/').Replace('\\', '/').Trim('/').ToLowerInvariant();
+            if (stem.Length == 0) continue;
+            candidates.Add("/resources/de-de/" + stem + ".stb");
+            candidates.Add("/resources/en-us/" + stem + ".stb");
+            candidates.Add("/resources/fr-fr/" + stem + ".stb");
+          }
+        }
+      }
+      catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Filename Finder STB manifest harvest failed: " + ex.Message);
+      }
+    }
+
     private void TestHashFiles(String singleFile = null) {
-      m_hashData.Dictionary.SaveBinaryHashList();
+      lock (s_filenameFinderLock) TestHashFilesCore(singleFile);
+    }
+
+    private void TestHashFilesCore(String singleFile = null) {
       m_foundFiles?.Clear();
 
       String[] testFiles;
 
       if (singleFile != null) testFiles = new String[] { singleFile };
-      else testFiles = Directory.GetFiles(m_extractPath + "\\File_Names\\");
+      else {
+        String candidateDirectory = m_extractPath + "\\File_Names\\";
+        testFiles = Directory.Exists(candidateDirectory)
+          ? Directory.GetFiles(candidateDirectory)
+          : Array.Empty<String>();
+      }
 
-      if (testFiles.Length > 0) {
-        m_foundFiles = new HashSet<String>();
+      m_foundFiles = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (String file in testFiles) {
-          HashSet<String> testLines = new HashSet<String>();
+      // Aggregate candidates first. The old implementation rebuilt a complete multi-million-row
+      // hash->archive index (and used to save the whole dictionary) before testing parser output.
+      // Neither is necessary: a candidate can be validated directly against the currently loaded
+      // TOR libraries by its PH+SH lookup.
+      HashSet<String> testLines = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
 
-          if (file.EndsWith(".bin")) { // Import jedipedia hashes.bin format
-            using FileStream fs = new FileStream(file, FileMode.Open);
-            using BinaryReader br = new BinaryReader(fs);
+      foreach (String file in testFiles) {
+        if (file.EndsWith(".bin", StringComparison.OrdinalIgnoreCase)) { // Import jedipedia hashes.bin format
+          using FileStream fs = new FileStream(
+            file, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete
+          );
+          using BinaryReader br = new BinaryReader(fs);
 
-            while (br.BaseStream.Position != br.BaseStream.Length) {
-              _ = br.ReadUInt32(); //ph
-              _ = br.ReadUInt32(); //sh
+          while (br.BaseStream.Position != br.BaseStream.Length) {
+            _ = br.ReadUInt32(); //ph
+            _ = br.ReadUInt32(); //sh
 
-              Byte len = br.ReadByte(); //filename length
-              Byte nul = br.ReadByte();
+            Byte len = br.ReadByte(); //filename length
+            Byte nul = br.ReadByte();
 
-              if (nul != 0x00) { /* string second_len = "????"; */ }
+            if (nul != 0x00) { /* string second_len = "????"; */ }
 
-              String filename = Encoding.Default.GetString(br.ReadBytes(len));
-              testLines.Add(filename.ToLower());
-            }
-
-          } else {
-            String[] lines = System.IO.File.ReadAllLines(file);
-
-            foreach (String line in lines) {
-              if (line.Contains('#')) { // Old hash dict format
-                String[] temp = line.Split('#');
-
-                if (temp.Length < 3 || temp[2].Length == 0) continue;
-                else testLines.Add(temp[2].ToLower());
-
-              } else if (line.Contains('?')) { // New hash dict format
-                String[] temp = line.Split('?');
-
-                if (temp.Length < 4 || temp[3].Length == 0) continue;
-                else testLines.Add(temp[3].ToLower());
-
-              } else {
-                testLines.Add(line.ToLower());
-              }
-            }
+            String filename = Encoding.Default.GetString(br.ReadBytes(len));
+            if (!String.IsNullOrWhiteSpace(filename)) testLines.Add(filename.ToLowerInvariant());
           }
 
-          m_hashData.Dictionary.CreateArchiveHashMasterList();
+        } else {
+          String[] lines = System.IO.File.ReadAllLines(file);
 
-          foreach (String line in testLines) {
-            FileId fileId = FileId.FromFilePath(line);
-            IEnumerable<UpdateResults> results = m_hashData.Dictionary.UpdateHash(fileId.Ph, fileId.Sh, line, 0, true);
+          foreach (String line in lines) {
+            if (line.Contains('#')) { // Old hash dict format
+              String[] temp = line.Split('#');
 
-            if (results.Any()) {
-              m_foundFiles.Add(line);
+              if (temp.Length < 3 || temp[2].Length == 0) continue;
+              else testLines.Add(temp[2].ToLowerInvariant());
+
+            } else if (line.Contains('?')) { // New hash dict format
+              String[] temp = line.Split('?');
+
+              if (temp.Length < 4 || temp[3].Length == 0) continue;
+              else testLines.Add(temp[3].ToLowerInvariant());
+
+            } else if (!String.IsNullOrWhiteSpace(line)) {
+              testLines.Add(line.ToLowerInvariant());
             }
           }
-
-          testLines.Clear();
         }
+      }
+
+      // Use REAL SWTOR paths from HashInfo for the historical Jedipedia wildcard resolver. At
+      // the same time keep direct references to the unresolved files in the CURRENT build. This
+      // turns final validation into O(candidates) hash lookups instead of O(candidates * TORs).
+      var currentUnnamedHashes = new HashSet<UInt64>();
+      var currentUnnamedFiles = new Dictionary<UInt64, List<HashFileInfo>>();
+      var legacyTargetFiles = new Dictionary<UInt64, HashFileInfo>();
+      IEnumerable<String> knownPaths = Enumerable.Empty<String>();
+      if (m_assetDict != null) {
+        foreach (TreeListItem item in m_assetDict.Values) {
+          if (item != null && item.CompareState == BuildFileState.Removed) continue;
+          HashFileInfo info = item?.HashInfo;
+          TorArchive.File sourceFile = info?.File;
+          if (sourceFile?.FileInfo == null || sourceFile.Archive == null) continue;
+          if (!info.IsNamed) {
+            UInt64 signature = ((UInt64)sourceFile.FileInfo.PrimaryHash << 32)
+                             | sourceFile.FileInfo.SecondaryHash;
+            currentUnnamedHashes.Add(signature);
+
+            if (!currentUnnamedFiles.TryGetValue(signature, out List<HashFileInfo> targets)) {
+              targets = new List<HashFileInfo>();
+              currentUnnamedFiles.Add(signature, targets);
+            }
+            // The same HashFileInfo is intentionally present below /unnamed and /new or /modified.
+            // Keep one physical target reference so a discovered name is not written repeatedly.
+            if (!targets.Contains(info)) targets.Add(info);
+
+            if (LegacyUnnamedFileNameResolver.IsHintHash(signature)
+                && !legacyTargetFiles.ContainsKey(signature))
+              legacyTargetFiles.Add(signature, info);
+          }
+        }
+
+        knownPaths = m_assetDict.Values
+          .Where(x => x?.HashInfo != null && x.HashInfo.IsNamed
+                   && !String.IsNullOrWhiteSpace(x.HashInfo.FileName)
+                   && LegacyUnnamedFileNameResolver.MayHelpKnownPath(
+                        x.HashInfo.Directory, x.HashInfo.FileName))
+          .Select(x => {
+            String directory = (x.HashInfo.Directory ?? String.Empty).TrimEnd('/', '\\');
+            return String.IsNullOrEmpty(directory)
+              ? x.HashInfo.FileName
+              : directory + "/" + x.HashInfo.FileName;
+          })
+          .Distinct(StringComparer.OrdinalIgnoreCase);
+      }
+
+      // A patch can move a file to another TOR while the old archive entry already has the name.
+      // Recover those names with one linear dictionary pass, without materializing the global
+      // archive master index. They are still validated against the CURRENT build below.
+      if (currentUnnamedHashes.Count > 0) {
+        Dictionary<UInt64, String> knownCurrentNames =
+          m_hashData.Dictionary.FindKnownFileNames(currentUnnamedHashes);
+        foreach (String knownName in knownCurrentNames.Values)
+          if (!String.IsNullOrWhiteSpace(knownName)) testLines.Add(knownName.ToLowerInvariant());
+      }
+
+      // Jedipedia also learns names from small reference lists shipped by the client. This costs only
+      // three direct archive lookups and avoids brute forcing every GUI XML / global string-table name.
+      // As with every other finder source, these are merely candidates until the exact PH+SH check below.
+      if (currentUnnamedFiles.Count > 0) HarvestJedipediaReferenceLists(testLines);
+
+      // Some cooked SWTOR formats contain their own resource path. This is a high-value source for
+      // otherwise completely unknown hashes (for example generated .dat files). The scan is bounded
+      // and every path is accepted only if it reproduces the containing file's exact PH+SH.
+      foreach (String resolved in LegacyUnnamedFileNameResolver.ResolveEmbeddedPaths(currentUnnamedFiles))
+        testLines.Add(resolved);
+
+      foreach (String resolved in LegacyUnnamedFileNameResolver.Resolve(
+                 m_hashData.Dictionary,
+                 knownPaths,
+                 testLines,
+                 currentUnnamedHashes,
+                 legacyTargetFiles)) {
+        testLines.Add(resolved);
+      }
+
+      if (currentUnnamedFiles.Count == 0) return;
+
+      foreach (String line in LegacyUnnamedFileNameResolver.ExpandCandidates(testLines)) {
+        if (String.IsNullOrWhiteSpace(line)) continue;
+
+        FileId candidateId = FileId.FromFilePath(line);
+        UInt64 signature = ((UInt64)candidateId.Ph << 32) | candidateId.Sh;
+        if (!currentUnnamedFiles.TryGetValue(signature, out List<HashFileInfo> targets)) continue;
+
+        // Hash equality already proves the candidate belongs to these unresolved current-build
+        // entries. Persist it for each physical TOR copy represented by the Asset Browser without
+        // calling Library.FindFile() for every generated probe.
+        Boolean persisted = false;
+        foreach (HashFileInfo target in targets) {
+          TorArchive.File currentFile = target?.File;
+          if (currentFile?.FileInfo == null || currentFile.Archive == null) continue;
+          if (currentFile.FileInfo.PrimaryHash != candidateId.Ph
+              || currentFile.FileInfo.SecondaryHash != candidateId.Sh) continue;
+
+          m_hashData.Dictionary.AddHash(
+            candidateId.Ph,
+            candidateId.Sh,
+            line,
+            currentFile.FileInfo.CRC,
+            currentFile.Archive.StrippedFileName
+          );
+          persisted = true;
+        }
+
+        if (persisted) m_foundFiles.Add(line);
       }
     }
 
     #endregion Hash List Methods
+
+    private void JbaSpeedComboSelectedIndexChanged(Object sender, EventArgs e) {
+      if (!m_jbaActive || m_panelRender == null || m_jbaSpeedCombo == null) return;
+      String text = m_jbaSpeedCombo.SelectedItem?.ToString() ?? "1x";
+      if (text.EndsWith("x", StringComparison.OrdinalIgnoreCase)) text = text.Substring(0, text.Length - 1);
+      if (!Single.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out Single speed)) speed = 1.0F;
+      m_panelRender.SetAnimationSpeed(Math.Max(0.05F, Math.Min(8.0F, speed)));
+    }
+
+    private void JbaProgressBarMouseDown(Object sender, MouseEventArgs e) {
+      if (!m_jbaActive || m_panelRender == null || toolStrip1ProgressBar1.ProgressBar.Width <= 1) return;
+      Single ratio = Math.Max(0.0F, Math.Min(1.0F, e.X / (Single)Math.Max(1, toolStrip1ProgressBar1.ProgressBar.ClientSize.Width - 1)));
+      m_panelRender.SeekAnimation(m_panelRender.AnimationLength * ratio);
+      UpdateJbaToolbar();
+    }
 
     private void JbaSkeletonButtonCheckedChanged(Object sender, EventArgs e) {
       if (!m_jbaActive
@@ -4316,6 +4956,10 @@ namespace PugTools {
       pictureBox1.Visible = false;
       m_ddsPreview.ClearPreview();
       m_ddsPreview.Visible = false;
+      m_materialSpecPreview?.ClearPreview();
+      if (m_materialSpecPreview != null) m_materialSpecPreview.Visible = false;
+      m_audioBankPreview?.ClearPreview();
+      if (m_audioBankPreview != null) m_audioBankPreview.Visible = false;
       renderPanel.Visible = false;
       treeViewGrid1.Visible = false;
       txtRawView.Visible = false;

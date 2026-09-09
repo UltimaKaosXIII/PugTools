@@ -35,7 +35,8 @@ namespace PugTools {
     private void UpdateNodeFieldCompareMenu() {
       if (_compareFieldsMenuItem == null) return;
       NodeAsset asset = treeViewFast1?.SelectedNode?.Tag as NodeAsset;
-      bool visible = asset?.Obj != null && asset.compareState != BuildFileState.None;
+      bool visible = asset?.Obj != null && (asset.compareState == BuildFileState.Changed
+        || asset.compareState == BuildFileState.New || asset.compareState == BuildFileState.Removed);
       _compareFieldsMenuItem.Visible = visible;
       _compareFieldsMenuItem.Enabled = visible;
       if (visible) {
@@ -46,7 +47,8 @@ namespace PugTools {
 
     private void ShowSelectedNodeFieldDiff() {
       NodeAsset asset = treeViewFast1?.SelectedNode?.Tag as NodeAsset;
-      if (asset?.Obj == null || asset.compareState == BuildFileState.None) return;
+      if (asset?.Obj == null || asset.compareState == BuildFileState.None
+          || asset.compareState == BuildFileState.Unchanged) return;
       string name = asset.Obj.Name ?? asset.displayName ?? asset.id;
       if (String.IsNullOrWhiteSpace(name)) return;
 

@@ -234,7 +234,7 @@ namespace FileFormats {
       if (!likelyPlaceable && bodyType == "ithorian") {
         List<JBAAppearancePart> ithorian = GetDefault(bodyType);
         if (ithorian.Count > 0) {
-          diagnostic = "Jedipedia body override: ithorian";
+          diagnostic = "Body override: ithorian";
           index?.Cache(cacheKey, ithorian, diagnostic);
           return ithorian;
         }

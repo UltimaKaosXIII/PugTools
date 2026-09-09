@@ -885,6 +885,7 @@ namespace PugTools {
 
     private void ClearWorldFxRuntime() {
       worldFxPlayers.Clear(); worldFxSpecCache.Clear(); worldPrtSpecCache.Clear(); worldAmbientFxPlacements.Clear(); worldFxLastPrune = 0f;
+      worldVendorOverheadReferenceParticle = null;
       lock (worldConversationFxLock) { worldConversationFx.Clear(); worldConversationFxSnapshot = Array.Empty<WorldConversationFxEntry>(); }
       foreach (GR2 model in worldFxModelCache.Values.Distinct()) {
         try { ReleaseModelBuffers(model); model?.Dispose(); } catch { }
@@ -1156,13 +1157,55 @@ namespace PugTools {
       return false;
     }
 
-    private bool TryDrawWorldInteractionFxPlayer(WorldInteractionIconEntry entry, string fxSpecPath, Matrix viewProj, WorldRenderSettings renderSettings, out bool drawn) {
+    private static WorldFxHostContext BuildWorldFxStableOverheadHostContext(WorldInteractionIconEntry entry) {
+      // Quest/conversation overhead effects are already mounted on entry.FxFrame, whose translation is rebased onto
+      // the visible attach_nameplate anchor before rendering.  Returning the effect-local origin for NamePlate avoids
+      // a second animated/bind-pose skeleton lookup (the source of the old feet/nameplate flicker) while preserving
+      // the FXSPEC hierarchy and PRT camera-distance scaling used by the vendor/service icon renderer.
+      if (!(entry?.Owner is WorldNpcPlacement)) return null;
+      var host = new WorldFxHostContext { CasterFrame = Matrix.Identity };
+      host.BoneFrame = (actor, boneName) => {
+        if (!String.Equals(actor, "CASTER", StringComparison.OrdinalIgnoreCase) || String.IsNullOrWhiteSpace(boneName)) return null;
+        string bone = boneName.Trim();
+        if (String.Equals(bone, "NamePlate", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(bone, "attach_nameplate", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(bone, "attach_nameplate_fallback", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(bone, "nameplate", StringComparison.OrdinalIgnoreCase)) return Matrix.Identity;
+        return null;
+      };
+      return host;
+    }
+
+    private bool TryDrawWorldInteractionFxPlayer(WorldInteractionIconEntry entry, string fxSpecPath, Matrix viewProj, WorldRenderSettings renderSettings, out bool drawn,
+        bool stableOverheadAnchor = false, float? screenYOffsetOverride = null) {
       drawn = false; if (entry?.Owner == null) return false;
-      Matrix fxFrame = entry.FxFrame ?? Matrix.Translation(entry.Anchor);
+      Matrix fxFrame = entry.FxFrame ?? Matrix.Identity;
+      // The exact SWTOR NamePlate frame is still useful for the authored FX orientation, but some GR2/JBA rigs in
+      // PugTools expose a bind-frame translation that is noticeably below the text attach_nameplate point.  Keep the
+      // full orientation and rebase only the translation onto the same anchor used by the visible nameplate.  Then
+      // apply the same small screen-space lift used by the static sprite fallback.  This makes the quest/service FX
+      // sit above the NPC name instead of around the actor's feet while preserving the spec's local -Z/up semantics.
+      fxFrame.M41 = entry.Anchor.X; fxFrame.M42 = entry.Anchor.Y; fxFrame.M43 = entry.Anchor.Z; fxFrame.M44 = 1f;
+      float screenYOffset = screenYOffsetOverride ?? entry.ScreenYOffset;
+      if (Math.Abs(screenYOffset) > .01f && camera != null) {
+        Vector3 visibleForward = -camera.Look;
+        if (visibleForward.LengthSquared() > .000001f) {
+          visibleForward.Normalize();
+          float depth = Vector3.Dot(entry.Anchor - camera.Position, visibleForward);
+          int viewportHeight = Math.Max(1, (int)Viewport.Height);
+          if (depth > .001f && viewportHeight > 0) {
+            float worldPerPixel = (float)(2.0 * depth * Math.Tan(camera.FovY * .5f) / viewportHeight);
+            Vector3 lift = camera.Up * (-screenYOffset * worldPerPixel);
+            fxFrame.M41 += lift.X; fxFrame.M42 += lift.Y; fxFrame.M43 += lift.Z;
+          }
+        }
+      }
       // This pass is rendered after TAA/post-processing with the stable label matrix, while scene depth was produced
       // with the jittered world matrix. Receiver-space projectors would reconstruct from mismatched matrices here,
       // so keep interaction-icon projectors on their geometry fallback path.
-      WorldFxHostContext hostContext = BuildWorldFxInteractionHostContext(entry, fxFrame, renderSettings);
+      WorldFxHostContext hostContext = stableOverheadAnchor
+        ? BuildWorldFxStableOverheadHostContext(entry)
+        : BuildWorldFxInteractionHostContext(entry, fxFrame, renderSettings);
       return TryDrawWorldFxPlayer(entry.Owner, fxSpecPath, fxFrame, viewProj, WorldFxMaxRenderParticlesPerIcon, out drawn,
         null, renderSettings, false, 0, null, false, hostContext);
     }

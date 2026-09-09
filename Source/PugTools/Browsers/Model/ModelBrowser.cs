@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -40,6 +41,7 @@ namespace PugTools {
     private Assets _currentAssets;
     private DataObjectModel _currentDom;
     private Dictionary<String, NodeAsset> _dataViewDict;
+    private TreeViewFast.Controls.TreeViewFast.PreparedTree _preparedModelTree;
     private HashDictionaryInstance _hashData;
     private List<ItemAppearance> _items;
     private Dictionary<Object, Object> _mntMountInfoData;
@@ -56,6 +58,8 @@ namespace PugTools {
     private List<TestRule> _testRules;
     private Dictionary<String, Object> _weaponAppearance;
     private readonly HashSet<String> _parsedFxSpecs = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+    private String _pendingGameplayPreviewFqn;
+    private Boolean _gameplayTreeReady;
 
     #endregion Fields
 
@@ -95,36 +99,75 @@ namespace PugTools {
 
       backgroundWorker1.RunWorkerAsync(loadprevious);
     }
+
+    internal Boolean MatchesGameplayAssetSource(String assetLocation, Boolean usePts) {
+      String left = TorArchive.Assets.NormalizeGamePath(_assetsLocation ?? String.Empty).TrimEnd('\\', '/');
+      String right = TorArchive.Assets.NormalizeGamePath(assetLocation ?? String.Empty).TrimEnd('\\', '/');
+      return _assetsUsePts == usePts && String.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal void NavigateToGameplayNode(String fqn) {
+      if (String.IsNullOrWhiteSpace(fqn) || _closing) return;
+      _pendingGameplayPreviewFqn = fqn.Trim();
+      TryNavigateToGameplayNode();
+    }
+
+    private void TryNavigateToGameplayNode() {
+      if (_closing || !_gameplayTreeReady || String.IsNullOrWhiteSpace(_pendingGameplayPreviewFqn)
+          || treeViewFast1 == null || _assetDict == null) return;
+      if (InvokeRequired) { BeginInvoke(new Action(TryNavigateToGameplayNode)); return; }
+
+      String wanted = _pendingGameplayPreviewFqn;
+      String key = _assetDict.ContainsKey(wanted)
+        ? wanted
+        : _assetDict.Keys.FirstOrDefault(x => String.Equals(x, wanted, StringComparison.OrdinalIgnoreCase));
+      if (String.IsNullOrWhiteSpace(key)) {
+        StatusBarText("Gameplay model target is not available in Model Browser: " + wanted);
+        return;
+      }
+
+      try {
+        TreeNode node = treeViewFast1.GetNode(key);
+        if (node == null) return;
+        _pendingGameplayPreviewFqn = null;
+        treeViewFast1.SelectedNode = node;
+        node.EnsureVisible();
+        treeViewFast1.Focus();
+        BringToFront();
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Gameplay model navigation failed: " + ex.Message);
+      }
+    }
+
     private void ModelBrowserFormClosed(Object sender, FormClosedEventArgs e) {
-      Hide();
-
-      HashDictionaryInstance.Instance.Unload();
-
-      if (_panelRender != null) {
-        _panelRender.StopRender();
-
-        if (_render != null) _render.Join();
-
-        _panelRender.Clear();
-        _panelRender.Dispose();
-        _panelRender = null;
+      // HashDictionaryInstance is process-wide and shared by Asset/Node/World browsers. Closing one Model Browser
+      // must not invalidate that cache underneath another window. More importantly, never synchronously join or
+      // release the D3D preview on the WinForms thread: on a large model the render thread can still be finishing a
+      // frame, which made Close look like a full application hang and kept one CPU core saturated.
+      View_NPC_GR2 renderer = _panelRender;
+      Thread renderThread = _render;
+      _panelRender = null;
+      _render = null;
+      if (renderer != null) {
+        try { renderer.StopRender(); } catch { }
+        ThreadPool.QueueUserWorkItem(_ => {
+          Boolean stopped = renderThread == null || !renderThread.IsAlive;
+          if (!stopped) try { stopped = renderThread.Join(5000); } catch { stopped = false; }
+          // Do not race Direct3D disposal against a render thread that ignored the stop request. It is a background
+          // thread, so skipping disposal in that exceptional case is safer than freezing or crashing the UI.
+          if (!stopped) return;
+          try { renderer.Clear(); } catch { }
+          try { renderer.Dispose(); } catch { }
+        });
       }
 
-      if (treeViewFast1 != null) {
-        treeViewFast1.Dispose();
-        treeViewFast1 = null;
-      }
+      // Designer-owned controls are disposed by Form.Dispose(). Disposing the two very large TreeViews again from
+      // FormClosed performs a second native subtree walk and was another noticeable close-time stall.
+      treeViewFast1 = null;
+      treeViewFast2 = null;
+      dataGridView1 = null;
 
-      if (treeViewFast2 != null) {
-        treeViewFast2.Dispose();
-        treeViewFast2 = null;
-      }
-
-      if (dataGridView1 != null) {
-        dataGridView1.Dispose();
-        dataGridView1 = null;
-      }
-
+      _preparedModelTree = null;
       _assetDict = null;
       _currentAssets = null;
       _currentDom = null;
@@ -140,14 +183,19 @@ namespace PugTools {
       _testGroups = null;
       _testRules = null;
       _weaponAppearance = null;
-
-      Dispose(true);
-
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
     }
     private void ModelBrowserFormClosing(Object sender, FormClosingEventArgs e) {
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
+      if (_closing) return;
       _closing = true;
+      try { if (backgroundWorker1.IsBusy) backgroundWorker1.CancelAsync(); } catch { }
+      try { if (backgroundWorker2.IsBusy) backgroundWorker2.CancelAsync(); } catch { }
+      try { if (backgroundWorker3.IsBusy) backgroundWorker3.CancelAsync(); } catch { }
+      try { _panelRender?.StopRender(); } catch { }
+      _preparedModelTree = null;
+    }
+
+    private bool ModelWorkerCancelled(BackgroundWorker worker) {
+      return _closing || (worker?.CancellationPending ?? false);
     }
     private void ModelBrowserFormResize(Object sender, EventArgs e) {
       treeViewFast1.Size =
@@ -183,14 +231,14 @@ namespace PugTools {
 
     #region Background Worker Methods
     private void BackgroundWorker1DoWork(Object sender, DoWorkEventArgs e) {
-      if (_closing) return;
-
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
+      BackgroundWorker worker = sender as BackgroundWorker;
+      if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
 
       // Load current assets.
       _currentAssets = AssetHandler.Instance.GetCurrentAssets(_assetsLocation, _assetsUsePts);
       LocalizationResolver.Apply(_currentAssets, Config.Language);
       _currentDom = DomHandler.Instance.GetCurrentDOM(_currentAssets);
+      if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
 
       if ((Boolean)e.Argument) {
         // Load previous assets.
@@ -199,21 +247,33 @@ namespace PugTools {
         _previousDom = DomHandler.Instance.GetPreviousDOM(_previousAssets);
         if (!_hashData.Loaded) _hashData.Load();
       }
+      if (ModelWorkerCancelled(worker)) e.Cancel = true;
     }
     private void BackgroundWorker1RunWorkerCompleted(Object sender, RunWorkerCompletedEventArgs e) {
-      if (_closing) return;
+      if (_closing || e.Cancelled) return;
 
       if (e.Error != null) {
-        throw new Exception("Echter Fehler beim Laden (Worker 1): " + e.Error, e.Error);
+        ProgressBarHide();
+        LoadingSwirlHide();
+        StatusBarText("Model Browser could not load the shared SWTOR data.");
+        MessageBox.Show(
+          e.Error.GetBaseException().Message,
+          "Model Browser",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Error
+        );
+        return;
       }
 
       backgroundWorker2.RunWorkerAsync();
     }
     private void BackgroundWorker2ProgressChanged(Object sender, ProgressChangedEventArgs e) {
-      toolStripProgressBar1.Value = e.ProgressPercentage;
+      if (_closing || IsDisposed || Disposing || toolStripProgressBar1 == null) return;
+      toolStripProgressBar1.Value = Math.Max(toolStripProgressBar1.Minimum, Math.Min(toolStripProgressBar1.Maximum, e.ProgressPercentage));
     }
     private void BackgroundWorker2DoWork(Object sender, DoWorkEventArgs e) {
-      if (_closing) return;
+      BackgroundWorker worker = sender as BackgroundWorker;
+      if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
 
       _assetDict = new Dictionary<String, NodeAsset>();
 
@@ -223,12 +283,15 @@ namespace PugTools {
 
       #region Nodes
 
-      Dictionary<Object, Object> weaponApp = _currentDom.GetObject("itmAppearanceDatatable").Data
-          .Get<Dictionary<Object, Object>>("itmAppearances");
       _weaponAppearance = new Dictionary<String, Object>();
-
-      foreach (KeyValuePair<Object, Object> app in weaponApp) {
-        _weaponAppearance.Add(app.Key.ToString().ToLower(), app.Value);
+      GomObject appearanceTable = _currentDom.GetObject("itmAppearanceDatatable");
+      Dictionary<Object, Object> weaponApp = appearanceTable?.Data
+        ?.ValueOrDefault<Dictionary<Object, Object>>("itmAppearances", null);
+      if (weaponApp != null) {
+        foreach (KeyValuePair<Object, Object> app in weaponApp) {
+          if (app.Key == null) continue;
+          _weaponAppearance[app.Key.ToString().ToLowerInvariant()] = app.Value;
+        }
       }
 
       // Mount table names changed over the lifetime of SWTOR.  Older PugTools
@@ -265,11 +328,19 @@ namespace PugTools {
       Int32 nodesTotal = itmList.Count;
 
       foreach (GomObject item in itmList) {
+        if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
+        GomObjectData itemData = item?.Data;
+        if (item == null || itemData == null) {
+          nodesDone++;
+          continue;
+        }
+
         if (item.Name.StartsWith("itm.")) {
-          String appearSpec = item.Data.ValueOrDefault<String>("cbtWeaponAppearanceSpec", null);
+          String appearSpec = itemData.ValueOrDefault<String>("cbtWeaponAppearanceSpec", null);
 
           if (appearSpec == null) {
             nodesDone++;
+            item.Unload();
             continue;
           }
         }
@@ -284,16 +355,17 @@ namespace PugTools {
 
           if (item.Name.StartsWith("itm.")) {
             // Try and get the item name.
-            if (item.Data.ContainsKey("locTextRetrieverMap")) {
-              GomObjectData nameLookupData =
-                (GomObjectData)item.Data.Get<Dictionary<Object, Object>>(
-                  "locTextRetrieverMap"
-                )[-2761358831308646330];
-              String itmName = _currentDom.StringTable.TryGetString(item.Name, nameLookupData);
-
-              if (itmName.Length > 0) {
-                // Found the item name, put it in brackets.
-                display = display + " (" + itmName + ")";
+            if (itemData.ContainsKey("locTextRetrieverMap")) {
+              Dictionary<Object, Object> retrievers =
+                itemData.ValueOrDefault<Dictionary<Object, Object>>("locTextRetrieverMap", null);
+              if (retrievers != null
+                  && retrievers.TryGetValue(-2761358831308646330L, out Object rawLookup)
+                  && rawLookup is GomObjectData nameLookupData) {
+                String itmName = _currentDom.StringTable.TryGetString(item.Name, nameLookupData);
+                if (!String.IsNullOrWhiteSpace(itmName)) {
+                  // Found the item name, put it in brackets.
+                  display = display + " (" + itmName + ")";
+                }
               }
             }
           }
@@ -304,16 +376,18 @@ namespace PugTools {
         NodeAsset asset = new NodeAsset(item.Name, parent, display, _currentDom);
 
         _assetDict.Add(item.Name, asset);
-        item.Unload(); // Make sure these aren't hanging around
+        item.Unload(); // Lazy GOM access is synchronized; release decompressed data after indexing.
 
         nodesDone++;
-        backgroundWorker2.ReportProgress(nodesDone * 100 / nodesTotal);
+        if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
+        backgroundWorker2.ReportProgress(nodesTotal == 0 ? 100 : nodesDone * 100 / nodesTotal);
       }
 
       // Determine which nodes are new.
       List<Int32> newNodeIndexes = new List<Int32>();
       if (_previousDom != null) {
         for (Int32 i = 0; i < itmList.Count; i++) {
+          if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
           GomObject newObj = itmList[i];
           GomObject oldObj = _previousDom.GetObject(newObj.Name);
 
@@ -324,12 +398,15 @@ namespace PugTools {
 
         // Build the new list.
         foreach (Int32 i in newNodeIndexes) {
+          if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
           GomObject item = itmList[i];
+          GomObjectData itemData = item?.Data;
+          if (item == null || itemData == null) continue;
 
           if (item.Name.StartsWith("itm.")) {
-            String appearSpec = item.Data.ValueOrDefault<String>("cbtWeaponAppearanceSpec", null);
+            String appearSpec = itemData.ValueOrDefault<String>("cbtWeaponAppearanceSpec", null);
 
-            if (appearSpec == null) continue;
+            if (appearSpec == null) { item.Unload(); continue; }
           }
 
           String parent = String.Empty;
@@ -343,16 +420,17 @@ namespace PugTools {
 
             if (item.Name.StartsWith("itm.")) {
               // Try and get the item name.
-              if (item.Data.ContainsKey("locTextRetrieverMap")) {
-                GomObjectData nameLookupData =
-                (GomObjectData)item.Data.Get<Dictionary<Object, Object>>(
-                  "locTextRetrieverMap"
-                )[-2761358831308646330];
-                String itmName = _currentDom.StringTable.TryGetString(item.Name, nameLookupData);
-
-                if (itmName.Length > 0)
-                  // Found the item name, put it in brackets.
-                  display = display + " (" + itmName + ")";
+              if (itemData.ContainsKey("locTextRetrieverMap")) {
+                Dictionary<Object, Object> retrievers =
+                  itemData.ValueOrDefault<Dictionary<Object, Object>>("locTextRetrieverMap", null);
+                if (retrievers != null
+                    && retrievers.TryGetValue(-2761358831308646330L, out Object rawLookup)
+                    && rawLookup is GomObjectData nameLookupData) {
+                  String itmName = _currentDom.StringTable.TryGetString(item.Name, nameLookupData);
+                  if (!String.IsNullOrWhiteSpace(itmName))
+                    // Found the item name, put it in brackets.
+                    display = display + " (" + itmName + ")";
+                }
               }
             }
 
@@ -363,11 +441,12 @@ namespace PugTools {
           NodeAsset asset = new NodeAsset("new." + item.Name, parent, display, item);
 
           _assetDict.Add("new." + item.Name, asset);
-          item.Unload(); // Make sure these aren't hanging around
+          item.Unload(); // Lazy GOM access is synchronized; release decompressed data after indexing.
         }
       }
 
       foreach (KeyValuePair<Object, Object> item in _mntMountInfoData) {
+        if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
         GomObjectData value = FindFirstGomObjectData(item.Value);
         if (value == null)
           continue;
@@ -402,6 +481,7 @@ namespace PugTools {
       }
 
       foreach (String dir in nodeDirs) {
+        if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
         String[] temp = dir.Split('.');
         Int32 intLength = temp.Length;
 
@@ -413,6 +493,7 @@ namespace PugTools {
       }
 
       foreach (String dir in allDirs) {
+        if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
         String[] temp = dir.Split('.');
         String parentDir = String.Join(".", temp.Take(temp.Length - 1));
 
@@ -442,17 +523,20 @@ namespace PugTools {
       Int32 totalLibs = _currentAssets.Libraries.Count;
 
       if (_compareFiles && _previousAssets != null) {
-        BuildComparedGr2Assets(fileDirs);
+        if (!BuildComparedGr2Assets(fileDirs, worker)) { e.Cancel = true; return; }
       } else {
         foreach (Library lib in _currentAssets.Libraries) {
+          if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
           String path = lib.Location;
 
           if (!lib.Loaded) lib.Load();
 
           foreach (KeyValuePair<Int32, Archive> arch in lib.Archives) {
+            if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
             foreach (File file in arch.Value.EnumerateFiles()) {
+              if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
               HashFileInfo hashInfo =
-                new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file);
+                new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file, true, false);
 
               if (hashInfo.IsNamed) {
                 if (hashInfo.FileName == "metadata.bin" || hashInfo.FileName == "ft.sig"
@@ -585,7 +669,8 @@ namespace PugTools {
           }
 
           libsDone++;
-          backgroundWorker2.ReportProgress(libsDone * 100 / totalLibs);
+          if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
+          backgroundWorker2.ReportProgress(totalLibs == 0 ? 100 : libsDone * 100 / totalLibs);
         }
       }
       #endregion
@@ -596,6 +681,7 @@ namespace PugTools {
 
 
       foreach (String dir in fileDirs) {
+        if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
         String[] temp = dir.Split('/');
         Int32 intLength = temp.Length;
 
@@ -607,6 +693,7 @@ namespace PugTools {
       }
 
       foreach (String dir in allDirs) {
+        if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
         String[] temp = dir.Split('/');
         String parentDir = String.Join("/", temp.Take(temp.Length - 1));
 
@@ -618,19 +705,27 @@ namespace PugTools {
         if (!_assetDict.ContainsKey(dir)) _assetDict.Add(dir, asset);
       }
     }
-    private void BuildComparedGr2Assets(HashSet<String> fileDirs) {
+    private bool BuildComparedGr2Assets(HashSet<String> fileDirs, BackgroundWorker worker) {
       List<BuildFileDifference> differences = BuildAssetComparer
-        .Compare(_currentAssets, _previousAssets)
+        .Compare(_currentAssets, _previousAssets, true, () => ModelWorkerCancelled(worker))
         .Where(x => x.DisplayRecord?.HashInfo != null
           && x.DisplayRecord.HashInfo.Extension.Equals("GR2", StringComparison.OrdinalIgnoreCase))
         .ToList();
+      if (ModelWorkerCancelled(worker)) return false;
+
+      Int32 newCount = 0;
+      Int32 changedCount = 0;
+      Int32 removedCount = 0;
+      Int32 unchangedCount = 0;
 
       foreach (BuildFileDifference difference in differences) {
+        if (ModelWorkerCancelled(worker)) return false;
         HashFileInfo info = difference.DisplayRecord.HashInfo;
         String prefix = difference.State switch {
           BuildFileState.New => "/assets/new",
           BuildFileState.Changed => "/assets/changed",
           BuildFileState.Removed => "/assets/removed",
+          BuildFileState.Unchanged => "/assets/unchanged",
           _ => "/assets"
         };
 
@@ -655,16 +750,48 @@ namespace PugTools {
         };
         _assetDict.Add(id, asset);
         fileDirs.Add(parent);
+
+        switch (difference.State) {
+          case BuildFileState.New: newCount++; break;
+          case BuildFileState.Changed: changedCount++; break;
+          case BuildFileState.Removed: removedCount++; break;
+          case BuildFileState.Unchanged: unchangedCount++; break;
+        }
       }
 
-      backgroundWorker2.ReportProgress(100);
+      // Keep all four comparison buckets visible even when one of them is empty. Apart from making
+      // the result easier to read, this avoids a category silently disappearing between patches.
+      _assetDict["/assets/changed"] = new NodeAsset(
+        "/assets/changed", "/assets", "Changed GR2 (" + changedCount.ToString("N0") + ")", null
+      );
+      _assetDict["/assets/new"] = new NodeAsset(
+        "/assets/new", "/assets", "New GR2 (" + newCount.ToString("N0") + ")", null
+      );
+      _assetDict["/assets/removed"] = new NodeAsset(
+        "/assets/removed", "/assets", "Removed GR2 (" + removedCount.ToString("N0") + ")", null
+      );
+      _assetDict["/assets/unchanged"] = new NodeAsset(
+        "/assets/unchanged", "/assets", "Unchanged GR2 (" + unchangedCount.ToString("N0") + ")", null
+      );
+
+      if (!ModelWorkerCancelled(worker)) backgroundWorker2.ReportProgress(100);
+      return !ModelWorkerCancelled(worker);
     }
 
     private void BackgroundWorker2Completed(Object sender, RunWorkerCompletedEventArgs e) {
-      if (_closing) return;
+      if (_closing || e.Cancelled) return;
 
       if (e.Error != null) {
-        throw new Exception("Echter Fehler beim Laden (Worker 2): " + e.Error, e.Error);
+        ProgressBarHide();
+        LoadingSwirlHide();
+        StatusBarText("Model Browser could not build the model/appearance index.");
+        MessageBox.Show(
+          e.Error.GetBaseException().Message,
+          "Model Browser",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Error
+        );
+        return;
       }
 
       ParseTestRules();
@@ -676,30 +803,62 @@ namespace PugTools {
       backgroundWorker3.RunWorkerAsync();
     }
     private void BackgroundWorker3Run(Object sender, DoWorkEventArgs e) {
-      if (_closing) return;
+      BackgroundWorker worker = sender as BackgroundWorker;
+      if (ModelWorkerCancelled(worker)) { e.Cancel = true; return; }
 
       String getId(NodeAsset x) => x.id;
       String getParentId(NodeAsset x) => x.parentId;
       String getDisplayName(NodeAsset x) => x.displayName;
+      HashSet<String> parents = new HashSet<String>(
+        _assetDict.Values
+          .Select(x => x.parentId)
+          .Where(x => !String.IsNullOrWhiteSpace(x)),
+        StringComparer.Ordinal
+      );
+      Int32 getImageIndex(NodeAsset x) {
+        if (String.Equals(x.id, "/", StringComparison.Ordinal)) return 1;
+        return parents.Contains(x.id) ? 1 : 2;
+      }
 
-      treeViewFast1.BeginUpdate();
-      treeViewFast1.LoadItems<NodeAsset>(_assetDict, getId, getParentId, getDisplayName);
-      treeViewFast1.EndUpdate();
-      TreeViewFast1Show();
+      // Build only managed TreeNode objects here. Attaching them to the native WinForms TreeView
+      // from a BackgroundWorker is a cross-thread UI access and becomes especially fragile when
+      // Asset/Node/World Browser are initializing at the same time.
+      _preparedModelTree = TreeViewFast.Controls.TreeViewFast.PrepareItems(
+        _assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, null,
+        () => ModelWorkerCancelled(worker)
+      );
+      if (ModelWorkerCancelled(worker)) { _preparedModelTree = null; e.Cancel = true; }
     }
     private void BackgroundWorker3RunWorkerCompleted(Object sender, RunWorkerCompletedEventArgs e) {
-      if (_closing) return;
+      if (_closing || e.Cancelled) return;
 
       if (e.Error != null) {
-        throw new Exception("Echter Fehler beim Laden (Worker 3): " + e.Error, e.Error);
+        ProgressBarHide();
+        LoadingSwirlHide();
+        StatusBarText("Model Browser could not build the tree view.");
+        MessageBox.Show(
+          e.Error.GetBaseException().Message,
+          "Model Browser",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Error
+        );
+        return;
       }
+
+      treeViewFast1.BeginUpdate();
+      try {
+        if (_preparedModelTree != null) treeViewFast1.LoadPrepared(_preparedModelTree);
+      } finally {
+        treeViewFast1.EndUpdate();
+      }
+      TreeViewFast1Show();
 
       // treeViewFast1.Visible = true;
 
       ProgressBarHide();
       StatusBarText(
         _compareFiles
-          ? "Comparison loaded. GR2 Assets show New, Changed and Removed files."
+          ? "Comparison loaded. GR2 Assets show New, Changed, Removed and Unchanged files."
           : "Loading Complete."
       );
       ProgressBarValue(0);
@@ -708,11 +867,11 @@ namespace PugTools {
       _panelRender = new View_NPC_GR2(Handle, this, "renderPanel");
       _panelRender.Init();
 
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
-
       LoadingSwirlHide();
       RenderPanelShow();
       ButtonsEnable();
+      _gameplayTreeReady = true;
+      TryNavigateToGameplayNode();
 
       if (treeViewFast1.Nodes.Count > 0) {
         treeViewFast1.Nodes[0].Expand();
@@ -726,7 +885,30 @@ namespace PugTools {
 
     #region Buttons
     private void BtnExportClick(Object sender, EventArgs e) {
-      // _panelRender.ExportGeometry(Bodytype);
+      if (_models == null || _models.Count == 0 || !_models.Values.Any(x => x?.meshes != null && x.meshes.Count > 0)) {
+        MessageBox.Show(this, "Load a model with GR2 geometry first.", "Wavefront OBJ export", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        return;
+      }
+
+      using SaveFileDialog dialog = new SaveFileDialog {
+        AddExtension = true,
+        DefaultExt = "obj",
+        Filter = "Wavefront OBJ (*.obj)|*.obj|All files (*.*)|*.*",
+        FileName = "swtor_model.obj",
+        Title = "Export current Model Browser geometry"
+      };
+      if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+      try {
+        var stats = Gr2ObjExporter.Export(dialog.FileName, _models);
+        StatusBarText("OBJ exported: " + stats.Models.ToString("N0") + " models, " + stats.Meshes.ToString("N0") + " meshes, " + stats.Faces.ToString("N0") + " faces.");
+        MessageBox.Show(this,
+          "Export complete.\r\n\r\nOBJ: " + dialog.FileName + "\r\nMTL: " + Path.ChangeExtension(dialog.FileName, ".mtl") +
+          "\r\n\r\n" + stats.Faces.ToString("N0") + " triangle faces written.",
+          "Wavefront OBJ export", MessageBoxButtons.OK, MessageBoxIcon.Information);
+      } catch (Exception ex) {
+        MessageBox.Show(this, ex.Message, "Wavefront OBJ export failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+      }
     }
     private void BtnHelpClick(Object sender, EventArgs e) {
       ModelBrowserHelp helpForm = new ModelBrowserHelp();
@@ -743,20 +925,35 @@ namespace PugTools {
         btnToggleData.Text = "Show Data Panel";
       }
     }
-    private void BtnStopRenderClick(Object sender, EventArgs e) {
-      if (_panelRender != null) {
-        RenderPanelHide();
+    private Boolean StopModelRenderForPreview(Int32 timeoutMs = 1000) {
+      if (_panelRender == null || _render == null) return true;
 
-        if (_render != null) {
-          _panelRender.StopRender();
-          _render.Join();
-          _panelRender.Clear();
-        }
+      Thread renderThread = _render;
+      try { _panelRender.StopRender(); } catch { }
+
+      Boolean stopped = !renderThread.IsAlive;
+      if (!stopped) {
+        try { stopped = renderThread.Join(timeoutMs); } catch { }
       }
+      if (!stopped) {
+        StatusBarText("Previous 3D preview is still stopping.");
+        return false;
+      }
+
+      _render = null;
+      try { _panelRender.Clear(); } catch { }
+      return true;
+    }
+
+    private void BtnStopRenderClick(Object sender, EventArgs e) {
+      if (_panelRender == null) return;
+      RenderPanelHide();
+      StopModelRenderForPreview();
     }
     private void ButtonsEnable() {
       btnStopRender.Enabled = true;
       btnToggleData.Enabled = true;
+      btnExport.Enabled = true;
       btnHelp.Enabled = true;
     }
     #endregion
@@ -992,22 +1189,13 @@ namespace PugTools {
       }
     }
     private void DataGridViewClear() {
-      if (dataGridView1.InvokeRequired)
-        dataGridView1.Invoke(new Action(() => DataGridViewClear()));
-      else
-        dataGridView1.DataSource = null;
+      PostModelUi(() => { if (dataGridView1 != null) dataGridView1.DataSource = null; });
     }
     private void DataGridViewDisable() {
-      if (dataGridView1.InvokeRequired)
-        dataGridView1.Invoke(new Action(() => DataGridViewDisable()));
-      else
-        dataGridView1.Enabled = false;
+      PostModelUi(() => { if (dataGridView1 != null) dataGridView1.Enabled = false; });
     }
     private void DataGridViewEnable() {
-      if (dataGridView1.InvokeRequired)
-        dataGridView1.Invoke(new Action(() => DataGridViewEnable()));
-      else
-        dataGridView1.Enabled = true;
+      PostModelUi(() => { if (dataGridView1 != null) dataGridView1.Enabled = true; });
     }
     #endregion
 
@@ -1151,12 +1339,10 @@ namespace PugTools {
 
     #region LoadingSwirl
     private void LoadingSwirlHide() {
-      if (InvokeRequired) Invoke(new Action(() => LoadingSwirlHide()));
-      else loadingSwirl1.Visible = false;
+      PostModelUi(() => { if (loadingSwirl1 != null) loadingSwirl1.Visible = false; });
     }
     private void LoadingSwirlShow() {
-      if (InvokeRequired) Invoke(new Action(() => LoadingSwirlShow()));
-      else loadingSwirl1.Visible = true;
+      PostModelUi(() => { if (loadingSwirl1 != null) loadingSwirl1.Visible = true; });
     }
     #endregion
 
@@ -1829,12 +2015,10 @@ namespace PugTools {
         LoadingSwirlShow();
         ProgressBarShow();
 
-        if (_panelRender != null) {
-          if (_render != null) {
-            _panelRender.StopRender();
-            _render.Join();
-            _panelRender.Clear();
-          }
+        if (_panelRender != null && !StopModelRenderForPreview()) {
+          LoadingSwirlHide();
+          ProgressBarHide();
+          return;
         }
 
         _models ??= new Dictionary<String, GR2>();
@@ -1868,7 +2052,7 @@ namespace PugTools {
           GomObject obj = asset.Obj;
           NpcAppearance npcData;
           ItemAppearance itemData;
-          List<Object> visualList;
+          List<GomObjectData> visualList;
           Object weaponData;
 
           try {
@@ -1906,24 +2090,29 @@ namespace PugTools {
                 break;
               case "dyn":
                 try {
-                  visualList = obj.Data.ValueOrDefault<List<Object>>("dynVisualList", null);
+                  // Current SWTOR DYN nodes use dynObjectDataList (stable field id
+                  // 4611686038108070010). Older clients used dynVisualList.  The
+                  // serialized list may itself be a GomObjectData/map, so a strict
+                  // List<Object> cast makes perfectly valid current DYNs look empty.
+                  visualList = GetDynVisualRows(obj);
                   StatusBarText("Loading DYN Data ...");
                   Refresh();
 
-                  if (visualList != null) PreviewDYN(obj, visualList);
-                  else
-                    MessageBox.Show(
-                      "ERROR: Cannot load model! \r\nVisual List Missing",
-                      "Missing Visual List Spec"
-                    );
-
-                  StatusBarText("DYN Loaded");
+                  if (visualList.Count > 0) {
+                    PreviewDYN(obj, visualList);
+                    StatusBarText(_models != null && _models.Count > 0
+                      ? "DYN Loaded"
+                      : "DYN contains no resolvable GR2 visuals.");
+                  } else {
+                    // Some dyn.* helper/material nodes are not drawable themselves.
+                    // Do not interrupt browsing with a modal error for those nodes.
+                    StatusBarText("DYN contains no visual rows.");
+                  }
                 }
                 catch (Exception ex) {
                   MessageBox.Show(
-                    ex.Message.ToString() + "\r\n" + ex.InnerException.ToString() + "\r\n"
-                      + ex.StackTrace.ToString(),
-                    "Error"
+                    ex.GetBaseException().Message + "\r\n" + ex.StackTrace,
+                    "DYN Preview Error"
                   );
                 }
                 break;
@@ -1969,67 +2158,222 @@ namespace PugTools {
       }
     }
 
-    private void PreviewDYN(GomObject obj, List<Object> visualList) {
-      foreach (GomObjectData visualItem in visualList) {
-        String model = "";
-        String visualName = "";
+    private static Object DynDataValue(GomObjectData data, String name, String numericName) {
+      if (data == null) return null;
+      if (!String.IsNullOrWhiteSpace(name) && data.Dictionary.TryGetValue(name, out Object value))
+        return value;
+      if (!String.IsNullOrWhiteSpace(numericName) && data.Dictionary.TryGetValue(numericName, out value))
+        return value;
+      return null;
+    }
 
-        Vector3 rotationVec = new Vector3();
-        Vector3 scaleVec = new Vector3(1.0F, 1.0F, 1.0F);
-        Vector3 positionVec = new Vector3();
+    private static List<Object> DynListEntries(Object value) {
+      List<Object> result = new List<Object>();
+      if (value == null || value is String) return result;
 
-        foreach (KeyValuePair<String, Object> item in visualItem.Dictionary) {
-          if (item.Key == "dynVisualFqn") {
-            if (item.Value.ToString().Contains(".gr2"))
-              model = item.Value.ToString();
-            else
-              continue;
-          } else if (item.Key == "dynVisualName") {
-            visualName = item.Value.ToString();
-          } else if (item.Key == "dynRotation" || item.Key == "dynScale"
-                     || item.Key == "dynPosition") {
-            List<Single> value = (List<Single>)item.Value;
-
-            if (item.Key == "dynRotation")
-              rotationVec = new Vector3(value[0], value[1], value[2]);
-            else if (item.Key == "dynScale")
-              scaleVec = new Vector3(value[0], value[1], value[2]);
-            else if (item.Key == "dynPosition")
-              positionVec = new Vector3(value[0], value[1], value[2]);
-          } else {
-            continue;
-          }
+      // Newer GOM serializers can expose an array/map as GomObjectData with numeric
+      // property names rather than as List<Object>. Preserve wire order when possible.
+      if (value is GomObjectData gom) {
+        List<(Int32 Order, Object Value)> entries = new List<(Int32, Object)>();
+        Int32 fallback = 0;
+        foreach (KeyValuePair<String, Object> entry in gom.Dictionary) {
+          if (String.Equals(entry.Key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          Int32 order = Int32.TryParse(entry.Key, out Int32 parsed)
+            ? parsed
+            : Int32.MaxValue - 100000 + fallback++;
+          entries.Add((order, entry.Value));
         }
+        result.AddRange(entries.OrderBy(x => x.Order).Select(x => x.Value));
+        return result;
+      }
 
-        if (model.Contains("designblockout")) continue;
+      if (value is IDictionary dictionary) {
+        List<(Int32 Order, Object Value)> entries = new List<(Int32, Object)>();
+        Int32 fallback = 0;
+        foreach (DictionaryEntry entry in dictionary) {
+          String key = entry.Key?.ToString();
+          if (String.Equals(key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          Int32 order = Int32.TryParse(key, out Int32 parsed)
+            ? parsed
+            : Int32.MaxValue - 100000 + fallback++;
+          entries.Add((order, entry.Value));
+        }
+        result.AddRange(entries.OrderBy(x => x.Order).Select(x => x.Value));
+        return result;
+      }
 
-        File file = _currentAssets.FindFile("/resources" + model);
+      if (value is IEnumerable enumerable)
+        foreach (Object entry in enumerable) result.Add(entry);
+      return result;
+    }
 
-        if (file != null) {
-          using BinaryReader br = new BinaryReader(file.OpenCopyInMemory());
-          String name = model.Split('/').Last();
+    private static GomObjectData DynObjectData(Object value) {
+      if (value is GomObjectData data) return data;
+      if (value is IDictionary dictionary) {
+        GomObjectData copy = new GomObjectData();
+        foreach (DictionaryEntry entry in dictionary) {
+          String key = entry.Key?.ToString();
+          if (String.IsNullOrWhiteSpace(key)
+              || String.Equals(key, "_count", StringComparison.OrdinalIgnoreCase)) continue;
+          copy.Dictionary[key] = entry.Value;
+        }
+        return copy.Dictionary.Count > 0 ? copy : null;
+      }
+      return null;
+    }
 
-          GR2 gr2Model = new GR2(br, name) {
-            transformMatrix = Matrix.Scaling(scaleVec)
-              * Matrix.RotationZ((Single)(rotationVec.Z * Math.PI / 180))
-              * Matrix.RotationX((Single)(rotationVec.X * Math.PI / 180))
-              * Matrix.RotationY((Single)(rotationVec.Y * Math.PI / 180))
-              * Matrix.Translation(positionVec)
-          };
+    private static Single DynNumber(Object value, Single fallback) {
+      if (value == null) return fallback;
+      try {
+        Single result = Convert.ToSingle(value, System.Globalization.CultureInfo.InvariantCulture);
+        return Single.IsNaN(result) || Single.IsInfinity(result) ? fallback : result;
+      } catch { return fallback; }
+    }
 
-          try {
-            _models.Add(visualName, gr2Model);
-          }
-          catch (Exception ex) {
-            Debug.WriteLine(ex.StackTrace.ToString());
-          }
+    private static Vector3 DynVector3(Object value, Vector3 fallback) {
+      if (value is IList list && list.Count >= 3)
+        return new Vector3(
+          DynNumber(list[0], fallback.X),
+          DynNumber(list[1], fallback.Y),
+          DynNumber(list[2], fallback.Z)
+        );
+
+      // Some current GOM vectors are serialized as numeric-keyed object data.
+      List<Object> values = DynListEntries(value);
+      if (values.Count >= 3)
+        return new Vector3(
+          DynNumber(values[0], fallback.X),
+          DynNumber(values[1], fallback.Y),
+          DynNumber(values[2], fallback.Z)
+        );
+      return fallback;
+    }
+
+    private static void CollectNestedDynVisualRows(
+      Object value,
+      List<GomObjectData> output,
+      HashSet<Object> visited,
+      Int32 depth
+    ) {
+      if (value == null || output.Count >= 256 || depth > 6) return;
+      if (value is String) return;
+      if (!value.GetType().IsValueType && !visited.Add(value)) return;
+
+      GomObjectData data = DynObjectData(value);
+      if (data != null) {
+        Object visual = DynDataValue(data, "dynVisualFqn", "4611686038125770001");
+        if (visual != null && !String.IsNullOrWhiteSpace(visual.ToString())) output.Add(data);
+
+        foreach (Object child in data.Dictionary.Values)
+          CollectNestedDynVisualRows(child, output, visited, depth + 1);
+        return;
+      }
+
+      if (value is IDictionary dictionary) {
+        foreach (DictionaryEntry entry in dictionary)
+          CollectNestedDynVisualRows(entry.Value, output, visited, depth + 1);
+        return;
+      }
+
+      if (value is IEnumerable enumerable)
+        foreach (Object child in enumerable)
+          CollectNestedDynVisualRows(child, output, visited, depth + 1);
+    }
+
+    private static List<GomObjectData> GetDynVisualRows(GomObject obj) {
+      List<GomObjectData> rows = new List<GomObjectData>();
+      if (obj?.Data == null) return rows;
+
+      Object current = DynDataValue(obj.Data, "dynObjectDataList", "4611686038108070010");
+      foreach (Object raw in DynListEntries(current)) {
+        GomObjectData row = DynObjectData(raw);
+        if (row != null) rows.Add(row);
+      }
+
+      if (rows.Count == 0) {
+        Object legacy = DynDataValue(obj.Data, "dynVisualList", null);
+        foreach (Object raw in DynListEntries(legacy)) {
+          GomObjectData row = DynObjectData(raw);
+          if (row != null) rows.Add(row);
         }
       }
 
+      // A few helper/wrapper nodes expose the visual row one level deeper or put
+      // dynVisualFqn directly on the node. This bounded fallback keeps those useful
+      // without recursively walking the whole DOM.
+      if (rows.Count == 0) {
+        CollectNestedDynVisualRows(
+          obj.Data,
+          rows,
+          new HashSet<Object>(),
+          0
+        );
+      }
+
+      return rows
+        .Where(row => row != null)
+        .Distinct()
+        .Take(256)
+        .ToList();
+    }
+
+    private void PreviewDYN(GomObject obj, List<GomObjectData> visualList) {
+      Int32 visualIndex = 0;
+      foreach (GomObjectData visualItem in visualList) {
+        String model = DynDataValue(
+          visualItem,
+          "dynVisualFqn",
+          "4611686038125770001"
+        )?.ToString();
+
+        if (String.IsNullOrWhiteSpace(model)
+            || !model.EndsWith(".gr2", StringComparison.OrdinalIgnoreCase)
+            || model.Contains("designblockout", StringComparison.OrdinalIgnoreCase))
+          continue;
+
+        String visualName = DynDataValue(visualItem, "dynVisualName", null)?.ToString();
+        Vector3 rotationVec = DynVector3(
+          DynDataValue(visualItem, "dynRotation", "4611686038108070006"),
+          new Vector3()
+        );
+        Vector3 scaleVec = DynVector3(
+          DynDataValue(visualItem, "dynScale", "4611686038108070007"),
+          new Vector3(1.0F, 1.0F, 1.0F)
+        );
+        Vector3 positionVec = DynVector3(
+          DynDataValue(visualItem, "dynPosition", "4611686038108070005"),
+          new Vector3()
+        );
+
+        String resourcePath = model.Replace('\\', '/');
+        if (!resourcePath.StartsWith("/resources", StringComparison.OrdinalIgnoreCase))
+          resourcePath = "/resources" + (resourcePath.StartsWith("/") ? "" : "/") + resourcePath;
+
+        File file = _currentAssets.FindFile(resourcePath);
+        if (file == null) continue;
+
+        using BinaryReader br = new BinaryReader(file.OpenCopyInMemory());
+        String name = resourcePath.Split('/').Last();
+        GR2 gr2Model = new GR2(br, name) {
+          transformMatrix = Matrix.Scaling(scaleVec)
+            * Matrix.RotationZ((Single)(rotationVec.Z * Math.PI / 180))
+            * Matrix.RotationX((Single)(rotationVec.X * Math.PI / 180))
+            * Matrix.RotationY((Single)(rotationVec.Y * Math.PI / 180))
+            * Matrix.Translation(positionVec)
+        };
+
+        String key = !String.IsNullOrWhiteSpace(visualName)
+          ? visualName
+          : name + "#" + visualIndex;
+        while (_models.ContainsKey(key)) key = name + "#" + (++visualIndex);
+        _models[key] = gr2Model;
+        visualIndex++;
+      }
+
+      if (_models == null || _models.Count == 0) return;
+
       _panelRender.LoadModel(_models, _resources, obj.Name, "dyn");
-
       _render = new Thread(_panelRender.StartRender) { IsBackground = true };
-
       _render.Start();
     }
 
@@ -2190,15 +2534,16 @@ namespace PugTools {
       if (!String.IsNullOrWhiteSpace(placeableModel))
         loaded |= LoadGR2Model(placeableModel, key);
 
-      // Dynamic decoration nodes can contain one or several visual GR2s.
-      List<Object> visualList =
-        node.Data.ValueOrDefault<List<Object>>("dynVisualList", null);
-      if (visualList != null) {
-        foreach (GomObjectData visualItem in visualList.OfType<GomObjectData>()) {
-          String model = visualItem.ValueOrDefault<String>("dynVisualFqn", null);
-          if (!String.IsNullOrWhiteSpace(model))
-            loaded |= LoadGR2Model(model, model.Replace('\\', '/').Split('/').Last());
-        }
+      // Dynamic decoration nodes can contain one or several visual GR2s. Support
+      // both the current dynObjectDataList and the legacy dynVisualList layouts.
+      foreach (GomObjectData visualItem in GetDynVisualRows(node)) {
+        String model = DynDataValue(
+          visualItem,
+          "dynVisualFqn",
+          "4611686038125770001"
+        )?.ToString();
+        if (!String.IsNullOrWhiteSpace(model))
+          loaded |= LoadGR2Model(model, model.Replace('\\', '/').Split('/').Last());
       }
 
       // Some wrappers point at another object by FQN rather than by node ID.
@@ -2824,8 +3169,7 @@ namespace PugTools {
 
     #region RenderPanel
     private void RenderPanelHide() {
-      if (InvokeRequired) Invoke(new Action(() => RenderPanelHide()));
-      else renderPanel.Visible = false;
+      PostModelUi(() => { if (renderPanel != null) renderPanel.Visible = false; });
     }
 
     private void RenderPanelMouseHover(Object sender, EventArgs e) {
@@ -2841,50 +3185,38 @@ namespace PugTools {
     }
 
     private void RenderPanelShow() {
-      if (InvokeRequired) Invoke(new Action(() => RenderPanelShow()));
-      else renderPanel.Visible = true;
+      PostModelUi(() => { if (renderPanel != null) renderPanel.Visible = true; });
     }
 
     #endregion
 
+    private void PostModelUi(Action action) {
+      if (action == null || _closing || IsDisposed || Disposing) return;
+      if (InvokeRequired) {
+        if (!IsHandleCreated) return;
+        try { BeginInvoke(new Action(() => { if (!_closing && !IsDisposed && !Disposing) action(); })); } catch { }
+        return;
+      }
+      action();
+    }
+
     #region Progress Bar
-    private void ProgressBarHide() {
-      if (InvokeRequired) Invoke(new Action(() => ProgressBarHide()));
-      else toolStripProgressBar1.Visible = false;
-    }
+    private void ProgressBarHide() { PostModelUi(() => { if (toolStripProgressBar1 != null) toolStripProgressBar1.Visible = false; }); }
 
-    private void ProgressBarShow() {
-      if (InvokeRequired) Invoke(new Action(() => ProgressBarShow()));
-      else toolStripProgressBar1.Visible = true;
-    }
+    private void ProgressBarShow() { PostModelUi(() => { if (toolStripProgressBar1 != null) toolStripProgressBar1.Visible = true; }); }
 
-    private void ProgressBarStyle(ProgressBarStyle style) {
-      if (InvokeRequired) Invoke(new Action(() => ProgressBarStyle(style)));
-      else toolStripProgressBar1.Style = style;
-    }
+    private void ProgressBarStyle(ProgressBarStyle style) { PostModelUi(() => { if (toolStripProgressBar1 != null) toolStripProgressBar1.Style = style; }); }
 
-    private void ProgressBarValue(Int32 value) {
-      if (InvokeRequired) Invoke(new Action(() => ProgressBarValue(value)));
-      else toolStripProgressBar1.Value = value;
-    }
+    private void ProgressBarValue(Int32 value) { PostModelUi(() => { if (toolStripProgressBar1 != null) toolStripProgressBar1.Value = Math.Max(toolStripProgressBar1.Minimum, Math.Min(toolStripProgressBar1.Maximum, value)); }); }
 
     #endregion
 
     #region Status Bar Text
-    internal void StatusBarText(String text) {
-      if (InvokeRequired) Invoke(new Action(() => StatusBarText(text)));
-      else toolStripStatusLabel1.Text = text;
-    }
+    internal void StatusBarText(String text) { PostModelUi(() => { if (toolStripStatusLabel1 != null) toolStripStatusLabel1.Text = text; }); }
 
-    private void StatusBarTextHide() {
-      if (InvokeRequired) Invoke(new Action(() => StatusBarTextHide()));
-      else toolStripStatusLabel1.Visible = false;
-    }
+    private void StatusBarTextHide() { PostModelUi(() => { if (toolStripStatusLabel1 != null) toolStripStatusLabel1.Visible = false; }); }
 
-    private void StatusBarTextShow() {
-      if (InvokeRequired) Invoke(new Action(() => StatusBarTextShow()));
-      else toolStripStatusLabel1.Visible = true;
-    }
+    private void StatusBarTextShow() { PostModelUi(() => { if (toolStripStatusLabel1 != null) toolStripStatusLabel1.Visible = true; }); }
 
     #endregion
 
@@ -2965,11 +3297,9 @@ namespace PugTools {
 
       if (_panelRender != null) {
         renderPanel.Visible = false;
-
-        if (_render != null) {
-          _panelRender.StopRender();
-          _render.Join();
-          _panelRender.Clear();
+        if (!StopModelRenderForPreview()) {
+          ProgressBarHide();
+          return;
         }
       }
 
@@ -3011,8 +3341,7 @@ namespace PugTools {
     }
 
     private void TreeViewFast1Hide() {
-      if (InvokeRequired) Invoke(new Action(() => TreeViewFast1Hide()));
-      else treeViewFast1.Visible = false;
+      PostModelUi(() => { if (treeViewFast1 != null) treeViewFast1.Visible = false; });
     }
 
     private void TreeViewFast1MouseHover(Object sender, EventArgs e) {
@@ -3046,8 +3375,7 @@ namespace PugTools {
     }
 
     private void TreeViewFast1Show() {
-      if (InvokeRequired) Invoke(new Action(() => TreeViewFast1Show()));
-      else treeViewFast1.Visible = true;
+      PostModelUi(() => { if (treeViewFast1 != null) treeViewFast1.Visible = true; });
     }
 
     #endregion
@@ -3191,13 +3519,11 @@ namespace PugTools {
     }
 
     private void TreeViewFast2Clear() {
-      if (InvokeRequired) Invoke(new Action(() => TreeViewFast2Clear()));
-      else treeViewFast2.Nodes.Clear();
+      PostModelUi(() => { if (treeViewFast2 != null) treeViewFast2.Nodes.Clear(); });
     }
 
     private void TreeViewFast2Disable() {
-      if (InvokeRequired) Invoke(new Action(() => TreeViewFast2Disable()));
-      else treeViewFast2.Enabled = false;
+      PostModelUi(() => { if (treeViewFast2 != null) treeViewFast2.Enabled = false; });
     }
 
     // private void TreeViewFast2Enable() {

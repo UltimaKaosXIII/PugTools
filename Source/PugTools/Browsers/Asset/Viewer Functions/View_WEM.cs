@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -10,6 +10,7 @@ using NAudio.Wave;
 namespace PugTools {
   internal class ViewWEM {
     private readonly UInt32 _id;
+    internal UInt32 Id => _id;
     internal Byte[] Data { get; set; }
     internal Int64 Length { get; set; }
     internal String WemName { get; set; }

@@ -37,6 +37,8 @@ namespace PugTools {
       { "spn_grp", "/resources/engine/spawner/spawner_group.gr2" },
       { "spn_rly", "/resources/engine/spawner/spawner_rallypoint.gr2" },
       { "spn_seed", "/resources/engine/spawners/spawner_seed_point.gr2" },
+      // Generic pedestal used by effect/audio/camera authoring helpers that do not have a dedicated live marker.
+      { "pedestal", "/resources/engine/utility/util_cube_hidden.gr2" },
       // These marker shapes were beta-only in Jedipedia's catalogue. Use a stable live stand-in when available;
       // the overlay tint still distinguishes the placement kind and the fallback cross covers missing assets.
       { "spn_pt", "/resources/engine/spawner/spawner_movepoint_1.gr2" },

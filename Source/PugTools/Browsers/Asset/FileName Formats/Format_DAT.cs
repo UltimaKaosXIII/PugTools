@@ -126,11 +126,20 @@ namespace PugTools {
       br.BaseStream.Position = guidOffset;
       UInt64 areaGuid = br.ReadUInt64();
 
-      String areaID = null;   //areaGuid not usually the correct ID in the file path
-
-      if (_filename.Contains("/resources/world/areas")) {
-        areaID = _filename.Replace("/resources/world/areas/", "").Replace("/area.dat", "");
-        FileNames.Add("/resources/world/areas/" + areaID + "/mapnotes.not");
+      // The path segment is more authoritative than the GUID stored inside the file. Retail
+      // live-content worlds use /resources/world/livecontent/systemgenerated/<id>/area.dat,
+      // while ordinary worlds live below /resources/world/areas/<id>. Keep the actual parent
+      // directory so room/mapnote candidates stay in the same namespace instead of being moved
+      // back under /world/areas (Jedipedia also resolves rooms relative to the loaded area.dat).
+      String areaDirectory = null;
+      String normalizedFileName = (_filename ?? String.Empty).Replace('\\', '/').ToLowerInvariant();
+      if (normalizedFileName.EndsWith("/area.dat", StringComparison.Ordinal)) {
+        String parent = normalizedFileName.Substring(0, normalizedFileName.Length - "/area.dat".Length);
+        if (parent.StartsWith("/resources/world/areas/", StringComparison.Ordinal)
+            || parent.StartsWith("/resources/world/livecontent/systemgenerated/", StringComparison.Ordinal)) {
+          areaDirectory = parent;
+          FileNames.Add(areaDirectory + "/mapnotes.not");
+        }
       }
 
       //Rooms
@@ -141,8 +150,8 @@ namespace PugTools {
         UInt32 nameLength = br.ReadUInt32();
         String room = ReadString(br, nameLength).ToLower();
 
-        if (areaID != null)
-          FileNames.Add(String.Format("/resources/world/areas/{0}/{1}.dat", areaID, room));
+        if (areaDirectory != null)
+          FileNames.Add(areaDirectory + "/" + room + ".dat");
         else
           FileNames.Add(String.Format("/resources/world/areas/{0}/{1}.dat", areaGuid, room));
       }

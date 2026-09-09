@@ -10,6 +10,7 @@ using System.Windows.Forms;
 using GomLib;
 using GomLib.Models;
 using NAudio.Wave;
+using SlimDX;
 
 namespace PugTools {
   public partial class WorldBrowser {
@@ -32,6 +33,8 @@ namespace PugTools {
     private Conversation worldConversationPlaybackConversation;
     private DialogNode worldConversationPlaybackNode;
     private WorldNpcPlacement worldConversationPrimaryNpc;
+    private WorldSpnPlacement worldConversationPrimarySpn;
+    private Vector3? worldConversationOriginCameraPosition;
     // The clicked/started-on body stands in for at most one speaker the AREA itself never placed. Current Jedipedia
     // does this to avoid synthesizing a duplicate character beside the NPC that launched the conversation.
     private string worldConversationPrimaryStandInFqn;
@@ -58,26 +61,33 @@ namespace PugTools {
     private void StartWorldConversationPlayback(WorldInteractionInfo interaction) {
       if (!CanOpenWorldConversation(interaction)) return;
       WorldNpcPlacement primaryNpc = panelRender?.InteractionTargetWorldNpcPlacement;
+      WorldSpnPlacement primarySpn = panelRender?.InteractionTargetWorldSpnPlacement;
       if (!TryLoadWorldConversation(interaction, out Conversation conversation, out string error)) {
         MessageBox.Show(this, error ?? "The conversation could not be loaded.", "Conversation playback", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         return;
       }
-      StartWorldConversationPlayback(conversation, primaryNpc);
+      StartWorldConversationPlayback(conversation, primaryNpc, primarySpn, null);
     }
 
     private void StartWorldConversationPlayback(Conversation conversation) {
-      StartWorldConversationPlayback(conversation, null, null);
+      StartWorldConversationPlayback(conversation, null, null, null);
     }
 
     private void StartWorldConversationPlayback(Conversation conversation, WorldNpcPlacement primaryNpc) {
-      StartWorldConversationPlayback(conversation, primaryNpc, null);
+      StartWorldConversationPlayback(conversation, primaryNpc, null, null);
     }
 
     private void StartWorldConversationPlayback(Conversation conversation, WorldNpcPlacement primaryNpc, long? startNode) {
+      StartWorldConversationPlayback(conversation, primaryNpc, null, startNode);
+    }
+
+    private void StartWorldConversationPlayback(Conversation conversation, WorldNpcPlacement primaryNpc, WorldSpnPlacement primarySpn, long? startNode) {
       if (conversation?.NodeLookup == null || conversation.NodeLookup.Count == 0) return;
       EnsureWorldConversationPlaybackForm();
       StopWorldConversationPlayback(false);
       worldConversationPrimaryNpc = primaryNpc;
+      worldConversationPrimarySpn = primarySpn;
+      worldConversationOriginCameraPosition = panelRender != null ? panelRender.CurrentCameraPosition : (Vector3?)null;
       worldConversationPrimaryStandInFqn = null;
       worldConversationPlaybackConversation = conversation;
       worldConversationPlaybackForm.Text = "Conversation — " + (conversation.Fqn ?? "(unnamed)");
@@ -169,6 +179,7 @@ namespace PugTools {
       tree.Click += (_, __) => {
         if (worldConversationPlaybackConversation == null) return;
         worldConversationPreviewPrimaryNpc = worldConversationPrimaryNpc;
+        worldConversationPreviewPrimarySpn = worldConversationPrimarySpn;
         ShowWorldConversationPreview(worldConversationPlaybackConversation, false);
       };
       worldConversationPlaybackNext.Click += (_, __) => ContinueWorldConversationAfterLine();
@@ -563,7 +574,8 @@ namespace PugTools {
       if (worldConversationPlaybackChoices != null) worldConversationPlaybackChoices.Controls.Clear();
       if (worldConversationPlaybackNext != null) worldConversationPlaybackNext.Enabled = false;
       if (clearConversation) {
-        worldConversationPlaybackConversation = null; worldConversationPrimaryNpc = null;
+        worldConversationPlaybackConversation = null; worldConversationPrimaryNpc = null; worldConversationPrimarySpn = null;
+        worldConversationOriginCameraPosition = null;
         worldConversationPlayerNpc = null;
       }
       if (worldConversationPlaybackStatus != null) worldConversationPlaybackStatus.Text = clearConversation ? String.Empty : "Playback stopped.";

@@ -9,8 +9,8 @@ namespace TorArchive {
     private readonly Object m_previousLock = new Object();
     private Assets m_currentData;
     private Assets m_previousData;
-    private Boolean m_currentLoaded;
-    private Boolean m_previousLoaded;
+    private volatile Boolean m_currentLoaded;
+    private volatile Boolean m_previousLoaded;
 
     // public Dictionary<string, Assets> loadedData = new Dictionary<string, Assets>();
 
@@ -34,8 +34,8 @@ namespace TorArchive {
       }
 
       if (disposing) {
-        m_currentData.Dispose();
-        m_previousData.Dispose();
+        m_currentData?.Dispose();
+        m_previousData?.Dispose();
       }
       m_disposed = true;
     }
@@ -44,50 +44,34 @@ namespace TorArchive {
 
     #region Methods
     public Assets GetCurrentAssets(String path = null, Boolean isPTR = false) {
-      // Multiple browser windows can call this concurrently (e.g. two browsers opened close
-      // together, both racing to trigger the first load). Without a lock, both could start
-      // constructing/loading Assets at once, wasting work at best and corrupting shared state
-      // at worst. Double-checked locking: cheap re-check outside the lock for the common case
-      // (already loaded), real check + load happens only once, serialized, inside the lock.
-      if (m_currentLoaded) {
+      // Browser startup is not a hot path; always take the same lock used by unload so a source
+      // cannot be disposed between a fast-path Loaded check and the returned reference.
+      lock (m_currentLock) {
+        if (m_currentLoaded) return m_currentData;
+
+        if (path == null)
+          throw new ArgumentException("No path to the assests was provided");
+
+        m_currentData = new Assets(path);
+        m_currentData.Load(isPTR);
+        m_currentLoaded = true;
         return m_currentData;
       }
-
-      lock (m_currentLock) {
-        if (m_currentLoaded) {
-          return m_currentData;
-        }
-
-        if (path != null) {
-          m_currentData = new Assets(path);
-          m_currentData.Load(isPTR);
-          m_currentLoaded = true;
-
-          return m_currentData;
-        } else {
-          throw new ArgumentException("No path to the assests was provided");
-        }
-      }
     }
-    public Assets GetPreviousAssets(String path = null, Boolean isPTR = false) {
-      if (m_previousLoaded) {
-        return m_previousData;
-      }
 
+    public Assets GetPreviousAssets(String path = null, Boolean isPTR = false) {
       lock (m_previousLock) {
-        if (m_previousLoaded) {
-          return m_previousData;
-        } else {
-          if (path != null) {
-            m_previousData = new Assets(path);
-            m_previousData.Load(isPTR);
-            m_previousLoaded = true;
-            HashDictionaryInstance.Instance.Unload();
-            return m_previousData;
-          } else {
-            throw new ArgumentException("No path to the assests were provided");
-          }
-        }
+        if (m_previousLoaded) return m_previousData;
+
+        if (path == null)
+          throw new ArgumentException("No path to the assests were provided");
+
+        m_previousData = new Assets(path);
+        m_previousData.Load(isPTR);
+        m_previousLoaded = true;
+        // HashDictionaryInstance is shared by every open browser. Loading a comparison build
+        // must not tear down the filename cache used by the current build/browser windows.
+        return m_previousData;
       }
     }
 
@@ -102,31 +86,41 @@ namespace TorArchive {
 
     #region Unload Data
     public void UnloadAllAssets() {
-      if (m_currentLoaded) {
-        m_currentData.Dispose();
-        m_currentData = null;
-        m_currentLoaded = false;
+      // Use the same locks as GetCurrent/GetPrevious so an explicit unload cannot dispose an
+      // Assets instance while another browser is in the middle of first-load publication.
+      lock (m_currentLock) {
+        if (m_currentLoaded) {
+          m_currentData?.Dispose();
+          m_currentData = null;
+          m_currentLoaded = false;
+        }
       }
-
-      if (m_previousLoaded) {
-        m_previousData.Dispose();
-        m_previousData = null;
-        m_previousLoaded = false;
+      lock (m_previousLock) {
+        if (m_previousLoaded) {
+          m_previousData?.Dispose();
+          m_previousData = null;
+          m_previousLoaded = false;
+        }
       }
-      GC.Collect();
+      // Assets can be very large. Let the runtime reclaim them incrementally instead of forcing
+      // a full stop-the-world collection on the UI path.
     }
     public void UnloadCurrentAssets() {
-      if (m_currentLoaded) {
-        m_currentData.Dispose();
-        m_currentData = null;
-        m_currentLoaded = false;
+      lock (m_currentLock) {
+        if (m_currentLoaded) {
+          m_currentData?.Dispose();
+          m_currentData = null;
+          m_currentLoaded = false;
+        }
       }
     }
     public void UnloadPreviousAssets() {
-      if (m_previousLoaded) {
-        m_previousData.Dispose();
-        m_previousData = null;
-        m_previousLoaded = false;
+      lock (m_previousLock) {
+        if (m_previousLoaded) {
+          m_previousData?.Dispose();
+          m_previousData = null;
+          m_previousLoaded = false;
+        }
       }
     }
 

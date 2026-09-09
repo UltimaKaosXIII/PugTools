@@ -59,7 +59,8 @@ namespace PugTools {
       backgroundWorker1.RunWorkerAsync();
     }
     public void AssetBrowserFileTable_FormClosed(Object sender, FormClosedEventArgs e) {
-      HashDictionaryInstance.Instance.Unload();
+      // The hash dictionary is a process-wide cache used by all browser windows. This child
+      // window only drops its own UI data; unloading the shared cache here races other browsers.
 
       if (treeViewFast1 != null) {
         treeViewFast1.Dispose();
@@ -513,7 +514,7 @@ namespace PugTools {
 
         foreach (File file in files) {
           HashFileInfo hashInfo =
-            new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file);
+            new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file, true, false);
 
           if (hashInfo.FileName.Contains("metadata.bin") || hashInfo.FileName.Contains("ft.sig"))
             continue;

@@ -136,7 +136,7 @@
             _palette1Spec = FX.GetVariableByName("Palette1Specular").AsVector();
             _palette2Spec = FX.GetVariableByName("Palette2Specular").AsVector();
             _palette1MetSpec = FX.GetVariableByName("Palette1MetallicSpecular").AsVector();
-            _palette2MetSpec = FX.GetVariableByName("Palette1MetallicSpecular").AsVector();
+            _palette2MetSpec = FX.GetVariableByName("Palette2MetallicSpecular").AsVector();
 
             _flushTone = FX.GetVariableByName("FlushTone").AsVector();
             _fleshBrightness = FX.GetVariableByName("FleshBrightness").AsScalar();
@@ -235,11 +235,11 @@
         }
         public void SetPalette1MetSpec(Vector4 v)
         {
-            _palette1Spec.Set(v);
+            _palette1MetSpec.Set(v);
         }
         public void SetPalette2MetSpec(Vector4 v)
         {
-            _palette2Spec.Set(v);
+            _palette2MetSpec.Set(v);
         }
         public void SetFlushTone(Vector4 v)
         {

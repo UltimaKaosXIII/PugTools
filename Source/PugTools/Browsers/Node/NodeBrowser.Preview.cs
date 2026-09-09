@@ -29,6 +29,9 @@ namespace PugTools {
     private RichTextBox _nodePreviewText;
     private Label _nodePreviewModelLabel;
     private CheckBox _nodePreviewIppSetCheck;
+    private Button _nodeGameplayButton;
+    private NodeGameplayExplorer _nodeGameplayExplorer;
+    private static readonly Object NodePreviewDevIlLock = new Object();
     private View_NPC_GR2 _nodePreviewRenderer;
     private Thread _nodePreviewRenderThread;
     private Dictionary<String, GR2> _nodePreviewModels;
@@ -126,6 +129,17 @@ namespace PugTools {
         Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
       };
       _nodePreviewInfoPanel.Controls.Add(_nodePreviewMeta);
+
+      _nodeGameplayButton = new Button {
+        AutoSize = false,
+        Size = new Size(136, 28),
+        Text = "Gameplay explorer",
+        Anchor = AnchorStyles.Top | AnchorStyles.Right,
+        Location = new Point(Math.Max(8, _nodePreviewInfoPanel.ClientSize.Width - 144), 8),
+        Visible = false
+      };
+      _nodeGameplayButton.Click += delegate { OpenNodeGameplayExplorer(); };
+      _nodePreviewInfoPanel.Controls.Add(_nodeGameplayButton);
 
       _nodePreviewIppSetCheck = new CheckBox {
         AutoSize = true,
@@ -262,6 +276,10 @@ namespace PugTools {
 
       PreviewContent content = BuildPreviewContent(gom);
       UpdateNodeConversationButton(gom);
+      if (_nodeGameplayButton != null) {
+        _nodeGameplayButton.Visible = NodeGameplayExplorer.Supports(gom);
+        _nodeGameplayButton.Enabled = _nodeGameplayButton.Visible;
+      }
       Boolean isIpp = gom.Name.StartsWith("ipp.", StringComparison.OrdinalIgnoreCase);
       Int32 ippSetCount = isIpp ? GetIppSetObjects(gom).Count : 0;
       _nodePreviewUpdatingIppSetCheck = true;
@@ -319,8 +337,9 @@ namespace PugTools {
         _nodePreviewTitle.Left = 8;
         _nodePreviewMeta.Left = 8;
       }
-      _nodePreviewTitle.Width = Math.Max(10, _nodePreviewInfoPanel.ClientSize.Width - _nodePreviewTitle.Left - 8);
-      _nodePreviewMeta.Width = Math.Max(10, _nodePreviewInfoPanel.ClientSize.Width - _nodePreviewMeta.Left - 8);
+      Int32 gameplayReserve = _nodeGameplayButton != null && _nodeGameplayButton.Visible ? _nodeGameplayButton.Width + 16 : 8;
+      _nodePreviewTitle.Width = Math.Max(10, _nodePreviewInfoPanel.ClientSize.Width - _nodePreviewTitle.Left - gameplayReserve);
+      _nodePreviewMeta.Width = Math.Max(10, _nodePreviewInfoPanel.ClientSize.Width - _nodePreviewMeta.Left - gameplayReserve);
       UpdateNodeReferencePanel(gom);
       LayoutNodePreviewInformation();
 
@@ -328,8 +347,73 @@ namespace PugTools {
       ResizeNodePreviewLayout();
     }
 
+    private void OpenNodeGameplayExplorer() {
+      if (treeViewFast1?.SelectedNode?.Tag is not NodeAsset asset || asset.Obj == null || _currentDom == null) return;
+      if (!NodeGameplayExplorer.Supports(asset.Obj)) return;
+      try {
+        if (_nodeGameplayExplorer != null && !_nodeGameplayExplorer.IsDisposed) _nodeGameplayExplorer.Dispose();
+      } catch { }
+      _nodeGameplayExplorer = new NodeGameplayExplorer(
+        _currentDom, asset.Obj, delegate (String fqn) { NavigateToNodeName(fqn); }, OpenGameplayWorldMapNote, OpenGameplayModelPreview,
+        TryLoadGameplayGraphIcon,
+        delegate { return _nodePreviewIcon?.Image is Bitmap bitmap ? new Bitmap(bitmap) : null; });
+      _nodeGameplayExplorer.FormClosed += delegate { _nodeGameplayExplorer = null; };
+      _nodeGameplayExplorer.Show(this);
+    }
+
+    private void OpenGameplayWorldMapNote(MapNote note) {
+      if (note == null || String.IsNullOrWhiteSpace(note.Fqn)) return;
+      WorldBrowser world = null;
+      try {
+        world = Application.OpenForms.OfType<WorldBrowser>().FirstOrDefault(x => x != null && !x.IsDisposed && x.MatchesGameplayAssetSource(_assetsLocation, _assetsUsePts));
+      } catch { }
+      if (world == null) {
+        world = new WorldBrowser(_assetsLocation, _assetsUsePts);
+        world.Show();
+      } else {
+        if (!world.Visible) world.Show();
+        if (world.WindowState == FormWindowState.Minimized) world.WindowState = FormWindowState.Normal;
+      }
+      world.BringToFront();
+      world.Focus();
+      world.NavigateToGameplayMapNote(note.Fqn);
+    }
+
+    private void OpenGameplayModelPreview(String fqn) {
+      if (String.IsNullOrWhiteSpace(fqn)) return;
+      ModelBrowser model = null;
+      try {
+        model = Application.OpenForms.OfType<ModelBrowser>()
+          .FirstOrDefault(x => x != null && !x.IsDisposed && x.MatchesGameplayAssetSource(_assetsLocation, _assetsUsePts));
+      } catch { }
+      if (model == null) {
+        model = new ModelBrowser(_assetsLocation, _assetsUsePts, _previousAssetsLocation, _previousAssetsUsePts, _compareNodes);
+        model.Show();
+      } else {
+        if (!model.Visible) model.Show();
+        if (model.WindowState == FormWindowState.Minimized) model.WindowState = FormWindowState.Normal;
+      }
+      model.BringToFront();
+      model.Focus();
+      model.NavigateToGameplayNode(fqn);
+    }
+
+    private Bitmap TryLoadGameplayGraphIcon(String fqn) {
+      if (_closing || _currentDom == null || String.IsNullOrWhiteSpace(fqn)) return null;
+      try {
+        GomObject gom = _currentDom.GetObject(fqn);
+        if (gom == null) return null;
+        GameObject model = null;
+        try { model = GameObject.Load(gom, true); } catch { }
+        String icon = FindIconValue(model);
+        if (String.IsNullOrWhiteSpace(icon)) icon = FindRawIconValue(gom);
+        return TryLoadNodeIcon(icon, gom);
+      } catch { return null; }
+    }
+
     private void HideNodePreview() {
       StopNodePreviewRenderer(false);
+      if (_nodeGameplayButton != null) { _nodeGameplayButton.Visible = false; _nodeGameplayButton.Enabled = false; }
       if (_nodePreviewContentSplit != null) _nodePreviewContentSplit.Panel2Collapsed = true;
       if (_nodePreviewSplit != null) _nodePreviewSplit.Panel1Collapsed = true;
       if (_nodePreviewIcon?.Image != null) {
@@ -876,14 +960,16 @@ namespace PugTools {
           using TorFile file = _currentAssets.FindFile(path);
           if (file == null) continue;
           using Stream input = file.OpenCopyInMemory();
-          DevIL.ImageImporter importer = new DevIL.ImageImporter();
-          DevIL.Image image = importer.LoadImageFromStream(DevIL.ImageType.Dds, input);
-          using MemoryStream output = new MemoryStream();
-          DevIL.ImageExporter exporter = new DevIL.ImageExporter();
-          exporter.SaveImageToStream(image, DevIL.ImageType.Png, output);
-          output.Position = 0;
-          using Bitmap temporary = new Bitmap(output);
-          return new Bitmap(temporary);
+          lock (NodePreviewDevIlLock) {
+            DevIL.ImageImporter importer = new DevIL.ImageImporter();
+            DevIL.Image image = importer.LoadImageFromStream(DevIL.ImageType.Dds, input);
+            using MemoryStream output = new MemoryStream();
+            DevIL.ImageExporter exporter = new DevIL.ImageExporter();
+            exporter.SaveImageToStream(image, DevIL.ImageType.Png, output);
+            output.Position = 0;
+            using Bitmap temporary = new Bitmap(output);
+            return new Bitmap(temporary);
+          }
         } catch { }
       }
       return null;
@@ -1461,22 +1547,48 @@ namespace PugTools {
     }
 
     private void StopNodePreviewRenderer(Boolean disposeRenderer) {
-      try { _nodePreviewRenderer?.StopRender(); } catch { }
-      try {
-        if (_nodePreviewRenderThread != null && _nodePreviewRenderThread.IsAlive)
-          _nodePreviewRenderThread.Join(750);
-      } catch { }
+      View_NPC_GR2 renderer = _nodePreviewRenderer;
+      Thread renderThread = _nodePreviewRenderThread;
+
+      try { renderer?.StopRender(); } catch { }
+
+      Boolean stopped = renderThread == null || !renderThread.IsAlive;
+      if (!stopped) {
+        try { stopped = renderThread.Join(disposeRenderer ? 100 : 500); } catch { }
+      }
+
       _nodePreviewRenderThread = null;
 
-      if (_nodePreviewRenderer != null) {
-        try { _nodePreviewRenderer.Clear(); } catch { }
-        if (disposeRenderer) {
-          try { _nodePreviewRenderer.Dispose(); } catch { }
-          _nodePreviewRenderer = null;
-        }
-      } else {
+      if (renderer == null) {
         DisposeUnrenderedNodeModels();
+        _nodePreviewModels = null;
+        _nodePreviewResources = null;
+        return;
       }
+
+      if (disposeRenderer || !stopped) {
+        // Never perform the expensive D3D release on the WinForms close path,
+        // and never Clear()/Dispose() while the render thread is still inside
+        // DrawScene/Present. Detach it and finish bounded cleanup in the
+        // background. A later preview creates a fresh renderer if necessary.
+        _nodePreviewRenderer = null;
+        _nodePreviewModels = null;
+        _nodePreviewResources = null;
+        ThreadPool.QueueUserWorkItem(_ => {
+          Boolean eventuallyStopped = stopped || renderThread == null || !renderThread.IsAlive;
+          if (!eventuallyStopped) {
+            try { eventuallyStopped = renderThread.Join(5000); } catch { }
+          }
+          if (!eventuallyStopped) return;
+          try { renderer.Clear(); } catch { }
+          try { renderer.Dispose(); } catch { }
+        });
+        return;
+      }
+
+      // Normal preview-to-preview replacement: the render thread has stopped,
+      // so Clear() is safe and the initialized renderer can be reused.
+      try { renderer.Clear(); } catch { }
       _nodePreviewModels = null;
       _nodePreviewResources = null;
     }
@@ -1500,6 +1612,10 @@ namespace PugTools {
       }
       DisposeNodeReferenceUi();
       DisposeNodeConversationUi();
+      if (_nodeGameplayExplorer != null && !_nodeGameplayExplorer.IsDisposed) {
+        try { _nodeGameplayExplorer.Dispose(); } catch { }
+      }
+      _nodeGameplayExplorer = null;
     }
   }
 }

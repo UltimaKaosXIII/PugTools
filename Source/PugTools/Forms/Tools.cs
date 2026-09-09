@@ -108,6 +108,46 @@ namespace PugTools {
       txtSqlAddress.Enabled = false;
       txtSqlName.Enabled = false;
       txtSqlPassword.Enabled = false;
+      FormClosing += ToolsFormClosing;
+    }
+
+    private void ToolsFormClosing(Object sender, FormClosingEventArgs e) {
+      // Do not create/load the multi-million-entry dictionary just because the application is
+      // closing. If no browser/tool used it during this process there cannot be session changes.
+      if (!TorArchive.HashDictionaryInstance.IsCreated) return;
+
+      TorArchive.HashDictionaryInstance hashData = TorArchive.HashDictionaryInstance.Instance;
+      Int32 pendingNames = hashData.Dictionary.PendingFileNameChanges;
+      if (pendingNames <= 0) return;
+
+      DialogResult save = MessageBox.Show(
+        $"{pendingNames:N0} new or updated filename(s) were discovered during this session.\r\n\r\n"
+          + "Write these filename changes to the hash dictionary before closing?",
+        "Save discovered filenames?",
+        MessageBoxButtons.YesNoCancel,
+        MessageBoxIcon.Question
+      );
+
+      if (save == DialogResult.Cancel) {
+        e.Cancel = true;
+        return;
+      }
+
+      if (save != DialogResult.Yes) return;
+
+      try {
+        hashData.Dictionary.SaveCompactHashListOnly();
+      }
+      catch (Exception ex) {
+        DialogResult closeWithoutSaving = MessageBox.Show(
+          "The hash dictionary could not be saved:\r\n\r\n" + ex.Message
+            + "\r\n\r\nClose PugTools without saving these filename changes?",
+          "Hash dictionary save failed",
+          MessageBoxButtons.YesNo,
+          MessageBoxIcon.Error
+        );
+        if (closeWithoutSaving != DialogResult.Yes) e.Cancel = true;
+      }
     }
     public void CreateGzip(String filename) {
       String filepath = String.Join("", Config.ExtractPath, s_prefix, filename);
@@ -322,8 +362,9 @@ namespace PugTools {
             "colCollectionItemsData"
           );
 
-          TorArchive.HashDictionaryInstance.Instance.Unload();
-          TorArchive.HashDictionaryInstance.Instance.Load();
+          // New/updated filenames are already applied to the live process-wide dictionary.
+          // Re-reading the complete multi-million-row hash list here was both expensive and capable
+          // of discarding unsaved session discoveries. Helper sets are incremental after creation.
           TorArchive.HashDictionaryInstance.Instance.Dictionary.CreateHelpers();
         }
 
@@ -346,8 +387,9 @@ namespace PugTools {
           );
 
           //Reload hash dict.
-          TorArchive.HashDictionaryInstance.Instance.Unload();
-          TorArchive.HashDictionaryInstance.Instance.Load();
+          // New/updated filenames are already applied to the live process-wide dictionary.
+          // Re-reading the complete multi-million-row hash list here was both expensive and capable
+          // of discarding unsaved session discoveries. Helper sets are incremental after creation.
           TorArchive.HashDictionaryInstance.Instance.Dictionary.CreateHelpers();
         }
 

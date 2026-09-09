@@ -149,8 +149,25 @@ namespace FileFormats {
           EnsureRange(br, mesh.offsetMeshVerts, (UInt64)mesh.numVerts * mesh.vertexSize, "vertex buffer");
           br.BaseStream.Seek((Int64)mesh.offsetMeshVerts, SeekOrigin.Begin);
 
-          for (UInt32 i = 0; i < mesh.numVerts; i++)
-            mesh.meshVerts.Add(new GR2_Mesh_Vertex(br, mesh.bitFlag2));
+          for (UInt32 i = 0; i < mesh.numVerts; i++) {
+            Int64 vertexStart = br.BaseStream.Position;
+            GR2_Mesh_Vertex vertex = new GR2_Mesh_Vertex(br, mesh.bitFlag2);
+            Int64 vertexEnd = checked(vertexStart + (Int64)mesh.vertexSize);
+
+            // BWAG stores a fixed stride for every vertex.  Some meshes carry
+            // extra/unknown attributes that the lightweight PugTools vertex
+            // decoder does not consume.  Always advance to the declared next
+            // vertex boundary; otherwise one unknown attribute shifts every
+            // following position/UV and the mesh explodes into long triangles.
+            if (br.BaseStream.Position > vertexEnd)
+              throw new InvalidDataException(
+                $"GR2 mesh '{mesh.meshName}' vertex decoder consumed "
+                + $"{br.BaseStream.Position - vertexStart} bytes, but the declared stride is {mesh.vertexSize}."
+              );
+
+            br.BaseStream.Position = vertexEnd;
+            mesh.meshVerts.Add(vertex);
+          }
         }
 
         if (mesh.numVertIndex > 0) {

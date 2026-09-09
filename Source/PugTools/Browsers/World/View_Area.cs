@@ -1011,6 +1011,7 @@ namespace PugTools {
     public string SelectedWorldModelDetails => selectedWorldModelDetails ?? String.Empty;
     internal WorldInteractionInfo SelectedWorldInteraction => selectedWorldSpnPlacement?.Interaction ?? selectedWorldNpcPlacement?.Interaction;
     internal WorldNpcPlacement SelectedWorldNpcPlacement => selectedWorldNpcPlacement;
+    internal WorldSpnPlacement SelectedWorldSpnPlacement => selectedWorldSpnPlacement;
     internal WorldInteractionInfo InteractionTargetWorldInteraction => interactionWorldSpnPlacement?.Interaction ?? interactionWorldNpcPlacement?.Interaction;
     internal WorldSpnPlacement InteractionTargetWorldSpnPlacement => interactionWorldSpnPlacement;
     internal WorldNpcPlacement InteractionTargetWorldNpcPlacement => interactionWorldNpcPlacement;
@@ -1493,7 +1494,7 @@ namespace PugTools {
       foreach(GR2_Material material in worldOwnedMaterials)ReleaseOwnedMaterial(material);
       ReleaseJedipediaFeatureGpu();
       mapBackdropBuffer?.Dispose();mapBackdropBuffer=null;mapBackdropTexture?.Dispose();mapBackdropTexture=null;mapBackdropLoadAttempted=false;
-      foreach(var g in terrainGpu.Values)g.Dispose();terrainGpu.Clear();foreach(var g in terrainIndexCache.Values)g.Dispose();terrainIndexCache.Clear(); foreach(var g in waterGpu.Values)g.Dispose();waterGpu.Clear(); foreach(var g in roadGpu)g.Dispose();roadGpu.Clear();foreach(var g in mapNoteFallbackGpu)g.Dispose();mapNoteFallbackGpu.Clear();foreach(var g in mapArtGpu)g.Dispose();mapArtGpu.Clear();mapArtPrepared=false;foreach(var g in mapNoteIconGpu.Values)g.Dispose();mapNoteIconGpu.Clear();materialLastUseFrame.Clear();modelGeometryPrepared.Clear();modelGeometryLastUseFrame.Clear();worldRenderFrame=0;Release(ref selectedWorldBoxBuffer);ClearWorldModelSelection();
+      foreach(var g in terrainGpu.Values)g.Dispose();terrainGpu.Clear();foreach(var g in terrainIndexCache.Values)g.Dispose();terrainIndexCache.Clear(); foreach(var g in waterGpu.Values)g.Dispose();waterGpu.Clear(); foreach(var g in roadGpu)g.Dispose();roadGpu.Clear();foreach(var g in mapNoteFallbackGpu)g.Dispose();mapNoteFallbackGpu.Clear();foreach(var g in mapArtGpu)g.Dispose();mapArtGpu.Clear();mapArtPrepared=false;foreach(var g in mapNoteIconGpu.Values)g.Dispose();mapNoteIconGpu.Clear();materialLastUseFrame.Clear();modelGeometryPrepared.Clear();modelGeometryLastUseFrame.Clear();worldRenderFrame=0;Release(ref selectedWorldBoxBuffer);manuallyHiddenWorldEntries.Clear();ClearWorldModelSelection();
       foreach(var list in dynamicDetailGpu.Values)foreach(var g in list)g.Dispose();dynamicDetailGpu.Clear();
       foreach(var list in dynamicDetailMeshBatches.Values)foreach(var g in list)g.Dispose();dynamicDetailMeshBatches.Clear();
       instanceWorldTransforms.Clear();heightMapFloorGrid.Clear();heightMapFloors.Clear();roomPlacementGrid.Clear();roomPlacementGlobal.Clear();volumeMembershipGrid.Clear();volumeMembershipGlobal.Clear();modelFloorData.Clear();modelFloorPlacementGrid.Clear();modelFloorPlacementGlobal.Clear();renderGrid.Clear();renderGlobal.Clear();renderEntriesByRoom.Clear();occluderRenderEntries.Clear();walkingPathFollowerRenderEntries.Clear();decorationHookRenderEntries.Clear();teleportWarmupModels.Clear();teleportWarmupQueued.Clear();cameraWarmupModels.Clear();cameraWarmupQueued.Clear();cameraWarmupAnchor=new Vector3(float.NaN,float.NaN,float.NaN);cameraWarmupRoomName=String.Empty;lock(teleportWarmupLock){teleportWarmupRequestPending=false;teleportWarmupCancelPending=false;}Release(ref regularModelInstanceBuffer);regularModelInstanceCapacity=0;regularModelInstanceScratch=Array.Empty<float>();regularModelInstancingSafe.Clear();visualLodLevels.Clear();lodSchemas.Clear();localLightGrid.Clear();localLightGlobal.Clear();localLightSelectionCache.Clear();localLightVisibilityScope=null;currentLocalLightSelection=LocalLightSelection.Empty;boundLocalLightTexturePaths.Clear();roomPortals.Clear();roomStreamingNeighbors.Clear();roomStreamingAuthoredVisible.Clear();roomStreamingBounds.Clear();streamTransitionRoomGrace.Clear();lastStreamAnchorRoom=String.Empty;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);lastLocalLightCount=-1;currentCameraRoom=null;displayCameraRoom=null;skyRoomNames.Clear();
@@ -1755,6 +1756,8 @@ namespace PugTools {
         else {viewProj=currentUnjittered;frameProjection=camera.Proj;taaJitterPixels=Vector2.Zero;taaReprojectionValid=false;}
       }
 
+      bool sliceEnabled=s.EnableVerticalSlice&&s.VerticalSliceFraction<.9995f&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap;
+      float sliceHeight=VerticalSliceHeightForFraction(s.VerticalSliceFraction);
       bool shadows=s.EnableShadows&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap&&env.CastDirectionalShadows&&shadowMaps.All(x=>x!=null);
       HashSet<string> visible=BuildVisibleRoomSet(renderCameraRoom,s);
       // Decode/MAT metadata happen on background TOR workers. The render thread commits local placements and a
@@ -1776,6 +1779,7 @@ namespace PugTools {
       if(!String.Equals(lightScope,localLightVisibilityScope,StringComparison.Ordinal)){localLightSelectionCache.Clear();localLightVisibilityScope=lightScope;}
       // Dynamic-detail shadow cards need the same camera/time values as their visible pass.
       fx.SetCamera(cam);fx.SetScrolling(env,elapsed,LoadTexture(env.ScrollingTexture),LoadTexture(env.ScrollingMask));
+      fx.SetWorldSlice(sliceEnabled,sliceHeight);
       if(shadows)RenderShadowCascades(env,visible,s);
 
       bool useOffscreen=sceneRenderTarget!=null&&(useColorPost||useTaa||useFxaa);
@@ -1786,7 +1790,7 @@ namespace PugTools {
       ImmediateContext.ClearRenderTargetView(target,clear);ImmediateContext.ClearDepthStencilView(DepthStencilView,DepthStencilClearFlags.Depth|DepthStencilClearFlags.Stencil,1,0);
       ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
       if(mapOpen)DrawMapBackdrop(viewProj);
-      fx.SetViewProj(viewProj);fx.SetCamera(cam);fx.SetEnvironment(env,s.EnableLighting,s.EnableFog,shadows,s.ViewDistanceScale);fx.SetHeightRange(boundsMin.Y,boundsMax.Y);fx.SetPlaceableBlueGlow(false);
+      fx.SetViewProj(viewProj);fx.SetCamera(cam);fx.SetEnvironment(env,s.EnableLighting,s.EnableFog,shadows,s.ViewDistanceScale);fx.SetHeightRange(boundsMin.Y,boundsMax.Y);fx.SetWorldSlice(sliceEnabled,sliceHeight);fx.SetPlaceableBlueGlow(false);
       ShaderResourceView illum=LoadTexture(env.IlluminationMap);fx.SetIllumination(illum);fx.SetScrolling(env,elapsed,LoadTexture(env.ScrollingTexture),LoadTexture(env.ScrollingMask));
       var maps=shadowMaps.Select(x=>x?.DepthMapSRV).ToArray();fx.SetShadows(shadowMatrices,maps,shadowDistances,shadows);fx.ClearLocalLights();currentLocalLightSelection=LocalLightSelection.Empty;lastLocalLightCount=0;Array.Clear(lastLocalLightSelection,0,lastLocalLightSelection.Length);
       UpdateJedipediaDynamicLights(s);
@@ -1794,7 +1798,11 @@ namespace PugTools {
       // mixed into the model pass lets sky geometry fight with terrain/models and is responsible for many
       // floating/half-screen artefacts when a skyscene happens to intersect the world depth buffer.
       if(s.ShowSky&&s.Mode!=WorldRenderMode.Map&&s.Mode!=WorldRenderMode.Heightmap){
+        // Jedipedia's Y-slice cuts world geometry, not the sky dome. Temporarily disable the clip plane
+        // for the backdrop and restore it before the authored world is submitted.
+        if(sliceEnabled)fx.SetWorldSlice(false,sliceHeight);
         DrawSky(env,s);
+        if(sliceEnabled)fx.SetWorldSlice(true,sliceHeight);
         ImmediateContext.ClearDepthStencilView(DepthStencilView,DepthStencilClearFlags.Depth|DepthStencilClearFlags.Stencil,1,0);
       }
       // Jedipedia's native dPVS consumes authored occlusion geometry before deciding which receivers are visible.
@@ -1810,9 +1818,11 @@ namespace PugTools {
         DrawMapNoteIcons(viewProj,s);
       }
       if(s.Mode!=WorldRenderMode.Heightmap)DrawJedipediaUtilities(viewProj,visible,s);
+      DrawGameplayMapNoteHighlight(viewProj,s);
       // The generated minimap already paints its marker in WinForms. Only the interactive M map needs the GPU
       // marker, otherwise the minimap capture would bake a second arrow into its bitmap.
       if(mapOpen&&s.Mode==WorldRenderMode.Map){DrawTaxiRouteMapOverlay(viewProj,s);DrawQuickTravelMapOverlay(viewProj,s);DrawMapPlayerMarker(viewProj);}
+      DrawWorldStreamingDebugBounds(viewProj,s);
       DrawWorldSelectionOutline(viewProj,s);
 
       if(useOffscreen)ResolvePostProcessing(s,env,useTaa,useFxaa);
@@ -2158,13 +2168,15 @@ namespace PugTools {
 
     private static bool InstanceVisibleInWorld(AssetInstance inst,WorldRenderSettings s=null){
       if(inst==null||inst.PathFollowerPending)return false;
-      // Hidden/MAP_ONLY/OCCLUDER_ONLY placements are an explicit opt-in through the Utilities submenu. There is no
-      // second top-level display tier anymore: the submenu checkbox is the single source of truth.
       bool showHidden=s?.ShowHiddenGeometry==true;
+      bool showAuthoring=s?.ShowUtilityOther==true;
+      // Authoring helpers are authored with BOTH material-level visibility and placement-level visibility flags.
+      // Once the authoring overlay is enabled, Hidden/MAP_ONLY/OCCLUDER_ONLY placements must be allowed into the
+      // render pass; IsMaterialHiddenFromWorld remains the safety gate that keeps collision/occluder hull materials
+      // suppressed. Previously MapOnly/OccluderOnly was still rejected here, which is why the large level/act/quest
+      // boards never appeared even though the orange utility marker overlay did.
+      if(showAuthoring)return true;
       if(inst.hidden&&!showHidden)return false;
-      // OCCLUDER_ONLY is solver/helper geometry, never a visible world surface. Rendering it in the colour pass can
-      // turn authored doorway blockers into opaque black walls. Keep it out even when hidden helpers are enabled;
-      // the Utilities overlay/wireframe diagnostics remain the place to inspect those shapes.
       if(inst.Viewability==AssetInstanceViewability.OccluderOnly&&!(showHidden&&s?.Mode==WorldRenderMode.Wireframe))return false;
       if(!showHidden&&inst.Viewability==AssetInstanceViewability.MapOnly)return false;
       return true;
@@ -3708,7 +3720,7 @@ namespace PugTools {
         foreach(string roomName in visible){
           if(!renderEntriesByRoom.TryGetValue(roomName,out List<RenderEntry> roomEntries))continue;
           foreach(RenderEntry entry in roomEntries){
-            if(entry==null||entry.Kind!=kind)continue;
+            if(entry==null||entry.Kind!=kind||(kind==RenderKindModel&&IsWorldEntryManuallyHidden(entry)))continue;
             if(SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
           }
         }
@@ -3721,11 +3733,11 @@ namespace PugTools {
       // rectangle is more expensive than walking the populated buckets, scan the populated buckets instead; the
       // exact sphere/frustum tests below remain authoritative, so this changes cost only, never visibility.
       if(cellCount>Math.Max(256L,(long)renderGrid.Count*3L)){
-        foreach(List<RenderEntry> bucket in renderGrid.Values)foreach(RenderEntry entry in bucket)if(entry.Kind==kind&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
+        foreach(List<RenderEntry> bucket in renderGrid.Values)foreach(RenderEntry entry in bucket)if(entry.Kind==kind&&!(kind==RenderKindModel&&IsWorldEntryManuallyHidden(entry))&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
       } else {
-        for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++)if(renderGrid.TryGetValue((x,z),out List<RenderEntry> bucket))foreach(RenderEntry entry in bucket)if(entry.Kind==kind&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
+        for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++)if(renderGrid.TryGetValue((x,z),out List<RenderEntry> bucket))foreach(RenderEntry entry in bucket)if(entry.Kind==kind&&!(kind==RenderKindModel&&IsWorldEntryManuallyHidden(entry))&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
       }
-      foreach(RenderEntry entry in renderGlobal)if(entry.Kind==kind&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
+      foreach(RenderEntry entry in renderGlobal)if(entry.Kind==kind&&!(kind==RenderKindModel&&IsWorldEntryManuallyHidden(entry))&&SphereWithinDistance(entry.Center,entry.Radius,range)&&(!cameraFrustum||SphereVisibleInCameraFrustum(entry.Center,entry.Radius)))yield return entry;
     }
 
     private IEnumerable<RenderEntry> MapVisibleRenderEntries(byte kind){
@@ -3741,16 +3753,16 @@ namespace PugTools {
       if(cellCount>Math.Max(256L,(long)renderGrid.Count*3L)){
         foreach(List<RenderEntry> bucket in renderGrid.Values)
           foreach(RenderEntry entry in bucket)
-            if(entry.Kind==kind&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
+            if(entry.Kind==kind&&!(kind==RenderKindModel&&IsWorldEntryManuallyHidden(entry))&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
       } else {
         for(int z=minZ;z<=maxZ;z++)for(int x=minX;x<=maxX;x++)
           if(renderGrid.TryGetValue((x,z),out List<RenderEntry> bucket))
             foreach(RenderEntry entry in bucket)
-              if(entry.Kind==kind&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
+              if(entry.Kind==kind&&!(kind==RenderKindModel&&IsWorldEntryManuallyHidden(entry))&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
       }
       // Very large placements and path followers live outside the fixed grid. There are normally only a handful;
       // keep testing them individually so map behaviour remains exact.
-      foreach(RenderEntry entry in renderGlobal)if(entry.Kind==kind&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
+      foreach(RenderEntry entry in renderGlobal)if(entry.Kind==kind&&!(kind==RenderKindModel&&IsWorldEntryManuallyHidden(entry))&&MapSphereVisible(entry.Center,entry.Radius))yield return entry;
     }
     private bool SphereWithinDistance(Vector3 center,float radius,float range){
       if(!IsFinite(center))return false;float limit=Math.Max(0f,range)+Math.Max(0f,radius)+RangeCullPadding;return (center-camera.Position).LengthSquared()<=limit*limit;
@@ -4699,7 +4711,7 @@ namespace PugTools {
       ClearLocalLightBinding();fx.SetViewProj(vp);fx.SetPlaceableBlueGlow(false);
       ImmediateContext.InputAssembler.InputLayout=inputLayout;ImmediateContext.InputAssembler.PrimitiveTopology=PrimitiveTopology.TriangleList;
       foreach(RenderEntry entry in occluderRenderEntries){
-        if(entry?.Room==null||entry.Instance==null||entry.Model==null||!entry.Model.enabled||!RoomVisible(entry.Room,visible))continue;
+        if(entry?.Room==null||entry.Instance==null||entry.Model==null||!entry.Model.enabled||IsWorldEntryManuallyHidden(entry)||!RoomVisible(entry.Room,visible))continue;
         if(IsSpeedTreeInstance(entry.Instance)&&!s.ShowSpeedTrees)continue;
         if(!SphereWithinDistance(entry.Center,entry.Radius,camera.FarZ)||!SphereVisibleInCameraFrustum(entry.Center,entry.Radius))continue;
         Matrix world=entry.World;fx.SetWorld(world);DrawModelOccluderDepth(entry.Model,world,false);
@@ -5098,17 +5110,34 @@ namespace PugTools {
       if(mat==null)return false;
       string visibility=mat.visibility??String.Empty;
       bool showHidden=s?.ShowHiddenGeometry==true;
-      // With the top-level Show tier removed, hidden/editor geometry is controlled only by its Utilities submenu
-      // checkbox. This avoids the previous double-enable requirement.
-      if(visibility.Equals("EditorOnly",StringComparison.OrdinalIgnoreCase))return !showHidden;
-      if(visibility.Equals("Hidden",StringComparison.OrdinalIgnoreCase))return !showHidden;
-      // Streamed MAT metadata is intentionally read in the background. Before that XML has arrived, helper hulls
-      // otherwise render with the textureless fallback for a few frames (or forever if a beta MAT is missing),
-      // producing the solid black rectangles seen in some doorways. Jedipedia never submits these collision/occluder
-      // utility materials to the normal world pass. Use the same conservative authored-name fallback until metadata
-      // can confirm Visibility=Hidden; the explicit hidden-geometry diagnostic can still reveal them.
-      if(!showHidden&&String.IsNullOrWhiteSpace(visibility)&&LooksLikeHiddenUtilityMaterial(mat))return true;
+      bool showAuthoring=s?.ShowUtilityOther==true;
+
+      // SWTOR authoring geometry uses two different conventions. EditorOnly is a normal utility surface and should
+      // appear with the authoring overlay. Hidden is more restrictive: the useful utility/sign pieces are authored
+      // with PolyType=Ignore, while collision and occlusion meshes must remain hidden unless diagnostics are requested.
+      if(visibility.Equals("EditorOnly",StringComparison.OrdinalIgnoreCase))return !(showAuthoring||showHidden);
+      if(visibility.Equals("Hidden",StringComparison.OrdinalIgnoreCase)){
+        if(showHidden)return false;
+        if(!showAuthoring)return true;
+        return !String.Equals(mat.polyType??String.Empty,"Ignore",StringComparison.OrdinalIgnoreCase);
+      }
+
+      // Some beta/live MAT rows arrive without visibility metadata. Keep collision/occluder-looking materials hidden
+      // during normal/authoring rendering, while the explicit hidden-geometry diagnostic can still reveal them.
+      if(String.IsNullOrWhiteSpace(visibility)&&LooksLikeHiddenUtilityMaterial(mat)){
+        if(showHidden)return false;
+        if(!showAuthoring)return true;
+        return LooksLikeCollisionOrOccluderMaterial(mat);
+      }
       return false;
+    }
+
+    private static bool LooksLikeCollisionOrOccluderMaterial(GR2_Material mat){
+      string name=(mat?.sourceMaterialName??mat?.materialName??String.Empty).Replace('\\','/').ToLowerInvariant();
+      int slash=name.LastIndexOf('/');if(slash>=0)name=name.Substring(slash+1);
+      if(name.EndsWith(".mat",StringComparison.OrdinalIgnoreCase))name=name.Substring(0,name.Length-4);
+      return name.StartsWith("util_collision",StringComparison.Ordinal)||name=="collision"||name.StartsWith("collision_",StringComparison.Ordinal)||
+        name=="occluder"||name.StartsWith("occluder_",StringComparison.Ordinal)||name.Contains("fadeportal")||name.Contains("fade_portal");
     }
 
     private static bool LooksLikeHiddenUtilityMaterial(GR2_Material mat){

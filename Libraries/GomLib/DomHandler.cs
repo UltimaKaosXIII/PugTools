@@ -10,8 +10,8 @@ namespace GomLib {
     private readonly Object m_previousLock = new Object();
     private DataObjectModel m_currentData;
     private DataObjectModel m_previousData;
-    private Boolean m_currentLoaded;
-    private Boolean m_previousLoaded;
+    private volatile Boolean m_currentLoaded;
+    private volatile Boolean m_previousLoaded;
 
     #endregion Fields
 
@@ -33,8 +33,8 @@ namespace GomLib {
       }
 
       if (disposing) {
-        m_currentData.Dispose();
-        m_previousData.Dispose();
+        m_currentData?.Dispose();
+        m_previousData?.Dispose();
       }
       m_disposed = true;
     }
@@ -43,46 +43,30 @@ namespace GomLib {
 
     #region Methods
     public DataObjectModel GetCurrentDOM(Assets assets = null) {
-      // See AssetHandler.GetCurrentAssets for why this needs locking: multiple browser windows
-      // can trigger the first load concurrently.
-      if (m_currentLoaded) {
-        return m_currentData;
-      }
-
+      // Serialize publication with unload. Browser startup calls this only a handful of times, so
+      // correctness is more valuable than an unlocked fast path that can return a disposed DOM.
       lock (m_currentLock) {
-        if (m_currentLoaded) {
-          return m_currentData;
-        } else {
-          if (assets != null) {
-            m_currentData = new DataObjectModel(assets);
-            m_currentData.Load();
-            m_currentLoaded = true;
-            return m_currentData;
-          } else {
-            throw new ArgumentException("No list of assests were provided");
-          }
-        }
+        if (m_currentLoaded) return m_currentData;
+        if (assets == null)
+          throw new ArgumentException("No list of assests were provided");
+
+        m_currentData = new DataObjectModel(assets);
+        m_currentData.Load();
+        m_currentLoaded = true;
+        return m_currentData;
       }
     }
 
     public DataObjectModel GetPreviousDOM(Assets assets = null) {
-      if (m_previousLoaded) {
-        return m_previousData;
-      }
-
       lock (m_previousLock) {
-        if (m_previousLoaded) {
-          return m_previousData;
-        } else {
-          if (assets != null) {
-            m_previousData = new DataObjectModel(assets);
-            m_previousData.Load();
-            m_previousLoaded = true;
-            return m_previousData;
-          } else {
-            throw new ArgumentException("No list of assests were provided");
-          }
-        }
+        if (m_previousLoaded) return m_previousData;
+        if (assets == null)
+          throw new ArgumentException("No list of assests were provided");
+
+        m_previousData = new DataObjectModel(assets);
+        m_previousData.Load();
+        m_previousLoaded = true;
+        return m_previousData;
       }
     }
 
@@ -97,36 +81,42 @@ namespace GomLib {
 
     #region Unload Data
     public void UnloadAllDOM() {
-      if (m_currentLoaded) {
-        m_currentData.Dispose();
-        m_currentData = null;
-        m_currentLoaded = false;
+      lock (m_currentLock) {
+        if (m_currentLoaded) {
+          m_currentData?.Dispose();
+          m_currentData = null;
+          m_currentLoaded = false;
+        }
       }
-
-      if (m_previousLoaded) {
-        m_previousData.Dispose();
-        m_previousData = null;
-        m_previousLoaded = false;
+      lock (m_previousLock) {
+        if (m_previousLoaded) {
+          m_previousData?.Dispose();
+          m_previousData = null;
+          m_previousLoaded = false;
+        }
       }
       GC.Collect();
     }
 
     public void UnloadCurrentDOM() {
-      if (m_currentLoaded) {
-        m_currentData.Dispose();
-        m_currentData = null;
-        m_currentLoaded = false;
-        GC.Collect();
+      lock (m_currentLock) {
+        if (m_currentLoaded) {
+          m_currentData?.Dispose();
+          m_currentData = null;
+          m_currentLoaded = false;
+          GC.Collect();
+        }
       }
-
     }
 
     public void UnloadPreviousDOM() {
-      if (m_previousLoaded) {
-        m_previousData.Dispose();
-        m_previousData = null;
-        m_previousLoaded = false;
-        GC.Collect();
+      lock (m_previousLock) {
+        if (m_previousLoaded) {
+          m_previousData?.Dispose();
+          m_previousData = null;
+          m_previousLoaded = false;
+          GC.Collect();
+        }
       }
     }
 

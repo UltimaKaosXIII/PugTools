@@ -425,6 +425,38 @@ namespace PugTools {
 
     public override Int32 GetHashCode() => base.GetHashCode();
 
+    private static Boolean IsFinite(Single value) {
+      return !Single.IsNaN(value) && !Single.IsInfinity(value);
+    }
+
+    private static void ExpandTransformedBounds(
+      GR2 model,
+      ref Vector3 boundsMin,
+      ref Vector3 boundsMax
+    ) {
+      if (model == null || model.globalBox == null) return;
+
+      Matrix transform = model.GetTransform();
+      Single[] xs = { model.globalBox.minX, model.globalBox.maxX };
+      Single[] ys = { model.globalBox.minY, model.globalBox.maxY };
+      Single[] zs = { model.globalBox.minZ, model.globalBox.maxZ };
+
+      foreach (Single x in xs)
+        foreach (Single y in ys)
+          foreach (Single z in zs) {
+            Vector4 corner = Vector3.Transform(new Vector3(x, y, z), transform);
+            if (!IsFinite(corner.X) || !IsFinite(corner.Y) || !IsFinite(corner.Z))
+              continue;
+
+            boundsMin.X = Math.Min(boundsMin.X, corner.X);
+            boundsMin.Y = Math.Min(boundsMin.Y, corner.Y);
+            boundsMin.Z = Math.Min(boundsMin.Z, corner.Z);
+            boundsMax.X = Math.Max(boundsMax.X, corner.X);
+            boundsMax.Y = Math.Max(boundsMax.Y, corner.Y);
+            boundsMax.Z = Math.Max(boundsMax.Z, corner.Z);
+          }
+    }
+
     public void LoadModel(Dictionary<String, GR2> models,
                           Dictionary<String, Object> resources,
                           String fqn,
@@ -471,25 +503,7 @@ namespace PugTools {
         }
         _focus = models.First().Value;
 
-        Vector4 max = Vector3.Transform(
-          new Vector3(
-            _focus.globalBox.maxX,
-            _focus.globalBox.maxY,
-            _focus.globalBox.maxZ
-          ),
-          _focus.GetTransform()
-        );
-        _globalBoxMax = new Vector3(max.X, max.Y, max.Z);
-
-        Vector4 min = Vector3.Transform(
-          new Vector3(
-            _focus.globalBox.minX,
-            _focus.globalBox.minY,
-            _focus.globalBox.minZ
-          ),
-          _focus.GetTransform()
-        );
-        _globalBoxMin = new Vector3(min.X, min.Y, min.Z);
+        ExpandTransformedBounds(_focus, ref _globalBoxMin, ref _globalBoxMax);
 
         _globalBoxCenter = _globalBoxMin + (_globalBoxMax - _globalBoxMin) / 2;
         _cameraPos = _globalBoxCenter + new Vector3(1.0F, 0.65F, 1.0F) *
@@ -525,38 +539,11 @@ namespace PugTools {
 
           _focus = model.Value;
 
-          Vector4 max = Vector3.Transform(
-            new Vector3(
-              _focus.globalBox.maxX,
-              _focus.globalBox.maxY,
-              _focus.globalBox.maxZ
-            ),
-            _focus.GetTransform()
-          );
-          Vector4 min = Vector3.Transform(
-            new Vector3(
-              _focus.globalBox.minX,
-              _focus.globalBox.minY,
-              _focus.globalBox.minZ
-            ),
-            _focus.GetTransform()
-          );
-
-          // A rotated model can swap min/max on an axis.
-          Single minX = Math.Min(min.X, max.X);
-          Single minY = Math.Min(min.Y, max.Y);
-          Single minZ = Math.Min(min.Z, max.Z);
-          Single maxX = Math.Max(min.X, max.X);
-          Single maxY = Math.Max(min.Y, max.Y);
-          Single maxZ = Math.Max(min.Z, max.Z);
-
-          _globalBoxMin.X = Math.Min(_globalBoxMin.X, minX);
-          _globalBoxMin.Y = Math.Min(_globalBoxMin.Y, minY);
-          _globalBoxMin.Z = Math.Min(_globalBoxMin.Z, minZ);
-
-          _globalBoxMax.X = Math.Max(_globalBoxMax.X, maxX);
-          _globalBoxMax.Y = Math.Max(_globalBoxMax.Y, maxY);
-          _globalBoxMax.Z = Math.Max(_globalBoxMax.Z, maxZ);
+          // Transform all eight AABB corners.  Transforming only min/max is
+          // not sufficient once a DYN visual has rotation: it can massively
+          // underestimate the aggregate bounds and place the camera inside
+          // the model.
+          ExpandTransformedBounds(_focus, ref _globalBoxMin, ref _globalBoxMax);
         }
       }
 
@@ -582,7 +569,7 @@ namespace PugTools {
         // excessively far away.
         Single radius = Math.Max(boxDiagonal * 0.5F, 0.001F);
         Single verticalFov = 0.25F * MathF.PI;
-        Single margin = type == "mnt" ? 1.30F : type == "itm" ? 1.22F : 1.18F;
+        Single margin = type == "mnt" ? 1.30F : type == "itm" ? 1.22F : type == "dyn" ? 1.30F : 1.18F;
         Single distance = radius / (Single)Math.Tan(verticalFov * 0.5F) * margin;
 
         // Avoid pathological GOM/GR2 bounds while retaining a useful minimum
@@ -744,14 +731,15 @@ namespace PugTools {
       Window.Controls.Find(RenderPanelName, true).First().Capture = false;
     }
     protected override void OnMouseWheel(Object sender, MouseEventArgs e) {
-      Double zoom = -e.Delta * SystemInformation.MouseWheelScrollLines;
+      // Zoom relative to the current orbit radius.  The old geometric loop
+      // changed Radius by only a few thousandths per wheel notch, which became
+      // effectively invisible after the camera-fit changes.
+      Single notches = e.Delta / 120.0F;
+      if (notches == 0.0F) return;
 
-      _cameraZoomSpeed = !Util.IsKeyDown(Keys.ShiftKey) ? 0.00025F : 0.000025F;
-
-      while (zoom != 0) {
-        _camera.Zoom(zoom < 0 ? -_cameraZoomSpeed : _cameraZoomSpeed);
-        zoom = Math.Truncate(zoom * 750) / 1000;
-      }
+      Single fraction = Util.IsKeyDown(Keys.ShiftKey) ? 0.025F : 0.12F;
+      _cameraZoomSpeed = Math.Max(_camera.Radius * fraction, 0.01F);
+      _camera.Zoom(-notches * _cameraZoomSpeed);
     }
     public override void OnResize() {
       base.OnResize();
@@ -759,6 +747,8 @@ namespace PugTools {
       _camera.SetLens(0.25F * MathF.PI, AspectRatio, 0.001F, 1000.0F);
     }
     public void SetMaterial(GR2_Material selectedMaterial) {
+      if (selectedMaterial == null) return;
+
       List<EffectTechnique> derivedList = new List<EffectTechnique>() {
         _fx.Generic,
         _fx.Eye,
@@ -828,8 +818,9 @@ namespace PugTools {
 
       _fx.SetAlphaTestValue(selectedMaterial.alphaTestValue);
 
-      if (selectedMaterial.isTwoSided)
-        ImmediateContext.Rasterizer.State = RenderStates.TwoSidedRS;
+      ImmediateContext.Rasterizer.State = selectedMaterial.isTwoSided
+        ? RenderStates.TwoSidedRS
+        : RenderStates.OneSidedRS;
 
       _fx.SetDiffuseMap(selectedMaterial.diffuseSRV);
       _fx.SetRotationMap(selectedMaterial.rotationSRV);

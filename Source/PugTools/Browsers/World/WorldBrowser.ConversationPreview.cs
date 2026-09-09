@@ -31,6 +31,7 @@ namespace PugTools {
     private Button worldSelectionConversationButton;
     private Conversation worldConversationPreviewConversation;
     private WorldNpcPlacement worldConversationPreviewPrimaryNpc;
+    private WorldSpnPlacement worldConversationPreviewPrimarySpn;
     private readonly Dictionary<ulong, string> worldConversationSpeakerNames = new Dictionary<ulong, string>();
 
     private bool CanOpenWorldConversation(WorldInteractionInfo interaction) {
@@ -69,8 +70,16 @@ namespace PugTools {
       }
       WorldNpcPlacement selectedNpc = panelRender?.SelectedWorldNpcPlacement;
       WorldNpcPlacement interactionNpc = panelRender?.InteractionTargetWorldNpcPlacement;
+      WorldSpnPlacement selectedSpn = panelRender?.SelectedWorldSpnPlacement;
+      WorldSpnPlacement interactionSpn = panelRender?.InteractionTargetWorldSpnPlacement;
       worldConversationPreviewPrimaryNpc = selectedNpc != null && ReferenceEquals(selectedNpc.Interaction, interaction) ? selectedNpc :
         interactionNpc != null && ReferenceEquals(interactionNpc.Interaction, interaction) ? interactionNpc : null;
+      // Placeable conversations (notably datacrons) have no NPC anchor. Keep BOTH the Ctrl-selected SPN and the
+      // ordinary interaction-pick SPN alive across the tree window so pressing "Play conversation" still knows where
+      // the interaction happened. Fixed3 preserved neither in this form path, causing the fallback STG to lose its
+      // world frame and making camera marks and actor animation marks silently resolve to nothing.
+      worldConversationPreviewPrimarySpn = selectedSpn != null && ReferenceEquals(selectedSpn.Interaction, interaction) ? selectedSpn :
+        interactionSpn != null && ReferenceEquals(interactionSpn.Interaction, interaction) ? interactionSpn : null;
       ShowWorldConversationPreview(conversation, interaction.Kind == WorldInteractionKind.MissionBoard);
     }
 
@@ -415,7 +424,7 @@ namespace PugTools {
         if (worldConversationPreviewTree?.SelectedNode?.Tag is WorldConversationTreeTag tag && tag.Node != null)
           startNode = tag.RawNodeId != 0 ? tag.RawNodeId : tag.NodeId;
         StartWorldConversationPlayback(worldConversationPreviewConversation, worldConversationPreviewPrimaryNpc,
-          startNode != 0 ? (long?)startNode : null);
+          worldConversationPreviewPrimarySpn, startNode != 0 ? (long?)startNode : null);
       };
 
       worldConversationPreviewForm.Controls.Add(split);
@@ -458,6 +467,7 @@ namespace PugTools {
         worldConversationPreviewPlayButton = null;
         worldConversationPreviewConversation = null;
         worldConversationPreviewPrimaryNpc = null;
+        worldConversationPreviewPrimarySpn = null;
         worldConversationSpeakerNames.Clear();
       };
     }

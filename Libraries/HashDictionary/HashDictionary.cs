@@ -1,4 +1,4 @@
-/******************************************************************************
+﻿/******************************************************************************
  * This file only creates a list of hashes which can then be searched based on 
  * a text file which should be placed in Hash/hashes_filename.txt
  * 
@@ -35,14 +35,18 @@ namespace nsHashDictionary {
     public String ArchiveName { get; internal set; }
     public String FileName {
       get {
-        if (m_fileName != null) return m_fileName;
-        m_fileName = m_nameStore?.GetName(m_nameIndex) ?? String.Empty;
-        m_nameStore = null;
-        m_nameIndex = -1;
-        return m_fileName;
+        String current = System.Threading.Volatile.Read(ref m_fileName);
+        if (current != null) return current;
+
+        // Multiple browser workers can resolve the same lazy filename at the same time. Decode
+        // from the immutable shared store and publish exactly one string without clearing the
+        // backing store out from underneath another reader.
+        String decoded = m_nameStore?.GetName(m_nameIndex) ?? String.Empty;
+        String previous = System.Threading.Interlocked.CompareExchange(ref m_fileName, decoded, null);
+        return previous ?? decoded;
       }
       set {
-        m_fileName = value ?? String.Empty;
+        System.Threading.Interlocked.Exchange(ref m_fileName, value ?? String.Empty);
         m_nameStore = null;
         m_nameIndex = -1;
       }
@@ -95,6 +99,7 @@ namespace nsHashDictionary {
       m_fileListing = new HashSet<String>();
       m_hashList = new SortedList<String, SortedList<UInt64, HashData>>();
       m_masterArchiveHashList = new Dictionary<UInt64, HashSet<String>>();
+      m_runtimeFileNameChanges = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
     }
 
     #endregion
@@ -105,6 +110,7 @@ namespace nsHashDictionary {
     private readonly HashSet<String> m_dirListing;
     private readonly HashSet<String> m_extListing;
     private readonly HashSet<String> m_fileListing;
+    private CompactFileNameStore m_compactNameStore;
     private const String m_hashFile = "hashes_filename.bin";
     private const String m_compactHashFile = "hashes_filename.pfd1";
     private const UInt32 CompactMagic = 0x31444650; // PFD1
@@ -112,6 +118,13 @@ namespace nsHashDictionary {
     private readonly SortedList<String, SortedList<UInt64, HashData>> m_hashList;
     private Boolean m_helpersCreated;
     private readonly Dictionary<UInt64, HashSet<String>> m_masterArchiveHashList;
+    private readonly HashSet<String> m_runtimeFileNameChanges;
+    private Boolean m_masterArchiveHashListCreated;
+    // Asset/Model/Node browsers share this dictionary. Protect the mutable SortedLists so two
+    // browser workers can resolve/add hashes concurrently without corrupting collection state.
+    private readonly Object m_hashListLock = new Object();
+    private readonly Object m_pendingFileNameLock = new Object();
+    private readonly HashSet<UInt64> m_pendingFileNameHashes = new HashSet<UInt64>();
 
     #endregion Fields
 
@@ -133,21 +146,28 @@ namespace nsHashDictionary {
     /// Add/update a hash entry
     /// </summary>
     public void AddHash(UInt32 ph, UInt32 sh, String name, Int32 crc, String archiveName) {
-      UInt64 sig = (UInt64)ph << 32 | sh;
+      lock (m_hashListLock) {
+        UInt64 sig = (UInt64)ph << 32 | sh;
 
-      AddArchiveHashToMaster(sig, archiveName);
+        AddArchiveHashToMaster(sig, archiveName);
 
-      if (!m_hashList[archiveName].ContainsKey(sig)) {
-        m_hashList[archiveName].Add(sig, new HashData(ph, sh, name, crc, archiveName));
+        if (!m_hashList.ContainsKey(archiveName))
+          m_hashList.Add(archiveName, new SortedList<UInt64, HashData>());
 
-        NeedsSave = true;
+        if (!m_hashList[archiveName].ContainsKey(sig)) {
+          m_hashList[archiveName].Add(sig, new HashData(ph, sh, name, crc, archiveName));
 
-        if (name.CompareTo("") != 0) {
-          AddDirectory(name);
-          AddFileandExtension(name);
+          NeedsSave = true;
+
+          if (!String.IsNullOrEmpty(name)) {
+            m_runtimeFileNameChanges.Add(name.Replace('\\', '/'));
+            MarkFileNameChanged(sig);
+            AddDirectory(name);
+            AddFileandExtension(name);
+          }
+        } else {
+          UpdateHash(ph, sh, name, crc, archiveName);
         }
-      } else {
-        UpdateHash(ph, sh, name, crc, archiveName);
       }
     }
 
@@ -220,31 +240,48 @@ namespace nsHashDictionary {
     }
 
     public void CreateArchiveHashMasterList() {
-      foreach (KeyValuePair<String, SortedList<UInt64, HashData>> hashList in m_hashList) {
-        foreach (UInt64 sig in hashList.Value.Keys) {
-          AddArchiveHashToMaster(sig, hashList.Key);
+      lock (m_hashListLock) {
+        if (m_masterArchiveHashListCreated) return;
+
+        // AddHash() keeps this index current after it has been built. Before the first full build it
+        // may contain only hashes added during this process, so always rebuild once from the source
+        // dictionary instead of repeatedly walking millions of rows for every filename test file.
+        m_masterArchiveHashList.Clear();
+        foreach (KeyValuePair<String, SortedList<UInt64, HashData>> hashList in m_hashList) {
+          foreach (UInt64 sig in hashList.Value.Keys) {
+            AddArchiveHashToMaster(sig, hashList.Key);
+          }
         }
+        m_masterArchiveHashListCreated = true;
       }
     }
 
+    private void MarkFileNameChanged(UInt64 sig) {
+      lock (m_pendingFileNameLock) m_pendingFileNameHashes.Add(sig);
+      NeedsSave = true;
+    }
+
     public void CreateHelpers() {
-      // Check if this is not already created
-      if (!m_helpersCreated) {
-        SortedList<UInt64, HashData> subHashList;
+      lock (m_hashListLock) {
+        // Check if this is not already created. Helper collections are shared by every browser, so
+        // build them under the same lock as filename mutations to avoid concurrent HashSet writes.
+        if (!m_helpersCreated) {
+          SortedList<UInt64, HashData> subHashList;
 
-        for (Int32 j = 0; j < m_hashList.Count; j++) {
-          subHashList = m_hashList.Values[j];
+          for (Int32 j = 0; j < m_hashList.Count; j++) {
+            subHashList = m_hashList.Values[j];
 
-          for (Int32 i = 0; i < subHashList.Count; i++) {
-            // Helper generation may touch millions of rows. Read lazy PFD1 names transiently so
-            // this maintenance operation does not permanently inflate every HashData into a String.
-            String fileName = subHashList.Values[i].FileNameForSerialization;
-            AddDirectory(fileName);
-            AddFileandExtension(fileName);
+            for (Int32 i = 0; i < subHashList.Count; i++) {
+              // Helper generation may touch millions of rows. Read lazy PFD1 names transiently so
+              // this maintenance operation does not permanently inflate every HashData into a String.
+              String fileName = subHashList.Values[i].FileNameForSerialization;
+              AddDirectory(fileName);
+              AddFileandExtension(fileName);
+            }
           }
-        }
 
-        m_helpersCreated = true;
+          m_helpersCreated = true;
+        }
       }
     }
 
@@ -298,12 +335,17 @@ namespace nsHashDictionary {
       m_dirListing.Clear();
       m_extListing.Clear();
       m_fileListing.Clear();
+      m_compactNameStore = null;
+      m_runtimeFileNameChanges.Clear();
       m_helpersCreated = false;
+      m_masterArchiveHashListCreated = false;
+      lock (m_pendingFileNameLock) m_pendingFileNameHashes.Clear();
+      NeedsSave = false;
     }
 
     private Boolean LoadCompactHashList(String filePath) {
       using FileStream fs = new FileStream(
-        filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 128, FileOptions.SequentialScan
+        filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 1024 * 128, FileOptions.SequentialScan
       );
       using GZipStream gzip = new GZipStream(fs, CompressionMode.Decompress);
       using BinaryReader br = new BinaryReader(gzip, System.Text.Encoding.UTF8, false);
@@ -358,6 +400,7 @@ namespace nsHashDictionary {
 
       CompactFileNameStore names = CompactFileNameStore.Read(br, nameCount, poolBytes, suffixBytes);
       if (names.Count != nameCount) throw new InvalidDataException("PFD1: filename count mismatch.");
+      m_compactNameStore = names;
 
       for (Int32 i = 0; i < rowCount; i++) {
         UInt32 ph = br.ReadUInt32();
@@ -390,7 +433,7 @@ namespace nsHashDictionary {
 
     private void LoadLegacyHashList(String filePath) {
       using FileStream fs = new FileStream(
-        filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 128, FileOptions.SequentialScan
+        filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, 1024 * 128, FileOptions.SequentialScan
       );
       using GZipStream gzip = new GZipStream(fs, CompressionMode.Decompress);
       using BinaryReader br = new BinaryReader(gzip);
@@ -560,7 +603,9 @@ namespace nsHashDictionary {
         }
       }
 
-      using (FileStream readFS = new FileStream(dictFile, FileMode.Open, FileAccess.Read)) {
+      using (FileStream readFS = new FileStream(
+        dictFile, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete
+      )) {
         if (readFS == null) {
           return;
         }
@@ -584,7 +629,26 @@ namespace nsHashDictionary {
       // builds prefer PFD1 on the next start. Saving the legacy file first deliberately preserves
       // the existing recovery path if compact generation is interrupted.
       SaveCompactHashList($"{fullPath}\\Hash");
+      lock (m_pendingFileNameLock) m_pendingFileNameHashes.Clear();
+      NeedsSave = false;
       OnHashEvent(new DictionaryEventArgs(DictionaryState.Finished, 100f));
+    }
+
+    /// <summary>
+    /// Saves only the compact PFD1 dictionary used by current PugTools builds. This deliberately
+    /// avoids rewriting and recompressing the legacy has2 file as well, so accepting filename
+    /// discoveries at application shutdown performs one full dictionary serialization instead of two.
+    /// </summary>
+    public void SaveCompactHashListOnly() {
+      lock (m_hashListLock) {
+        String hashDirectory = GetHashDirectory().TrimEnd('\\', '/');
+        if (!Directory.Exists(hashDirectory)) Directory.CreateDirectory(hashDirectory);
+
+        SaveCompactHashList(hashDirectory);
+        lock (m_pendingFileNameLock) m_pendingFileNameHashes.Clear();
+        NeedsSave = false;
+        OnHashEvent(new DictionaryEventArgs(DictionaryState.Finished, 100f));
+      }
     }
 
     private void SaveCompactHashList(String hashDirectory) {
@@ -775,17 +839,19 @@ namespace nsHashDictionary {
     /// <param name="sh"></param>
     /// <returns>returns the HashData object or null</returns> 
     public HashData SearchHashList(UInt32 ph, UInt32 sh) {
-      UInt64 sig = (UInt64)ph << 32 | sh;
-      HashData result = null;
+      lock (m_hashListLock) {
+        UInt64 sig = (UInt64)ph << 32 | sh;
+        HashData result = null;
 
-      for (Int32 i = 0; i < m_hashList.Count; i++) {
-        if (m_hashList.Values[i].ContainsKey(sig)) {
-          result = m_hashList.Values[i][sig];
-          break;
+        for (Int32 i = 0; i < m_hashList.Count; i++) {
+          if (m_hashList.Values[i].ContainsKey(sig)) {
+            result = m_hashList.Values[i][sig];
+            break;
+          }
         }
-      }
 
-      return result;
+        return result;
+      }
     }
 
     /// <summary>
@@ -795,17 +861,20 @@ namespace nsHashDictionary {
     /// <param name="sh"></param>
     /// <returns>returns the HashData object or null</returns> 
     public HashData SearchHashList(UInt32 ph, UInt32 sh, String archiveName) {
-      UInt64 sig = (UInt64)ph << 32 | sh;
+      lock (m_hashListLock) {
+        UInt64 sig = (UInt64)ph << 32 | sh;
 
-      if (!m_hashList.ContainsKey(archiveName)) {
-        m_hashList.Add(archiveName, new SortedList<UInt64, HashData>());
+        // A lookup must be side-effect free. Older code created a new archive bucket here,
+        // which made ordinary browser reads mutate the process-wide dictionary and could race
+        // another browser enumerating it.
+        if (!m_hashList.ContainsKey(archiveName)) return null;
+
+        if (m_hashList[archiveName].ContainsKey(sig)) {
+          return m_hashList[archiveName][sig];
+        }
+
+        return null;
       }
-
-      if (m_hashList[archiveName].ContainsKey(sig)) {
-        return m_hashList[archiveName][sig];
-      }
-
-      return null;
     }
 
     /// <summary>
@@ -815,20 +884,95 @@ namespace nsHashDictionary {
     /// </summary>
     public IEnumerable<HashData> EnumerateArchiveFiles(String archiveName) {
       if (String.IsNullOrWhiteSpace(archiveName)) yield break;
-      if (!m_hashList.TryGetValue(archiveName, out SortedList<UInt64, HashData> archiveHashes) ||
-          archiveHashes == null) yield break;
 
-      foreach (HashData data in archiveHashes.Values) {
+      HashData[] snapshot = null;
+      lock (m_hashListLock) {
+        if (m_hashList.TryGetValue(archiveName, out SortedList<UInt64, HashData> archiveHashes)
+            && archiveHashes != null) {
+          snapshot = new HashData[archiveHashes.Count];
+          archiveHashes.Values.CopyTo(snapshot, 0);
+        }
+      }
+      if (snapshot == null) yield break;
+
+      foreach (HashData data in snapshot) {
         if (data != null) yield return data;
       }
     }
 
-    public void UpdateCRC(UInt32 ph, UInt32 sh, Int32 crc, String archiveName) {
-      UInt64 sig = (UInt64)ph << 32 | sh;
+    /// <summary>
+    /// Finds known resource paths by prefix without materialising the complete PFD1 filename pool.
+    /// Compact dictionaries use a binary search over their sorted unique-name store; the legacy has2
+    /// fallback scans existing rows only when no compact store is available.
+    /// </summary>
+    public IReadOnlyList<String> FindKnownFileNamesByPathPrefix(String pathPrefix) {
+      if (String.IsNullOrWhiteSpace(pathPrefix)) return Array.Empty<String>();
+      String normalizedPrefix = pathPrefix.Replace('\\', '/').Trim().ToLowerInvariant();
 
-      if (m_hashList[archiveName].ContainsKey(sig)) {
-        m_hashList[archiveName][sig].Crc = crc;
-        NeedsSave = true;
+      lock (m_hashListLock) {
+        if (m_compactNameStore != null) {
+          var compactMatches = new List<String>(m_compactNameStore.FindByPrefix(normalizedPrefix));
+          if (m_runtimeFileNameChanges.Count == 0) return compactMatches;
+          var seenCompact = new HashSet<String>(compactMatches, StringComparer.OrdinalIgnoreCase);
+          foreach (String liveName in m_runtimeFileNameChanges) {
+            if (liveName.StartsWith(normalizedPrefix, StringComparison.OrdinalIgnoreCase) && seenCompact.Add(liveName))
+              compactMatches.Add(liveName);
+          }
+          compactMatches.Sort(StringComparer.Ordinal);
+          return compactMatches;
+        }
+
+        var result = new List<String>();
+        var seen = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+        foreach (SortedList<UInt64, HashData> archive in m_hashList.Values) {
+          for (Int32 i = 0; i < archive.Count; i++) {
+            HashData data = archive.Values[i];
+            if (data == null) continue;
+            String fileName = data.FileNameForSerialization;
+            if (String.IsNullOrWhiteSpace(fileName)) continue;
+            String normalizedName = fileName.Replace('\\', '/');
+            if (normalizedName.StartsWith(normalizedPrefix, StringComparison.OrdinalIgnoreCase) && seen.Add(normalizedName))
+              result.Add(normalizedName);
+          }
+        }
+        result.Sort(StringComparer.Ordinal);
+        return result;
+      }
+    }
+
+    /// <summary>
+    /// Finds already-known names for a small set of hashes without constructing the global
+    /// hash-to-archive master index. Filename Finder uses this after a patch so a name that is
+    /// already known in an older/other TOR can be copied to the current archive cheaply.
+    /// </summary>
+    public Dictionary<UInt64, String> FindKnownFileNames(ISet<UInt64> signatures) {
+      lock (m_hashListLock) {
+        var result = new Dictionary<UInt64, String>();
+        if (signatures == null || signatures.Count == 0) return result;
+
+        foreach (SortedList<UInt64, HashData> archive in m_hashList.Values) {
+          for (Int32 i = 0; i < archive.Count; i++) {
+            UInt64 signature = archive.Keys[i];
+            if (!signatures.Contains(signature) || result.ContainsKey(signature)) continue;
+            HashData data = archive.Values[i];
+            if (data == null) continue;
+            String fileName = data.FileNameForSerialization;
+            if (!String.IsNullOrWhiteSpace(fileName)) result[signature] = fileName;
+          }
+          if (result.Count == signatures.Count) break;
+        }
+        return result;
+      }
+    }
+
+    public void UpdateCRC(UInt32 ph, UInt32 sh, Int32 crc, String archiveName) {
+      lock (m_hashListLock) {
+        UInt64 sig = (UInt64)ph << 32 | sh;
+
+        if (m_hashList[archiveName].ContainsKey(sig) && m_hashList[archiveName][sig].Crc != crc) {
+          m_hashList[archiveName][sig].Crc = crc;
+          NeedsSave = true;
+        }
       }
     }
 
@@ -842,37 +986,40 @@ namespace nsHashDictionary {
     /// <param name="archive">the name of the archive in which to look / update</param>
     /// <returns>0=not found, 1=already up-to-date, 2= name updated, 3=archive updated</returns>
     public UpdateResults UpdateHash(UInt32 ph, UInt32 sh, String name, Int32 crc, String archive) {
-      UInt64 sig = (UInt64)ph << 32 | sh;
-      UpdateResults result = UpdateResults.NOT_FOUND;
+      lock (m_hashListLock) {
+        UInt64 sig = (UInt64)ph << 32 | sh;
+        UpdateResults result = UpdateResults.NOT_FOUND;
 
-      // If the list contains the sig, then we update
-      if (m_hashList[archive].ContainsKey(sig)) {
-        result = UpdateResults.UPTODATE;
+        // If the list contains the sig, then we update
+        if (m_hashList[archive].ContainsKey(sig)) {
+          result = UpdateResults.UPTODATE;
 
-        if (!String.IsNullOrEmpty(name) && m_hashList[archive][sig].FileName != name) {
-          // Updates the filename if it has changed
-          m_hashList[archive][sig].FileName = name;
-          result = UpdateResults.NAME_UPDATED;
+          if (!String.IsNullOrEmpty(name) && m_hashList[archive][sig].FileName != name) {
+            // Updates the filename if it has changed
+            m_hashList[archive][sig].FileName = name;
+            result = UpdateResults.NAME_UPDATED;
+            m_runtimeFileNameChanges.Add(name.Replace('\\', '/'));
 
-          AddDirectory(name);
-          AddFileandExtension(name);
+            AddDirectory(name);
+            AddFileandExtension(name);
 
-          NeedsSave = true;
+            MarkFileNameChanged(sig);
+          }
+
+          if (archive != m_hashList[archive][sig].ArchiveName) {
+            // Updates the archivename if the file has switched archive
+            m_hashList[archive][sig].ArchiveName = archive;
+            result = UpdateResults.ARCHIVE_UPDATED;
+            NeedsSave = true;
+          }
+
+          if (crc != 0 && m_hashList[archive][sig].Crc != crc) {
+            m_hashList[archive][sig].Crc = crc;
+            NeedsSave = true;
+          }
         }
-
-        if (archive != m_hashList[archive][sig].ArchiveName) {
-          // Updates the archivename if the file has switched archive
-          m_hashList[archive][sig].ArchiveName = archive;
-          result = UpdateResults.ARCHIVE_UPDATED;
-          NeedsSave = true;
-        }
-
-        if (crc != 0) {
-          m_hashList[archive][sig].Crc = crc;
-          NeedsSave = true;
-        }
+        return result;
       }
-      return result;
     }
 
     /// <summary>
@@ -889,30 +1036,37 @@ namespace nsHashDictionary {
                                           String name,
                                           Int32 crc,
                                           Boolean updateOnly = false) {
-      UInt64 sig = (UInt64)ph << 32 | sh;
-      List<UpdateResults> result = new List<UpdateResults>();
+      lock (m_hashListLock) {
+        UInt64 sig = (UInt64)ph << 32 | sh;
+        List<UpdateResults> result = new List<UpdateResults>();
 
-      m_masterArchiveHashList.TryGetValue(sig, out HashSet<String> archives);
+        m_masterArchiveHashList.TryGetValue(sig, out HashSet<String> archives);
 
-      if (archives != null) {
-        foreach (String arch in archives) {
-          UpdateResults upd = UpdateHash(ph, sh, name, crc, arch);
+        if (archives != null) {
+          foreach (String arch in archives) {
+            UpdateResults upd = UpdateHash(ph, sh, name, crc, arch);
 
-          if (updateOnly) {
-            if ((Int32)upd > 1) result.Add(upd);
-          } else {
-            result.Add(upd);
+            if (updateOnly) {
+              if ((Int32)upd > 1) result.Add(upd);
+            } else {
+              result.Add(upd);
+            }
           }
         }
-      }
 
-      return result;
+        return result;
+      }
     }
 
     #endregion Methods
 
     #region Properties
     public Boolean NeedsSave { get; private set; }
+    public Int32 PendingFileNameChanges {
+      get {
+        lock (m_pendingFileNameLock) return m_pendingFileNameHashes.Count;
+      }
+    }
 
     #endregion Properties
 

@@ -427,6 +427,7 @@
       // 
       // backgroundWorker1
       // 
+      this.backgroundWorker1.WorkerSupportsCancellation = true;
       this.backgroundWorker1.DoWork += new System.ComponentModel.DoWorkEventHandler(this.BackgroundWorker1DoWork);
       this.backgroundWorker1.RunWorkerCompleted += new System.ComponentModel.RunWorkerCompletedEventHandler(this.BackgroundWorker1RunWorkerCompleted);
 
@@ -437,10 +438,12 @@
       this.backgroundWorker2.ProgressChanged += new System.ComponentModel.ProgressChangedEventHandler(this.BackgroundWorker2ProgressChanged);
       this.backgroundWorker2.RunWorkerCompleted += new System.ComponentModel.RunWorkerCompletedEventHandler(this.BackgroundWorker2Completed);
       this.backgroundWorker2.WorkerReportsProgress = true;
+      this.backgroundWorker2.WorkerSupportsCancellation = true;
 
       // 
       // backgroundWorker3
       // 
+      this.backgroundWorker3.WorkerSupportsCancellation = true;
       this.backgroundWorker3.DoWork += new System.ComponentModel.DoWorkEventHandler(this.BackgroundWorker3Run);
       this.backgroundWorker3.RunWorkerCompleted += new System.ComponentModel.RunWorkerCompletedEventHandler(this.BackgroundWorker3RunWorkerCompleted);
 

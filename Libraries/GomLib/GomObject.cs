@@ -34,7 +34,15 @@ namespace GomLib {
     public int NumFields { get; internal set; }
 
     private GomObjectData _data;
-    public GomObjectData Data { get { if (!IsLoaded) { Load(); } return _data; } }
+    private readonly Object _loadSync = new Object();
+    public GomObjectData Data {
+      get {
+        lock (_loadSync) {
+          if (!IsLoaded) LoadCore();
+          return _data;
+        }
+      }
+    }
 
     internal bool IsCompressed { get; set; }
     internal int NodeDataOffset { get; set; }
@@ -250,6 +258,12 @@ namespace GomLib {
     }
 
     public void Load() {
+      lock (_loadSync) {
+        LoadCore();
+      }
+    }
+
+    private void LoadCore() {
       if (IsLoaded) { return; }
       //if (this.Name == "chrPaidPermissionDefsTablePrototype") { return; } //bandaid, need to probe this failure. Probed. Was a 0xD0 variable length int error.
       //if (IsUnloaded) { throw new InvalidOperationException("Cannot reload object once it's unloaded"); } //Fuck you yes I can reload it.
@@ -376,10 +390,12 @@ namespace GomLib {
     }
 
     public void Unload() {
-      _data = null;
-      GlommedClasses = new List<DomClass>();
-      IsLoaded = false;
-      SetIsUnloaded(true);
+      lock (_loadSync) {
+        _data = null;
+        GlommedClasses = new List<DomClass>();
+        IsLoaded = false;
+        SetIsUnloaded(true);
+      }
     }
 
     /// <summary>

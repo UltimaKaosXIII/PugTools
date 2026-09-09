@@ -48,7 +48,7 @@ namespace PugTools {
             intTotal++;
             intAllTotal++;
             HashFileInfo hashInfo =
-              new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file);
+              new HashFileInfo(file.FileInfo.PrimaryHash, file.FileInfo.SecondaryHash, file, true, false);
 
             if (hashInfo.IsNamed) {
               intNamed++;

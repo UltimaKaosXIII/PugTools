@@ -9,6 +9,7 @@ namespace PugTools {
     internal FileFormat_BNK_BKHD BKHD { get; private set; }
     internal FileFormat_BNK_DIDX DIDX { get; set; }
     internal FileFormat_BNK_HIRC HIRC { get; set; }
+    internal FileFormat_BNK_ENVS ENVS { get; set; }
     internal FileFormat_BNK_STID STID { get; set; }
 
     internal FileFormat_BNK(BinaryReader br, Boolean loadWEMs = false) {
@@ -32,7 +33,11 @@ namespace PugTools {
             break;
 
           case "HIRC":
-            HIRC = new FileFormat_BNK_HIRC(br);
+            HIRC = new FileFormat_BNK_HIRC(br, BKHD?.Version ?? 0);
+            break;
+
+          case "ENVS":
+            ENVS = new FileFormat_BNK_ENVS(br);
             break;
 
           case "STID":
@@ -48,7 +53,7 @@ namespace PugTools {
 
       if (loadWEMs) {
         if (DIDX != null && _data != null) {
-          Boolean isBeta = BKHD != null && BKHD.Version == 56;
+          Boolean isBeta = BKHD != null && BKHD.Version <= 56;
           foreach (ViewWEM wem in DIDX.Wems) {
             br.BaseStream.Seek(_data.Offset /*+4*/, SeekOrigin.Begin);
             br.BaseStream.Seek(wem.Offset, SeekOrigin.Current);
@@ -121,158 +126,677 @@ namespace PugTools {
       }
     }
   }
-  internal class FileFormat_BNK_HIRC {
-    // private UInt32 _length;
-    // private Int64 _offset;
+  internal sealed class FileFormat_BNK_ENVS_Point {
+    internal Single X { get; set; }
+    internal Single Y { get; set; }
+    internal UInt32 Shape { get; set; }
+  }
 
-    internal UInt32 NumObject { get; set; }
-    internal List<FileFormat_BNK_HIRC_Object> Objects { get; set; }
+  internal sealed class FileFormat_BNK_ENVS_Curve {
+    internal Boolean Enabled { get; set; }
+    internal Byte Type { get; set; }
+    internal List<FileFormat_BNK_ENVS_Point> Points { get; } = new List<FileFormat_BNK_ENVS_Point>();
+  }
 
-    internal FileFormat_BNK_HIRC(BinaryReader br) {
-      Objects = new List<FileFormat_BNK_HIRC_Object>();
+  internal sealed class FileFormat_BNK_ENVS {
+    internal List<FileFormat_BNK_ENVS_Curve> Curves { get; } = new List<FileFormat_BNK_ENVS_Curve>();
 
-      // _length = 
-      br.ReadUInt32();
-      NumObject = br.ReadUInt32();
-
-      for (Int32 intCount = 0; intCount < NumObject; intCount++) {
-        FileFormat_BNK_HIRC_Object obj = new FileFormat_BNK_HIRC_Object(br);
-        Objects.Add(obj);
+    internal FileFormat_BNK_ENVS(BinaryReader br) {
+      UInt32 length = br.ReadUInt32();
+      Int64 end = br.BaseStream.Position + length;
+      try {
+        while (br.BaseStream.Position + 4 <= end) {
+          FileFormat_BNK_ENVS_Curve curve = new FileFormat_BNK_ENVS_Curve {
+            Enabled = br.ReadByte() != 0,
+            Type = br.ReadByte()
+          };
+          UInt16 points = br.ReadUInt16();
+          if (points > 1024 || br.BaseStream.Position + points * 12L > end) break;
+          for (Int32 i = 0; i < points; i++) {
+            curve.Points.Add(new FileFormat_BNK_ENVS_Point {
+              X = br.ReadSingle(), Y = br.ReadSingle(), Shape = br.ReadUInt32()
+            });
+          }
+          Curves.Add(curve);
+        }
+      } finally {
+        if (br.BaseStream.CanSeek) br.BaseStream.Seek(end, SeekOrigin.Begin);
       }
     }
   }
+
+  internal class FileFormat_BNK_HIRC {
+    internal UInt32 NumObject { get; set; }
+    internal List<FileFormat_BNK_HIRC_Object> Objects { get; set; }
+
+    internal FileFormat_BNK_HIRC(BinaryReader br, UInt32 version) {
+      Objects = new List<FileFormat_BNK_HIRC_Object>();
+
+      UInt32 sectionLength = br.ReadUInt32();
+      Int64 sectionEnd = br.BaseStream.Position + sectionLength;
+      NumObject = br.ReadUInt32();
+
+      for (Int32 intCount = 0; intCount < NumObject && br.BaseStream.Position < sectionEnd; intCount++) {
+        // Wwise <= 48 stored the HIRC type as uint32; later SWTOR banks use uint8.
+        UInt32 rawType = version != 0 && version <= 48 ? br.ReadUInt32() : br.ReadByte();
+        UInt32 length = br.ReadUInt32();
+        if (length < 4 || length > Int32.MaxValue || br.BaseStream.Position + length > sectionEnd) {
+          // A corrupt/unknown object must never desynchronise the remainder of the bank.
+          br.BaseStream.Seek(sectionEnd, SeekOrigin.Begin);
+          break;
+        }
+
+        Byte[] objectBytes = br.ReadBytes((Int32)length);
+        if (objectBytes.Length != length) break;
+        Objects.Add(new FileFormat_BNK_HIRC_Object((Byte)rawType, objectBytes, version));
+      }
+
+      if (br.BaseStream.CanSeek && br.BaseStream.Position != sectionEnd)
+        br.BaseStream.Seek(sectionEnd, SeekOrigin.Begin);
+    }
+  }
+
+  internal sealed class WwiseStateAssignment {
+    internal UInt32 StateId { get; set; }
+    internal UInt32 SettingsId { get; set; }
+  }
+
+  internal sealed class WwiseStateGroup {
+    internal UInt32 GroupId { get; set; }
+    internal Byte SyncType { get; set; }
+    internal List<WwiseStateAssignment> States { get; } = new List<WwiseStateAssignment>();
+  }
+
+  internal sealed class WwiseRtpcPoint {
+    internal Single X { get; set; }
+    internal Single Y { get; set; }
+    internal UInt32 Shape { get; set; }
+  }
+
+  internal sealed class WwiseRtpcCurve {
+    internal UInt32 ParameterId { get; set; }
+    internal UInt32 TargetType { get; set; }
+    internal UInt32 CurveId { get; set; }
+    internal Byte Scaling { get; set; }
+    internal List<WwiseRtpcPoint> Points { get; } = new List<WwiseRtpcPoint>();
+  }
+
+  internal sealed class WwiseSwitchGrouping {
+    internal UInt32 SwitchId { get; set; }
+    internal List<UInt32> Items { get; } = new List<UInt32>();
+  }
+
+  internal sealed class WwiseDuckedBus {
+    internal UInt32 BusId { get; set; }
+    internal Single Volume { get; set; }
+    internal Int32 FadeOutMs { get; set; }
+    internal Int32 FadeInMs { get; set; }
+    internal Byte Shape { get; set; }
+  }
+
+  internal sealed class WwiseAttenuationCurve {
+    internal Byte Scaling { get; set; }
+    internal List<WwiseRtpcPoint> Points { get; } = new List<WwiseRtpcPoint>();
+  }
+
   internal class FileFormat_BNK_HIRC_Object {
-    // All Objects
-    private readonly UInt32 _length;
-    // Music Segment
-    private readonly List<UInt32> _audioIds;
-    // Events
-    private readonly List<UInt32> _eventActions;
-    private readonly UInt32 _numEvents;
-    // Event Action
-    // private readonly UInt32 _actionObjectId;
+    private readonly List<UInt32> _audioIds = new List<UInt32>();
+    private readonly List<UInt32> _eventActions = new List<UInt32>();
+    private readonly List<UInt32> _children = new List<UInt32>();
+    private readonly List<UInt32> _effectIds = new List<UInt32>();
 
-    // SoundFX / Music Tracks
-    internal UInt32 AudioId { get; }
-    internal UInt32 AudioSourceId { get; }
-    internal UInt32 Embed { get; }
-    // All Objects
-    internal UInt32 Id { get; set; }
-    internal Byte Type { get; set; }
+    internal UInt32 Id { get; private set; }
+    internal Byte Type { get; private set; }
+    internal UInt32 Version { get; private set; }
+    internal Byte[] RawPayload { get; private set; }
+    internal String ParseWarning { get; private set; }
 
-    internal FileFormat_BNK_HIRC_Object(BinaryReader br) {
-      Type = br.ReadByte();
-      _length = br.ReadUInt32();
+    internal UInt32 AudioId { get; private set; }
+    internal UInt32 AudioSourceId { get; private set; }
+    internal UInt32 Embed { get; private set; }
+    internal UInt32 ActionObjectId { get; private set; }
+    internal UInt32 ParentId { get; private set; }
+    internal UInt32 OutputBusId { get; private set; }
+    internal UInt32 AttenuationId { get; private set; }
+    internal UInt32 ActionType { get; private set; }
+    internal UInt32 ActionScope { get; private set; }
+    internal UInt32 StateGroupId { get; private set; }
+    internal UInt32 StateId { get; private set; }
+    internal UInt32 SwitchGroupId { get; private set; }
+    internal UInt32 SwitchId { get; private set; }
+    internal UInt32 DefaultSwitchId { get; private set; }
+    internal UInt32 SoundBankId { get; private set; }
+    internal UInt32 PositioningSourceType { get; private set; }
+    internal Boolean Is3DPositioned { get; private set; }
+
+    internal IReadOnlyList<UInt32> EventActions => _eventActions;
+    internal IReadOnlyList<UInt32> AudioIds => _audioIds;
+    internal IReadOnlyList<UInt32> Children => _children;
+    internal IReadOnlyList<UInt32> EffectIds => _effectIds;
+    internal List<WwiseStateGroup> StateGroups { get; } = new List<WwiseStateGroup>();
+    internal List<WwiseRtpcCurve> Rtpcs { get; } = new List<WwiseRtpcCurve>();
+    internal List<WwiseSwitchGrouping> SwitchGroupings { get; } = new List<WwiseSwitchGrouping>();
+    internal List<WwiseDuckedBus> DuckedBusses { get; } = new List<WwiseDuckedBus>();
+    internal List<WwiseAttenuationCurve> AttenuationCurves { get; } = new List<WwiseAttenuationCurve>();
+
+    internal FileFormat_BNK_HIRC_Object(Byte type, Byte[] objectBytes, UInt32 version) {
+      Type = type;
+      Version = version;
+      if (objectBytes == null || objectBytes.Length < 4) {
+        RawPayload = Array.Empty<Byte>();
+        ParseWarning = "HIRC object was shorter than its 4-byte id.";
+        return;
+      }
+
+      using MemoryStream ms = new MemoryStream(objectBytes, false);
+      using BinaryReader br = new BinaryReader(ms);
       Id = br.ReadUInt32();
+      RawPayload = br.ReadBytes((Int32)(ms.Length - ms.Position));
 
+      try {
+        using MemoryStream payload = new MemoryStream(RawPayload, false);
+        using BinaryReader pr = new BinaryReader(payload);
+        ParsePayload(pr);
+      } catch (Exception ex) when (ex is EndOfStreamException || ex is IOException || ex is ArgumentException) {
+        ParseWarning = ex.Message;
+      }
+    }
+
+    private void ParsePayload(BinaryReader br) {
       switch (Type) {
-        case 2:
-          br.ReadBytes(4);
-          Embed = br.ReadUInt32();
-          AudioId = br.ReadUInt32();
-          AudioSourceId = br.ReadUInt32();
+        case 2: ParseSound(br); break;
+        case 3: ParseEventAction(br); break;
+        case 4: ParseEvent(br); break;
+        case 5: ParseRandomSequence(br); break;
+        case 6: ParseSwitchContainer(br); break;
+        case 7: ParseActorMixer(br); break;
+        case 8: ParseAudioBus(br); break;
+        case 9: ParseBlendContainer(br); break;
+        case 10: ParseMusicSegment(br); break;
+        case 11: ParseMusicTrack(br); break;
+        case 12: ParseMusicSwitch(br); break;
+        case 13: ParseMusicPlaylist(br); break;
+        case 14: ParseAttenuation(br); break;
+        case 18:
+        case 19: ParseEffect(br); break;
+      }
+    }
 
-          if (Embed == 0) {
-            // Offset
-            br.ReadUInt32();
-            // Length
-            br.ReadUInt32();
-          }
+    private static void Require(BinaryReader br, Int64 bytes) {
+      if (bytes < 0 || br.BaseStream.Position + bytes > br.BaseStream.Length)
+        throw new EndOfStreamException("Unexpected end of Wwise HIRC payload.");
+    }
 
-          br.ReadByte();
+    private static void Skip(BinaryReader br, Int64 bytes) {
+      Require(br, bytes);
+      br.BaseStream.Seek(bytes, SeekOrigin.Current);
+    }
 
-          if (Embed == 0)
-            br.BaseStream.Seek(_length - 29, SeekOrigin.Current);
-          else
-            br.BaseStream.Seek(_length - 21, SeekOrigin.Current);
-          break;
+    private void ParseEvent(BinaryReader br) {
+      UInt32 count = br.ReadUInt32();
+      if (count > 100000) throw new InvalidDataException("Unreasonable Wwise event action count.");
+      for (UInt32 i = 0; i < count; i++) _eventActions.Add(br.ReadUInt32());
+    }
 
-        case 3:
-          br.ReadByte();
-          br.ReadByte();
-          // _actionObjectId = 
-          br.ReadUInt32();
-          br.BaseStream.Seek(_length - 10, SeekOrigin.Current);
-          /*
-          // Disable this for now
-          br.ReadByte();
-          Byte numParam = br.ReadByte();
-          List<Byte> adtlParam = new List<Byte>();
-          Int32 numBytes = 17;
-          
-          for (Int32 c = 0; c < numParam; c++ ) {
-            adtlParam.Add(br.ReadByte());
-            numBytes++;
-          }
+    private void ParseEventAction(BinaryReader br) {
+      if (Version != 0 && Version <= 56) {
+        UInt32 raw = br.ReadUInt32();
+        ActionType = (raw >> 12) & 0xFF;
+        ActionScope = raw & 0xFFF;
+        ActionObjectId = br.ReadUInt32();
+        Skip(br, 12); // delay value/min/max
+        UInt32 subSize = br.ReadUInt32();
+        Int64 subEnd = br.BaseStream.Position + subSize;
+        if (subEnd > br.BaseStream.Length) throw new EndOfStreamException("Invalid beta EventAction subsection.");
+        if (subSize >= 8 && ActionType == 0x12) {
+          StateGroupId = br.ReadUInt32(); StateId = br.ReadUInt32();
+        } else if (subSize >= 8 && ActionType == 0x19) {
+          SwitchGroupId = br.ReadUInt32(); SwitchId = br.ReadUInt32();
+        }
+        br.BaseStream.Position = subEnd;
+        if ((ActionType == 0x04 || ActionType == 0x05) && br.BaseStream.Position + 4 <= br.BaseStream.Length)
+          SoundBankId = br.ReadUInt32();
+        return;
+      }
 
-          foreach(Byte param in adtlParam) {
-            if (param == 0x0E || param == 0x0F) {
-              br.ReadUInt32();
-              numBytes += 4;
-            } else {
-              br.ReadSingle();
-              numBytes += 4;
-            }
-          }
+      ActionScope = br.ReadByte();
+      ActionType = br.ReadByte();
+      ActionObjectId = br.ReadUInt32();
+      Byte numParams = br.ReadByte();
+      Skip(br, numParams);
+      Skip(br, numParams * 4L);
+      Byte numRandom = br.ReadByte();
+      Skip(br, numRandom);
+      Skip(br, numRandom * 8L);
 
-          br.ReadByte();
-          numBytes += 1;
+      if (ActionType == 1 || ActionType == 4) {
+        Skip(br, 1);
+        SoundBankId = br.ReadUInt32();
+      } else if (ActionType == 2 || ActionType == 3) {
+        Skip(br, 6);
+      } else if (ActionType == 8 || ActionType == 9 || ActionType == 10 || ActionType == 11 ||
+                 ActionType == 14 || ActionType == 15 || ActionType == 19 || ActionType == 20) {
+        Skip(br, 18);
+      } else if (ActionType == 18) {
+        StateGroupId = br.ReadUInt32(); StateId = br.ReadUInt32();
+      } else if (ActionType == 25) {
+        SwitchGroupId = br.ReadUInt32(); SwitchId = br.ReadUInt32();
+      }
+    }
 
-          if (type == 0x12) {
-            UInt32 state_group_id = br.ReadUInt32();
-            UInt32 state_id = br.ReadUInt32();
-            numBytes += 8;
-          } else if (type == 0x19) {
-            UInt32 switch_group_id = br.ReadUInt32();
-            UInt32 switch_id = br.ReadUInt32();
-            numBytes += 8;
-          }
-          */
-          break;
+    private void ParseSound(BinaryReader br) {
+      if (Version != 0 && Version <= 56) {
+        ParseOldSource(br);
+        ParseOldNodeBase(br);
+        return;
+      }
 
-        case 4:
-          _numEvents = br.ReadUInt32();
+      UInt16 unknown1 = br.ReadUInt16();
+      br.ReadUInt16();
+      if (unknown1 == 1) {
+        ParseLiveFileRef(br);
+        ParseLiveNodeBase(br, false, true);
+      }
+    }
 
-          if (_numEvents > 0) {
-            _eventActions = new List<UInt32>();
+    private void ParseLiveFileRef(BinaryReader br) {
+      Embed = br.ReadUInt32(); // 0 embedded, 1 streamed, 2 streamed with prefetch
+      AudioId = br.ReadUInt32();
+      AudioSourceId = br.ReadUInt32();
+      if (Embed == 0 || Embed == 2) Skip(br, 8);
+      Skip(br, 1);
+    }
 
-            for (Int32 count = 0; count < _numEvents; count++) {
-              _eventActions.Add(br.ReadUInt32());
-            }
-          }
+    private void ParseOldSource(BinaryReader br) {
+      UInt32 pluginId = br.ReadUInt32();
+      UInt32 streamType = br.ReadUInt32();
+      if (Version <= 46) Skip(br, 8);
+      AudioSourceId = br.ReadUInt32();
+      AudioId = br.ReadUInt32();
+      Embed = streamType;
+      if (streamType != 1) Skip(br, 8);
+      Skip(br, 1);
+      UInt32 pluginType = pluginId & 0x0F;
+      if (pluginType == 2 || pluginType == 5) {
+        UInt32 size = br.ReadUInt32(); Skip(br, size);
+      }
+    }
 
-          break;
+    private void ParseRandomSequence(BinaryReader br) {
+      if (Version != 0 && Version <= 56) {
+        ParseOldNodeBase(br);
+        Skip(br, 2 + 12 + 2 + 8);
+        ReadChildren(br);
+        return;
+      }
+      ParseLiveNodeBase(br, false, true);
+      Skip(br, 2 + 12 + 2 + 1 + 1 + 2 + 1 + 1 + 1 + 1);
+      ReadChildren(br);
+    }
 
-        case 10:
-          Int64 before = br.BaseStream.Position;
-          UInt32 numChild = br.ReadUInt32();
+    private void ParseSwitchContainer(BinaryReader br) {
+      if (Version != 0 && Version <= 56) ParseOldNodeBase(br);
+      else ParseLiveNodeBase(br, false, true);
 
-          if (numChild > 0) {
-            _audioIds = new List<UInt32>();
+      UInt32 groupType = br.ReadUInt32();
+      SwitchGroupId = br.ReadUInt32();
+      DefaultSwitchId = br.ReadUInt32();
+      Skip(br, 1);
+      ReadChildren(br);
+      UInt32 groupCount = br.ReadUInt32();
+      if (groupCount > 100000) throw new InvalidDataException("Unreasonable Wwise switch grouping count.");
+      for (UInt32 i = 0; i < groupCount; i++) {
+        WwiseSwitchGrouping grouping = new WwiseSwitchGrouping { SwitchId = br.ReadUInt32() };
+        UInt32 itemCount = br.ReadUInt32();
+        if (itemCount > 100000) throw new InvalidDataException("Unreasonable Wwise switch item count.");
+        for (UInt32 j = 0; j < itemCount; j++) grouping.Items.Add(br.ReadUInt32());
+        SwitchGroupings.Add(grouping);
+      }
+      // Grouping behavior follows; relations above are the useful semantic part.
+      _ = groupType;
+    }
 
-            for (Int32 count = 0; count < numChild; count++) {
-              _audioIds.Add(br.ReadUInt32());
-            }
-          }
+    private void ParseActorMixer(BinaryReader br) {
+      if (Version != 0 && Version <= 56) ParseOldNodeBase(br);
+      else ParseLiveNodeBase(br, false, true);
+      ReadChildren(br);
+    }
 
-          Int64 after = br.BaseStream.Position;
-          Int64 diff = after - before + 4;
-          br.BaseStream.Seek(_length - diff, SeekOrigin.Current);
-          break;
+    private void ParseBlendContainer(BinaryReader br) {
+      if (Version != 0 && Version <= 56) ParseOldNodeBase(br);
+      else ParseLiveNodeBase(br, false, true);
+      ReadChildren(br);
+    }
 
-        case 11:
-          br.ReadBytes(8);
-          br.ReadBoolean();
-          br.ReadBytes(3);
-          AudioSourceId = br.ReadUInt32();
-          AudioId = br.ReadUInt32();
-          br.BaseStream.Seek(_length - 24, SeekOrigin.Current);
-          break;
+    private void ParseMusicSegment(BinaryReader br) {
+      if (Version != 0 && Version <= 56) {
+        ParseOldNodeBase(br);
+        ReadChildren(br);
+      } else {
+        ParseLiveNodeBase(br, false, false);
+        ReadChildren(br);
+      }
+    }
 
-        default:
-          // Skipping other HIRC Types
-          br.BaseStream.Seek(_length - 4, SeekOrigin.Current);
-          break;
+    private void ParseMusicTrack(BinaryReader br) {
+      if (Version != 0 && Version <= 56) {
+        UInt32 sources = br.ReadUInt32();
+        if (sources > 10000) throw new InvalidDataException("Unreasonable beta music-track source count.");
+        for (UInt32 i = 0; i < sources; i++) {
+          UInt32 oldAudio = AudioId, oldSource = AudioSourceId, oldEmbed = Embed;
+          ParseOldSource(br);
+          if (i > 0) { AudioId = oldAudio; AudioSourceId = oldSource; Embed = oldEmbed; }
+        }
+        UInt32 playlist = br.ReadUInt32();
+        if (playlist > 100000) throw new InvalidDataException("Unreasonable beta music-track playlist count.");
+        Skip(br, playlist * 40L);
+        if (playlist > 0) Skip(br, 4); // numSubTrack
+        ParseOldNodeBase(br);
+        return;
+      }
+
+      Skip(br, 8); // uint32 const1 + uint16 const1 + uint16 format
+      ParseLiveFileRef(br);
+
+      UInt32 clips = br.ReadUInt32();
+      if (clips > 100000) throw new InvalidDataException("Unreasonable Wwise music clip count.");
+      Skip(br, clips * 40L);
+      Skip(br, 4); // const 1
+      UInt32 curves = br.ReadUInt32();
+      if (curves > 100000) throw new InvalidDataException("Unreasonable Wwise music property-curve count.");
+      for (UInt32 i = 0; i < curves; i++) {
+        Skip(br, 8);
+        UInt32 points = br.ReadUInt32();
+        if (points > 100000) throw new InvalidDataException("Unreasonable Wwise music property-curve point count.");
+        Skip(br, points * 12L);
+      }
+      ParseLiveNodeBase(br, true, false);
+      if (br.BaseStream.Position + 8 <= br.BaseStream.Length) Skip(br, 8); // track type + look-ahead
+    }
+
+    private void ParseMusicSwitch(BinaryReader br) {
+      if (Version != 0 && Version <= 56) {
+        // Parse enough of the beta shared structure to expose hierarchy/control data.
+        ParseOldNodeBase(br);
+        ReadChildren(br);
+        TryParseMusicSwitchTail(br);
+        return;
+      }
+      ParseLiveNodeBase(br, false, false);
+      ReadChildren(br);
+      // The transition table is variable-sized; parse switch/state mapping by scanning the validated tail conservatively.
+      TryParseMusicSwitchTail(br);
+    }
+
+    private void ParseMusicPlaylist(BinaryReader br) {
+      if (Version != 0 && Version <= 56) ParseOldNodeBase(br);
+      else ParseLiveNodeBase(br, false, false);
+      ReadChildren(br);
+    }
+
+    private void TryParseMusicSwitchTail(BinaryReader br) {
+      // Wwise v62 music switch containers end with: groupType, groupId, default, continue, count, pairs.
+      // Search from the current position for a tail whose pair count lands exactly at EOF.
+      Byte[] remaining = br.ReadBytes((Int32)(br.BaseStream.Length - br.BaseStream.Position));
+      for (Int32 off = Math.Max(0, remaining.Length - 4096); off + 17 <= remaining.Length; off++) {
+        UInt32 groupType = BitConverter.ToUInt32(remaining, off);
+        if (groupType > 1) continue;
+        UInt32 count = BitConverter.ToUInt32(remaining, off + 13);
+        Int64 end = off + 17L + count * 8L;
+        if (count > 10000 || end != remaining.Length) continue;
+        SwitchGroupId = BitConverter.ToUInt32(remaining, off + 4);
+        DefaultSwitchId = BitConverter.ToUInt32(remaining, off + 8);
+        for (UInt32 i = 0; i < count; i++) {
+          Int32 p = off + 17 + (Int32)i * 8;
+          WwiseSwitchGrouping g = new WwiseSwitchGrouping { SwitchId = BitConverter.ToUInt32(remaining, p) };
+          g.Items.Add(BitConverter.ToUInt32(remaining, p + 4));
+          SwitchGroupings.Add(g);
+        }
+        return;
+      }
+    }
+
+    private void ParseAudioBus(BinaryReader br) {
+      if (Version != 0 && Version <= 56) {
+        ParentId = br.ReadUInt32();
+        Skip(br, 16); // volume/LFE/pitch/LPF
+        Skip(br, 2);  // kill newest/use virtual behavior
+        Skip(br, 2);  // max instances
+        Skip(br, 1);  // override parent
+        Skip(br, 2);  // channel config
+        Skip(br, 2);  // legacy unused bytes
+        Boolean envBus = br.ReadByte() != 0;
+        Skip(br, 4 + 4); // recovery time + max duck volume
+        UInt32 ducked = br.ReadUInt32();
+        for (UInt32 i = 0; i < ducked; i++) {
+          WwiseDuckedBus d = new WwiseDuckedBus {
+            BusId = br.ReadUInt32(), Volume = br.ReadSingle(), FadeOutMs = br.ReadInt32(), FadeInMs = br.ReadInt32(), Shape = br.ReadByte()
+          };
+          DuckedBusses.Add(d);
+        }
+        Byte fxCount = br.ReadByte();
+        if (fxCount > 0 || envBus) {
+          Skip(br, 1); // bypass mask
+          for (Int32 i = 0; i < fxCount; i++) { Skip(br, 1); _effectIds.Add(br.ReadUInt32()); Skip(br, 2); }
+        }
+        ParseRtpcs(br, true);
+        ParseOldStateChunk(br);
+        return;
+      }
+
+      ParentId = br.ReadUInt32();
+      Skip(br, 2 + 4 + 4);
+      Byte extra = br.ReadByte();
+      Skip(br, 4 + 4);
+      UInt32 count = br.ReadUInt32();
+      for (UInt32 i = 0; i < count; i++) {
+        WwiseDuckedBus d = new WwiseDuckedBus {
+          BusId = br.ReadUInt32(), Volume = br.ReadSingle(), FadeOutMs = br.ReadInt32(), FadeInMs = br.ReadInt32(), Shape = br.ReadByte()
+        };
+        DuckedBusses.Add(d);
+      }
+      Byte effects = br.ReadByte();
+      if (effects > 0) {
+        Skip(br, 1);
+        for (Int32 i = 0; i < effects; i++) { Skip(br, 1); _effectIds.Add(br.ReadUInt32()); Skip(br, 2); }
+      }
+      ParseRtpcs(br, false);
+      if (br.BaseStream.Position + 4 <= br.BaseStream.Length) Skip(br, 4);
+      if (extra == 1 && br.BaseStream.Position < br.BaseStream.Length) Skip(br, 1);
+    }
+
+    private void ParseEffect(BinaryReader br) {
+      // Effect ShareSet/Custom: plugin header + opaque plugin properties + media flag + RTPCs.
+      Require(br, 8);
+      Skip(br, 4); // plugin type/company + plugin id
+      UInt32 propertyBytes = br.ReadUInt32();
+      Skip(br, propertyBytes);
+      Byte mediaChildren = br.ReadByte();
+      if (mediaChildren > 0) {
+        // SWTOR normally stores zero here. Keep payload bounded instead of guessing a newer layout.
+        throw new InvalidDataException("Unsupported Wwise effect media-child layout.");
+      }
+      ParseRtpcs(br, Version != 0 && Version <= 56);
+    }
+
+    private void ParseAttenuation(BinaryReader br) {
+      if (Version != 0 && Version <= 56) {
+        Byte cone = br.ReadByte();
+        if ((cone & 1) != 0) Skip(br, 16);
+        Skip(br, 5);
+        Byte curveCount = br.ReadByte();
+        for (Int32 i = 0; i < curveCount; i++) {
+          WwiseAttenuationCurve curve = new WwiseAttenuationCurve { Scaling = br.ReadByte() };
+          UInt16 points = br.ReadUInt16();
+          for (Int32 j = 0; j < points; j++) curve.Points.Add(ReadCurvePoint(br));
+          AttenuationCurves.Add(curve);
+        }
+        ParseRtpcs(br, true);
+        return;
+      }
+
+      Byte hasVector = br.ReadByte();
+      if (hasVector == 1) Skip(br, 16);
+      Skip(br, 5); // const/bool + three signed curve selectors
+      Byte outer = br.ReadByte();
+      for (Int32 i = 0; i < outer; i++) {
+        WwiseAttenuationCurve curve = new WwiseAttenuationCurve { Scaling = br.ReadByte() };
+        UInt16 points = br.ReadUInt16();
+        for (Int32 j = 0; j < points; j++) curve.Points.Add(ReadCurvePoint(br));
+        AttenuationCurves.Add(curve);
+      }
+    }
+
+    private WwiseRtpcPoint ReadCurvePoint(BinaryReader br) {
+      return new WwiseRtpcPoint { X = br.ReadSingle(), Y = br.ReadSingle(), Shape = br.ReadUInt32() };
+    }
+
+    private void ReadChildren(BinaryReader br) {
+      UInt32 count = br.ReadUInt32();
+      if (count > 100000) throw new InvalidDataException("Unreasonable Wwise child count.");
+      for (UInt32 i = 0; i < count; i++) _children.Add(br.ReadUInt32());
+      // v10 exposed music segment children as AudioIds; preserve that API.
+      if (Type == 10) _audioIds.AddRange(_children);
+    }
+
+    private void ParseLiveNodeBase(BinaryReader br, Boolean isMusicTrack, Boolean isSound) {
+      Skip(br, 1); // Override parent effects
+      Byte effects = br.ReadByte();
+      if (effects > 0) {
+        Skip(br, 1);
+        for (Int32 i = 0; i < effects; i++) {
+          Skip(br, 1); _effectIds.Add(br.ReadUInt32()); Skip(br, 2);
+        }
+      }
+
+      if (!isMusicTrack) OutputBusId = br.ReadUInt32();
+      ParentId = br.ReadUInt32();
+      Skip(br, 2);
+
+      Byte additional = br.ReadByte(); Skip(br, additional); Skip(br, additional * 4L);
+      Byte doubles = br.ReadByte(); Skip(br, doubles); Skip(br, doubles * 8L);
+
+      Byte positioning = br.ReadByte();
+      if (positioning == 1) {
+        Byte posType = br.ReadByte();
+        Is3DPositioned = posType != 0;
+        if (posType == 0) Skip(br, 1);
+        else {
+          PositioningSourceType = br.ReadUInt32();
+          AttenuationId = br.ReadUInt32();
+          Skip(br, 1);
+          if (PositioningSourceType == 2) {
+            Skip(br, 10);
+            UInt32 n1 = br.ReadUInt32(); Skip(br, n1 * 16L);
+            UInt32 n2 = br.ReadUInt32(); Skip(br, n2 * 16L);
+          } else if (PositioningSourceType == 3) Skip(br, 1);
+        }
+      }
+
+      if (!isSound) {
+        Skip(br, 3);
+        Byte aux = br.ReadByte(); if (aux == 1) Skip(br, 16);
+        Byte limit = br.ReadByte(); if (limit > 0) Skip(br, 4);
+      } else Skip(br, 5);
+      Skip(br, 4);
+
+      UInt32 stateGroups = br.ReadUInt32();
+      if (stateGroups > 10000) throw new InvalidDataException("Unreasonable Wwise state group count.");
+      for (UInt32 i = 0; i < stateGroups; i++) {
+        WwiseStateGroup group = new WwiseStateGroup { GroupId = br.ReadUInt32(), SyncType = br.ReadByte() };
+        UInt16 custom = br.ReadUInt16();
+        for (Int32 j = 0; j < custom; j++) group.States.Add(new WwiseStateAssignment { StateId = br.ReadUInt32(), SettingsId = br.ReadUInt32() });
+        StateGroups.Add(group);
+      }
+      ParseRtpcs(br, false);
+    }
+
+    private void ParseOldNodeBase(BinaryReader br) {
+      Skip(br, 1);
+      Byte effects = br.ReadByte();
+      if (effects > 0) {
+        Skip(br, 1);
+        for (Int32 i = 0; i < effects; i++) {
+          Skip(br, 1); _effectIds.Add(br.ReadUInt32());
+          if (Version <= 48) {
+            Skip(br, 1);
+            UInt32 preset = br.ReadUInt32(); Skip(br, preset);
+            if (Version > 46) { UInt32 bankData = br.ReadUInt32(); Skip(br, bankData * 8L); }
+          } else Skip(br, 2);
+        }
+      }
+      OutputBusId = br.ReadUInt32();
+      ParentId = br.ReadUInt32();
+      Skip(br, 4);
+      Skip(br, 12 * 4L);
+      if (Version <= 52) StateGroupId = br.ReadUInt32();
+      ParseOldPositioning(br);
+      if (Version <= 53) Skip(br, 7); else Skip(br, 9);
+      ParseOldStateChunk(br);
+      ParseRtpcs(br, true);
+    }
+
+    private void ParseOldPositioning(BinaryReader br) {
+      Byte flags = br.ReadByte();
+      if ((flags & 1) == 0) return;
+      Skip(br, 12);
+      Byte has3d = br.ReadByte();
+      Is3DPositioned = has3d != 0;
+      if (has3d == 0) { Skip(br, 1); return; }
+      PositioningSourceType = br.ReadUInt32();
+      AttenuationId = br.ReadUInt32();
+      Skip(br, 1);
+      if (PositioningSourceType == 3) Skip(br, 1);
+      else if (PositioningSourceType == 2) {
+        Skip(br, 4 + 1 + 4 + 1);
+        UInt32 vertices = br.ReadUInt32(); Skip(br, vertices * 16L);
+        UInt32 items = br.ReadUInt32(); Skip(br, items * 8L); Skip(br, items * 8L);
+      }
+    }
+
+    private void ParseOldStateChunk(BinaryReader br) {
+      if (Version <= 52) {
+        Byte sync = br.ReadByte();
+        UInt16 count = br.ReadUInt16();
+        WwiseStateGroup group = new WwiseStateGroup { GroupId = StateGroupId, SyncType = sync };
+        for (Int32 i = 0; i < count; i++) {
+          UInt32 state = br.ReadUInt32(); Skip(br, 1); UInt32 settings = br.ReadUInt32();
+          group.States.Add(new WwiseStateAssignment { StateId = state, SettingsId = settings });
+        }
+        if (count > 0 || StateGroupId != 0) StateGroups.Add(group);
+      } else {
+        UInt32 groups = br.ReadUInt32();
+        for (UInt32 i = 0; i < groups; i++) {
+          WwiseStateGroup group = new WwiseStateGroup { GroupId = br.ReadUInt32(), SyncType = br.ReadByte() };
+          UInt16 count = br.ReadUInt16();
+          for (Int32 j = 0; j < count; j++) group.States.Add(new WwiseStateAssignment { StateId = br.ReadUInt32(), SettingsId = br.ReadUInt32() });
+          StateGroups.Add(group);
+        }
+      }
+    }
+
+    private void ParseRtpcs(BinaryReader br, Boolean oldLayout) {
+      UInt16 count = br.ReadUInt16();
+      if (count > 512) throw new InvalidDataException("Unreasonable Wwise RTPC count.");
+      for (Int32 i = 0; i < count; i++) {
+        WwiseRtpcCurve rtpc = new WwiseRtpcCurve();
+        if (oldLayout) {
+          if (Version <= 36) Skip(br, 4);
+          else if (Version <= 48) Skip(br, 5);
+          rtpc.ParameterId = br.ReadUInt32();
+          rtpc.TargetType = br.ReadUInt32();
+          rtpc.CurveId = br.ReadUInt32();
+          rtpc.Scaling = br.ReadByte();
+        } else {
+          rtpc.ParameterId = br.ReadUInt32();
+          rtpc.TargetType = br.ReadUInt32();
+          rtpc.CurveId = br.ReadUInt32();
+          rtpc.Scaling = br.ReadByte();
+        }
+        UInt16 points = br.ReadUInt16();
+        if (points > 4096) throw new InvalidDataException("Unreasonable Wwise RTPC point count.");
+        for (Int32 j = 0; j < points; j++) rtpc.Points.Add(ReadCurvePoint(br));
+        Rtpcs.Add(rtpc);
       }
     }
   }
@@ -474,15 +998,14 @@ namespace PugTools {
     }
   }
   internal class FileFormat_BNK_STID_SoundBank {
-    // private UInt32 _id;
     private readonly Byte _nameLength;
     private readonly Char[] _nameTemp;
 
+    internal UInt32 Id { get; }
     internal String Name { get; set; }
 
     internal FileFormat_BNK_STID_SoundBank(BinaryReader br) {
-      // _id = 
-      br.ReadUInt32();
+      Id = br.ReadUInt32();
       _nameLength = br.ReadByte();
       _nameTemp = br.ReadChars(_nameLength);
       Name = String.Join("", _nameTemp);
@@ -502,11 +1025,16 @@ namespace PugTools {
       _extension = ext;
       _fileNames = new HashSet<String>();
     }
-    internal void ParseBNK(Stream fileStream, String _) {
+    internal void ParseBNK(Stream fileStream, String sourcePath) {
+      // Jedipedia skips *_media.bnk during its HIRC sweep: those banks contain the embedded
+      // media payload rather than the authored event/source graph and cannot name streamed WEMs.
+      if (!String.IsNullOrWhiteSpace(sourcePath)
+          && sourcePath.EndsWith("_media.bnk", StringComparison.OrdinalIgnoreCase)) return;
+
       using BinaryReader br = new BinaryReader(fileStream);
       FileFormat_BNK bnk = new FileFormat_BNK(br);
 
-      Boolean isBeta = bnk.BKHD != null && bnk.BKHD.Version == 56;
+      Boolean isBeta = bnk.BKHD != null && bnk.BKHD.Version <= 56;
       String streamedRoot = isBeta ? "/resources/bnk/streamed/" : "/resources/bnk2/streamed/";
       String streamedExtension = isBeta ? ".ogg" : ".wem";
       String bankRoot = isBeta ? "/resources/bnk/" : "/resources/bnk2/";
@@ -514,22 +1042,12 @@ namespace PugTools {
       if (bnk.HIRC != null) {
         if (bnk.HIRC.NumObject != 0) {
           foreach (var obj in bnk.HIRC.Objects) {
-            if (obj.Type == 2) {
-              if (obj.Embed != 0) {
-                if (obj.AudioId != 0)
-                  _fileNames.Add(streamedRoot + obj.AudioId + streamedExtension);
-
-                if (obj.AudioSourceId != 0)
-                  _fileNames.Add(streamedRoot + obj.AudioSourceId + streamedExtension);
-              }
-
-            } else if (obj.Type == 11) {
-              if (obj.AudioId != 0)
-                _fileNames.Add(streamedRoot + obj.AudioId + streamedExtension);
-
-              if (obj.AudioSourceId != 0)
-                _fileNames.Add(streamedRoot + obj.AudioSourceId + streamedExtension);
-            }
+            // Wwise's HIRC file reference stores the standalone streamed filename verbatim in
+            // AudioSourceId. Embed/isStreamed 0 is bank-local DATA; 1 and 2 point at
+            // /resources/bnk2/streamed/<AudioSourceId>.wem (or beta OGG). Candidate hashes are
+            // still verified by the Filename Finder before anything enters the dictionary.
+            if ((obj.Type == 2 || obj.Type == 11) && obj.Embed > 0 && obj.AudioSourceId != 0)
+              _fileNames.Add(streamedRoot + obj.AudioSourceId + streamedExtension);
           }
         }
       }

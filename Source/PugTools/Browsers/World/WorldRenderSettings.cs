@@ -128,6 +128,7 @@
     // The object label is the default selection feedback. The old wireframe bounds box can become enormous for
     // shell/portal assets, so keep it opt-in.
     public bool ShowSelectionBounds { get; set; } = true;
+    public bool ShowStreamingDebugBounds { get; set; } = false;
 
     // Taxi rides show their resolved vehicle by default, but users can hide it from the Taxi routes submenu.
     public bool ShowTaxiVehicle { get; set; } = true;
@@ -165,6 +166,11 @@
     // Jedipedia's orthographic plan/cutaway view. The renderer couples this to a zoom-scaled
     // projection box and camera height rather than treating it as a static projection toggle.
     public bool OrthographicProjection { get; set; } = false;
+
+    // Jedipedia map-viewer Y-slice. A normalized 0..1 position spans the loaded area's authored/render bounds;
+    // geometry above the resolved world-Y plane is clipped in the vertex shader. The UI treats 1.0 as disabled.
+    public bool EnableVerticalSlice { get; set; } = false;
+    public float VerticalSliceFraction { get; set; } = 1f;
 
     public WorldRenderSettings Clone() {
       return (WorldRenderSettings)MemberwiseClone();

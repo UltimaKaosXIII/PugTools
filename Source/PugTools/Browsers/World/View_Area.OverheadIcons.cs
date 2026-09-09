@@ -30,6 +30,12 @@ namespace PugTools {
       public float PixelHeight = 28f;
     }
 
+    // Quest/conversation markers are UI-like overhead glyphs. Keep them in true screen space just like the
+    // nameplate/service overlay: their apparent size must not change with camera distance. The authored quest sheet
+    // has more transparent/glow padding than most service sheets, so a slightly smaller cap visually matches the
+    // compact vendor/trainer symbols better than the generic 28 px resource cap.
+    private const float WorldQuestOverheadMaxPixels = 20f;
+
     private sealed class WorldInteractionIconEntry {
       public object Owner;
       public WorldInteractionInfo Interaction;
@@ -44,6 +50,10 @@ namespace PugTools {
     }
 
     private readonly Dictionary<string, List<WorldOverheadSprite>> worldOverheadSpriteCache = new Dictionary<string, List<WorldOverheadSprite>>(StringComparer.OrdinalIgnoreCase);
+    // Quest markers intentionally borrow the live vendor marker's billboard/distance profile. This is populated from
+    // vendor_01.fxspec at runtime so different SWTOR client generations keep their authored ScaleClampDistance,
+    // min/max distance and billboard sizing instead of PugTools maintaining another approximation.
+    private WorldFxRenderParticle worldVendorOverheadReferenceParticle;
     private readonly HashSet<object> worldInteractionIconVisible = new HashSet<object>();
     private readonly Vector4[] worldInteractionIconVisibilitySamples = new Vector4[NpcNameplateMaxCount];
     private int worldInteractionIconVisibilityFrame;
@@ -166,21 +176,30 @@ namespace PugTools {
             if (!npcNameplateVisible.Contains(npcOwner)) continue;
           } else if (useOcclusion && !worldInteractionIconVisible.Contains(entry.Owner)) continue;
         } else if (useOcclusion && !worldInteractionIconVisible.Contains(entry.Owner)) continue;
-        // Quest/conversation capability is independent from the primary service identity. A vendor/trainer/taxi can
-        // also own cnvConversationId/cnvConversationName; the old mutually-exclusive Kind silently discarded that
-        // quest marker. Draw the small bundled SWTOR quest symbol explicitly and, for mixed service actors, place it
-        // one icon-height above the service marker so both remain readable. This also avoids the malformed green-box
-        // result produced by trying to approximate icon_overhead_questavailable.fxspec through the generic PRT host.
-        bool wantsQuestMarker = entry.Interaction.Kind == WorldInteractionKind.MissionBoard || entry.Interaction.HasConversation;
-        if (wantsQuestMarker) {
-          float questYOffset = (entry.Interaction.Kind == WorldInteractionKind.Conversation || entry.Interaction.Kind == WorldInteractionKind.MissionBoard)
-            ? entry.ScreenYOffset : entry.ScreenYOffset - 30f;
-          DrawWorldInteractionTextureAt("quest", entry.Anchor, questYOffset, labelViewProj, width, height);
+        // Quest/conversation capability is independent from the primary service identity. Pure quest/conversation
+        // actors use SWTOR's authored quest-available FXSPEC so the large gold overhead symbol has the same geometry,
+        // animation and scale as the client. Only fall back to the compact bundled icon if that resource cannot be
+        // resolved in an older/beta archive. Mixed service actors keep a compact quest badge above their service icon
+        // because the FX player is keyed by owner and two independent FXSPECs cannot safely share that key at once.
+        bool pureQuestMarker = entry.Interaction.Kind == WorldInteractionKind.Conversation || entry.Interaction.Kind == WorldInteractionKind.MissionBoard;
+        bool wantsQuestMarker = pureQuestMarker || entry.Interaction.HasConversation;
+        if (pureQuestMarker) {
+          const string questFxSpec = "/resources/art/fx/fxspec/worlddesign/quests/icon_overhead_questavailable.fxspec";
+          // Quest markers deliberately do NOT run through their own live FXSPEC host here. The quest effect contains
+          // a CASTER/NamePlate attachment chain which can legitimately re-anchor itself to the actor root when the host
+          // skeleton is sampled. Keep the already-correct text nameplate point, but render the resolved quest DDS layers
+          // with the *vendor* marker's real particle profile. That reuses the exact service-icon ScaleClampDistance and
+          // billboard rules without letting the quest FXSPEC move the marker back to the feet.
+          float questYOffset = entry.Owner is WorldNpcPlacement ? Math.Min(entry.ScreenYOffset, -52f) : entry.ScreenYOffset;
+          bool questDrawn = false;
+          List<WorldOverheadSprite> questSprites = ResolveWorldOverheadSprites(questFxSpec);
+          if (questSprites != null) foreach (WorldOverheadSprite sprite in questSprites.Take(6))
+            questDrawn |= DrawWorldQuestSpriteAt(sprite, entry.Anchor, questYOffset, labelViewProj, width, height);
+          if (!questDrawn) DrawWorldQuestFallbackAt(entry.Anchor, questYOffset, labelViewProj, width, height);
+          continue;
         }
-
-        // Pure conversation/mission-board entries use the stable screen-space quest marker above. Service actors can
-        // still render their own authored marker underneath it.
-        if (entry.Interaction.Kind == WorldInteractionKind.Conversation || entry.Interaction.Kind == WorldInteractionKind.MissionBoard) continue;
+        if (wantsQuestMarker)
+          DrawWorldQuestFallbackAt(entry.Anchor, entry.ScreenYOffset - 30f, labelViewProj, width, height);
 
         bool drawn = false;
         bool runtimeHandled = false;
@@ -328,8 +347,98 @@ namespace PugTools {
         0f, 0f, 1f, 1f);
     }
 
-    private bool DrawWorldInteractionSpriteAt(WorldOverheadSprite sprite, Vector3 anchor, float screenYOffset,
+    private bool DrawWorldQuestFallbackAt(Vector3 anchor, float screenYOffset, Matrix viewProj, int width, int height) {
+      MapNoteIconGpu gpu = EnsureMapNoteIconGpu("quest", 6);
+      if (gpu?.Texture == null || gpu.Buffer == null) return false;
+      Size px = MapNoteIconPixelSize("quest");
+      // Last-resort bundled quest artwork. Match the compact quest/service footprint and keep it in the same true
+      // screen-space path as authored quest sprites.
+      float fit = WorldQuestPixelFit(px.Width, px.Height);
+      return DrawWorldInteractionScreenQuad(gpu, anchor, screenYOffset, viewProj, height,
+        Math.Max(8f, px.Width * fit), Math.Max(8f, px.Height * fit), 0f, 0f, 1f, 1f);
+    }
+
+    private static float WorldQuestPixelFit(float width, float height) {
+      float largest = Math.Max(1f, Math.Max(width, height));
+      return Math.Min(1f, WorldQuestOverheadMaxPixels / largest);
+    }
+
+    private WorldFxRenderParticle ResolveWorldVendorOverheadReferenceParticle() {
+      if (worldVendorOverheadReferenceParticle != null) return worldVendorOverheadReferenceParticle;
+      const string vendorFxSpec = "/resources/art/fx/fxspec/overhead_icons/vendor_01.fxspec";
+      try {
+        WorldFxSpecDefinition source = LoadWorldFxSpecDefinition(vendorFxSpec);
+        WorldFxSpecDefinition definition = CloneWorldFxDefinitionForDynamicData(source, null, null);
+        if (definition == null || !definition.DynamicGateOpen) return null;
+
+        // Build the same warmed-up particle system used by a real vendor marker, but off-screen and without adding it
+        // to worldFxPlayers.  The resulting particle already contains node scale, Size2D/XScale/YScale, authored
+        // ScaleClampDistance and the exact blend/orientation settings used by the service icon renderer.
+        var player = CreateWorldFxPlayer(new object(), definition, elapsed);
+        Vector3 referenceCamera = new Vector3(0f, 0f, 5f);
+        UpdateWorldFxPlayer(player, elapsed, referenceCamera);
+        WorldFxRenderParticle reference = BuildWorldFxRenderParticles(player)
+          .Where(x => x != null && x.HalfWidth > .000001f && x.HalfHeight > .000001f)
+          .OrderByDescending(x => x.HalfWidth * x.HalfHeight)
+          .FirstOrDefault();
+        if (reference == null) return null;
+
+        worldVendorOverheadReferenceParticle = new WorldFxRenderParticle {
+          HalfWidth = reference.HalfWidth, HalfHeight = reference.HalfHeight, Rotation = reference.Rotation,
+          PivotU = reference.PivotU, PivotV = reference.PivotV,
+          MinDistance = reference.MinDistance, MaxDistance = reference.MaxDistance,
+          ScaleClampDistance = reference.ScaleClampDistance, DistanceScaleAdjustment = reference.DistanceScaleAdjustment,
+          OrientationAxis = reference.OrientationAxis, LieFlat = reference.LieFlat, AlignToTrajectory = false,
+          NodeRotation = reference.NodeRotation, SourceBlend = reference.SourceBlend, DestBlend = reference.DestBlend,
+          Color = new Vector4(1f, 1f, 1f, 1f)
+        };
+        return worldVendorOverheadReferenceParticle;
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("Vendor overhead reference resolve failed: " + ex.Message);
+        return null;
+      }
+    }
+
+    private bool DrawWorldQuestSpriteAt(WorldOverheadSprite sprite, Vector3 anchor, float screenYOffset,
         Matrix viewProj, int width, int height) {
+      if (sprite == null || String.IsNullOrWhiteSpace(sprite.TexturePath)) return false;
+      WorldFxRenderParticle vendor = ResolveWorldVendorOverheadReferenceParticle();
+      if (vendor != null) {
+        // This is deliberately the normal world-FX particle renderer, not a special quest billboard.  Only the DDS
+        // sheet/frame comes from the quest FXSPEC; geometry and camera-distance behaviour come from vendor_01. That
+        // makes the quest glyph obey the exact same ScaleClampDistance curve as a merchant while the translation
+        // stays pinned to the already-correct nameplate anchor.
+        var particle = new WorldFxRenderParticle {
+          TexturePath = sprite.TexturePath, Position = Vector3.Zero,
+          HalfWidth = vendor.HalfWidth, HalfHeight = vendor.HalfHeight, Rotation = vendor.Rotation,
+          PivotU = vendor.PivotU, PivotV = vendor.PivotV,
+          MinDistance = vendor.MinDistance, MaxDistance = vendor.MaxDistance,
+          ScaleClampDistance = vendor.ScaleClampDistance, DistanceScaleAdjustment = vendor.DistanceScaleAdjustment,
+          Columns = Math.Max(1, sprite.Columns), Rows = Math.Max(1, sprite.Rows), Frame = Math.Max(0, sprite.Frame),
+          Color = new Vector4(1f, 1f, 1f, 1f),
+          OrientationAxis = vendor.OrientationAxis, LieFlat = vendor.LieFlat, AlignToTrajectory = false,
+          NodeRotation = vendor.NodeRotation, SourceBlend = vendor.SourceBlend, DestBlend = vendor.DestBlend
+        };
+        return DrawWorldFxParticle(particle, Matrix.Translation(anchor), screenYOffset, viewProj);
+      }
+
+      // If vendor_01 is absent in an old/beta archive, retain the fixed-size compatibility fallback rather than
+      // dropping the quest marker completely. Retail clients should take the vendor-profile path above.
+      MapNoteIconGpu gpu = EnsureWorldOverheadTextureGpu(sprite.TexturePath, 6);
+      if (gpu?.Texture == null || gpu.Buffer == null) return false;
+      int columns = Math.Max(1, sprite.Columns), rows = Math.Max(1, sprite.Rows);
+      int total = Math.Max(1, columns * rows);
+      int frame = Math.Max(0, Math.Min(total - 1, sprite.Frame));
+      int column = frame % columns, row = frame / columns;
+      float u0 = column / (float)columns, v0 = row / (float)rows;
+      float u1 = (column + 1) / (float)columns, v1 = (row + 1) / (float)rows;
+      float fit = WorldQuestPixelFit(sprite.PixelWidth, sprite.PixelHeight);
+      return DrawWorldInteractionScreenQuad(gpu, anchor, screenYOffset, viewProj, height,
+        Math.Max(8f, sprite.PixelWidth * fit), Math.Max(8f, sprite.PixelHeight * fit), u0, v0, u1, v1);
+    }
+
+    private bool DrawWorldInteractionSpriteAt(WorldOverheadSprite sprite, Vector3 anchor, float screenYOffset,
+        Matrix viewProj, int width, int height, float scale = 1f) {
       if (sprite == null || String.IsNullOrWhiteSpace(sprite.TexturePath)) return false;
       MapNoteIconGpu gpu = EnsureWorldOverheadTextureGpu(sprite.TexturePath, 6);
       if (gpu?.Texture == null || gpu.Buffer == null) return false;
@@ -339,27 +448,86 @@ namespace PugTools {
       int column = frame % columns, row = frame / columns;
       float u0 = column / (float)columns, v0 = row / (float)rows;
       float u1 = (column + 1) / (float)columns, v1 = (row + 1) / (float)rows;
+      if (Single.IsNaN(scale) || Single.IsInfinity(scale) || scale <= 0f) scale = 1f;
       return DrawWorldInteractionQuad(gpu, anchor, screenYOffset, viewProj, height,
-        Math.Max(8f, sprite.PixelWidth), Math.Max(8f, sprite.PixelHeight), u0, v0, u1, v1);
+        Math.Max(8f, sprite.PixelWidth * scale), Math.Max(8f, sprite.PixelHeight * scale), u0, v0, u1, v1);
+    }
+
+    private bool DrawWorldInteractionScreenQuad(MapNoteIconGpu gpu, Vector3 anchor, float screenYOffset, Matrix viewProj,
+        int height, float pixelWidth, float pixelHeight, float u0, float v0, float u1, float v1) {
+      if (gpu?.Texture == null || gpu.Buffer == null || camera == null || height <= 0) return false;
+      int width = Math.Max(1, (int)Viewport.Width);
+      Vector3 screen;
+      try { screen = Vector3.Project(anchor, 0f, 0f, width, height, 0f, 1f, viewProj); }
+      catch { return false; }
+      if (!IsFinite(screen) || screen.Z < 0f || screen.Z > 1f) return false;
+
+      // Do not unproject this rectangle back into world space. The interaction pass already performed its own scene
+      // depth visibility query, so the glyph can be drawn exactly like UI here. Feeding NDC coordinates through an
+      // identity ViewProj guarantees that a 20 px quest icon is 20 px at every camera distance. This also avoids the
+      // perspective round-trip that made the previous build shrink while approaching an NPC.
+      float cx = screen.X;
+      float cy = screen.Y + screenYOffset;
+      float halfW = Math.Max(1f, pixelWidth) * .5f;
+      float halfH = Math.Max(1f, pixelHeight) * .5f;
+      float left = (cx - halfW) * 2f / width - 1f;
+      float right = (cx + halfW) * 2f / width - 1f;
+      float top = 1f - (cy - halfH) * 2f / height;
+      float bottom = 1f - (cy + halfH) * 2f / height;
+      Vector3 tl = new Vector3(left, top, 0f);
+      Vector3 tr = new Vector3(right, top, 0f);
+      Vector3 br = new Vector3(right, bottom, 0f);
+      Vector3 bl = new Vector3(left, bottom, 0f);
+      Vector3 normal = new Vector3(0f, 0f, -1f), tangent = Vector3.UnitX;
+      var vertices = new[] {
+        new PosNormalTexTan(tl, normal, new Vector2(u0, v0), tangent),
+        new PosNormalTexTan(tr, normal, new Vector2(u1, v0), tangent),
+        new PosNormalTexTan(br, normal, new Vector2(u1, v1), tangent),
+        new PosNormalTexTan(tl, normal, new Vector2(u0, v0), tangent),
+        new PosNormalTexTan(br, normal, new Vector2(u1, v1), tangent),
+        new PosNormalTexTan(bl, normal, new Vector2(u0, v1), tangent)
+      };
+      try {
+        DataBox mapped = ImmediateContext.MapSubresource(gpu.Buffer, MapMode.WriteDiscard, SlimDX.Direct3D11.MapFlags.None);
+        mapped.Data.WriteRange(vertices); ImmediateContext.UnmapSubresource(gpu.Buffer, 0);
+        ImmediateContext.InputAssembler.InputLayout = inputLayout;
+        ImmediateContext.InputAssembler.PrimitiveTopology = PrimitiveTopology.TriangleList;
+        ImmediateContext.InputAssembler.SetVertexBuffers(0, new VertexBufferBinding(gpu.Buffer, PosNormalTexTan.Stride, 0));
+        fx.SetWorld(Matrix.Identity); fx.SetViewProj(Matrix.Identity); fx.SetPlaceableBlueGlow(false); fx.SetMapArt(gpu.Texture, 1f);
+        fx.MapArt.GetPassByIndex(0).Apply(ImmediateContext); ImmediateContext.Draw(6, 0); fx.ClearMapArt();
+        return true;
+      } catch (Exception ex) {
+        System.Diagnostics.Debug.WriteLine("World interaction screen icon draw failed: " + ex.Message);
+        return false;
+      }
     }
 
     private bool DrawWorldInteractionQuad(MapNoteIconGpu gpu, Vector3 anchor, float screenYOffset, Matrix viewProj,
         int height, float pixelWidth, float pixelHeight, float u0, float v0, float u1, float v1) {
       if (gpu?.Texture == null || gpu.Buffer == null || camera == null || height <= 0) return false;
-      // FpsCamera stores Look toward the target, but this viewer uses a right-handed view/projection where the
-      // visible forward vector is -Look (same convention as world picking/taxi navigation). Using +Look here made
-      // every icon that was actually in front of the camera fail the depth test, so even the bundled fallback icons
-      // were never drawn.
-      Vector3 visibleForward = -camera.Look;
-      if (visibleForward.LengthSquared() < .000001f) return false;
-      visibleForward.Normalize();
-      float depth = Vector3.Dot(anchor - camera.Position, visibleForward);
-      if (!(depth > .001f)) return false;
-      float worldPerPixel = (float)(2.0 * depth * Math.Tan(camera.FovY * .5f) / Math.Max(1, height));
-      Vector3 center = anchor + camera.Up * (-screenYOffset * worldPerPixel);
-      Vector3 right = camera.Right * (pixelWidth * worldPerPixel * .5f);
-      Vector3 up = camera.Up * (pixelHeight * worldPerPixel * .5f);
-      Vector3 tl = center - right + up, tr = center + right + up, br = center + right - up, bl = center - right - up;
+      int width = Math.Max(1, (int)Viewport.Width);
+      // Build the billboard in true screen space rather than estimating world-units-per-pixel from FovY/depth.
+      // The latter is close for an ordinary perspective projection, but the world browser can use camera/projection
+      // variants whose effective projection does not exactly match that approximation.  The result was the quest icon
+      // visibly changing size as the camera approached.  Project the anchor with the exact matrix being rendered,
+      // construct a fixed-size pixel rectangle, then unproject all four corners at the anchor's depth.  This is the
+      // same invariant-screen-size behaviour as the service/nameplate UI regardless of distance.
+      Vector3 screen;
+      try { screen = Vector3.Project(anchor, 0f, 0f, width, height, 0f, 1f, viewProj); }
+      catch { return false; }
+      if (!Single.IsFinite(screen.X) || !Single.IsFinite(screen.Y) || !Single.IsFinite(screen.Z) || screen.Z < 0f || screen.Z > 1f) return false;
+      float cx = screen.X;
+      float cy = screen.Y + screenYOffset;
+      float halfW = Math.Max(1f, pixelWidth) * .5f;
+      float halfH = Math.Max(1f, pixelHeight) * .5f;
+      Vector3 tl, tr, br, bl;
+      try {
+        tl = Vector3.Unproject(new Vector3(cx - halfW, cy - halfH, screen.Z), 0f, 0f, width, height, 0f, 1f, viewProj);
+        tr = Vector3.Unproject(new Vector3(cx + halfW, cy - halfH, screen.Z), 0f, 0f, width, height, 0f, 1f, viewProj);
+        br = Vector3.Unproject(new Vector3(cx + halfW, cy + halfH, screen.Z), 0f, 0f, width, height, 0f, 1f, viewProj);
+        bl = Vector3.Unproject(new Vector3(cx - halfW, cy + halfH, screen.Z), 0f, 0f, width, height, 0f, 1f, viewProj);
+      } catch { return false; }
+      if (!IsFinite(tl) || !IsFinite(tr) || !IsFinite(br) || !IsFinite(bl)) return false;
       Vector3 normal = -camera.Look, tangent = camera.Right;
       var vertices = new[] {
         new PosNormalTexTan(tl, normal, new Vector2(u0, v0), tangent),

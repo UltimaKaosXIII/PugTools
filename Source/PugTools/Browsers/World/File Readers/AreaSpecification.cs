@@ -677,7 +677,8 @@ namespace FileFormats {
       // GomLib loader successfully parsed the complete XML document, while Jedipedia's current browser strips the
       // fixed archive wrapper and parses the regular <k>/<e><node> stream. Support both forms here instead of
       // assuming one exact wrapper/encoding: otherwise a valid mapnotes.not can silently produce an empty list.
-      bool systemGenerated = Id == 36268000006UL || Id == 3758002374UL;
+      bool systemGenerated = !String.IsNullOrWhiteSpace(Path)
+        && Path.Replace('\\', '/').IndexOf("/resources/world/livecontent/systemgenerated/", StringComparison.OrdinalIgnoreCase) >= 0;
       string normalPath = "/resources/world/areas/" + Id + "/mapnotes.not";
       string generatedPath = "/resources/world/livecontent/systemgenerated/" + Id + "/mapnotes.not";
       var candidates = new List<string>();

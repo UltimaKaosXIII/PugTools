@@ -181,7 +181,7 @@ namespace PugTools {
         return true;
       }
 
-      TreeNode targetNode = FindWorldAreaTreeNode(treeViewFast1?.Nodes, targetArea);
+      TreeNode targetNode = FindMapLinkWorldAreaTreeNode(treeViewFast1?.Nodes, targetArea);
       if (targetNode == null) {
         SetStatusLabel("Map exit points to area " + targetArea.ToString(System.Globalization.CultureInfo.InvariantCulture) +
           ", but that area is not available in the current World Browser tree.");
@@ -198,12 +198,12 @@ namespace PugTools {
       return true;
     }
 
-    private static TreeNode FindWorldAreaTreeNode(TreeNodeCollection nodes, ulong areaId) {
+    private static TreeNode FindMapLinkWorldAreaTreeNode(TreeNodeCollection nodes, ulong areaId) {
       if (nodes == null || areaId == 0) return null;
       foreach (TreeNode node in nodes) {
         if (node?.Tag is NodeAsset tag && tag.dynObject is TorArchive.HashFileInfo &&
           UInt64.TryParse((tag.id ?? String.Empty).Trim('/'), out ulong id) && id == areaId) return node;
-        TreeNode child = FindWorldAreaTreeNode(node?.Nodes, areaId);
+        TreeNode child = FindMapLinkWorldAreaTreeNode(node?.Nodes, areaId);
         if (child != null) return child;
       }
       return null;

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
@@ -209,7 +209,12 @@ namespace TorArchive {
     }
 
     internal FileStream OpenStreamAt(Int64 offset) {
-      FileStream fs = System.IO.File.Open(FileName, FileMode.Open, FileAccess.Read, FileShare.Read);
+      FileStream fs = System.IO.File.Open(
+        FileName,
+        FileMode.Open,
+        FileAccess.Read,
+        FileShare.Read | FileShare.Delete
+      );
       fs.Seek(offset, SeekOrigin.Begin);
       return fs;
     }
@@ -231,6 +236,12 @@ namespace TorArchive {
         yield return new File(this, info);
       }
     }
+
+    /// <summary>
+    /// Enumerates TOR table metadata without allocating one File wrapper per entry.
+    /// Useful for checksum/hash-only searches that do not need to decompress payloads.
+    /// </summary>
+    public IEnumerable<FileInfo> EnumerateFileInfos() => m_fileLookup.Values;
 
     /// <summary>
     /// Compatibility property. Prefer EnumerateFiles() in long-running views.

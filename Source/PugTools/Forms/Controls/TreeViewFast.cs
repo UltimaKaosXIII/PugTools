@@ -39,19 +39,36 @@ namespace TreeViewFast.Controls {
       Func<T, String> getParentId,
       Func<T, String> getDisplayName,
       Func<T, Int32> getImageIndex = null,
-      Comparison<T> comparison = null
+      Comparison<T> comparison = null,
+      Func<Boolean> shouldCancel = null
     ) {
       if (items == null) throw new ArgumentNullException(nameof(items));
       if (getId == null) throw new ArgumentNullException(nameof(getId));
       if (getParentId == null) throw new ArgumentNullException(nameof(getParentId));
       if (getDisplayName == null) throw new ArgumentNullException(nameof(getDisplayName));
 
-      List<T> sortedItems = items.ToList();
-      if (comparison != null) sortedItems.Sort(comparison);
-      else sortedItems.Sort((x, y) => String.Compare(getId(x), getId(y), StringComparison.Ordinal));
+      List<T> sortedItems = new List<T>();
+      foreach (T item in items) {
+        if (shouldCancel?.Invoke() == true) throw new OperationCanceledException();
+        sortedItems.Add(item);
+      }
+
+      Int32 compareCounter = 0;
+      sortedItems.Sort((x, y) => {
+        // Sorting a several-hundred-thousand-entry browser tree can otherwise
+        // continue burning a core long after the window was closed.
+        if (((++compareCounter) & 0x3FF) == 0 && shouldCancel?.Invoke() == true)
+          throw new OperationCanceledException();
+        return comparison != null
+          ? comparison(x, y)
+          : String.Compare(getId(x), getId(y), StringComparison.Ordinal);
+      });
 
       var nodeMap = new Dictionary<String, TreeNode>(sortedItems.Count, StringComparer.Ordinal);
+      Int32 buildCounter = 0;
       foreach (T item in sortedItems) {
+        if (((++buildCounter) & 0xFF) == 0 && shouldCancel?.Invoke() == true)
+          throw new OperationCanceledException();
         String id = getId(item);
         TreeNode node = new TreeNode {
           Name = id,
@@ -69,7 +86,10 @@ namespace TreeViewFast.Controls {
       }
 
       var roots = new List<TreeNode>();
+      buildCounter = 0;
       foreach (T item in sortedItems) {
+        if (((++buildCounter) & 0xFF) == 0 && shouldCancel?.Invoke() == true)
+          throw new OperationCanceledException();
         String id = getId(item);
         TreeNode node = nodeMap[id];
         String parentId = getParentId(item);

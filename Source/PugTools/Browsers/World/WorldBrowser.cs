@@ -46,6 +46,8 @@ namespace PugTools {
     }
 
     public bool _closing = false;
+    private readonly String worldAssetLocation;
+    private readonly Boolean worldUsePts;
     public FileFormats.Area area;
     private readonly Dictionary<string, NodeAsset> assetDict = new Dictionary<string, NodeAsset>();
     public Assets currentAssets;
@@ -88,6 +90,8 @@ namespace PugTools {
     private ToolStripMenuItem btnWorldCurrentRegions;
     private ToolStripMenuItem btnWorldVolumeList;
     private ToolStripMenuItem btnWorldUtilities;
+    private bool worldAuthoringGeometryLoaded;
+    private bool worldAuthoringGeometryReloading;
     private ToolStripMenuItem btnWorldNpcs;
     private ToolStripMenuItem btnWorldRooms;
     private string worldRoomFilterText = String.Empty;
@@ -123,6 +127,12 @@ namespace PugTools {
     private Button miniMapSourceButton;
     private PictureBox miniMapPicture;
     private Panel miniMapResizeGrip;
+    private readonly List<Panel> miniMapResizeHandles = new List<Panel>();
+    [Flags]
+    private enum MiniMapResizeEdges { None = 0, Left = 1, Right = 2, Top = 4, Bottom = 8 }
+    private MiniMapResizeEdges miniMapResizeEdges;
+    private bool miniMapUserResized;
+    private Point miniMapResizeLocationStart;
     private Bitmap miniMapImage;
     private readonly Dictionary<string, Image> worldMapIconImages = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
     private ToolTip worldMapNoteToolTip;
@@ -168,6 +178,8 @@ namespace PugTools {
     internal bool WorldKeyboardInputEnabled => WorldWindowInputEnabled && worldRenderInputActive;
 
     public WorldBrowser(string assetLocation, bool usePTS) {
+      worldAssetLocation = assetLocation;
+      worldUsePts = usePTS;
       InitializeComponent();
       Activated += (_, __) => worldWindowActive = true;
       Deactivate += (_, __) => worldWindowActive = false;
@@ -180,6 +192,8 @@ namespace PugTools {
       Application.AddMessageFilter(this);
       InitializeWorldListToolbar();
       InitializeWorldRenderToolbar();
+      InitializeWorldInstanceFinder();
+      InitializeWorldCutawayUi();
       InitializeWorldMiniMap();
       InitializeWorldVolumePanel();
       InitializeWorldRoomStatus();
@@ -205,6 +219,9 @@ namespace PugTools {
     private Dictionary<string, NodeAsset> loadedAssetDict;
     private Dictionary<ulong, WorldAreaOverride> worldAreaOverrides = new Dictionary<ulong, WorldAreaOverride>();
     private readonly Dictionary<ulong, string> worldAreaInternalNames = new Dictionary<ulong, string>();
+    private readonly HashSet<ulong> worldSystemGeneratedAreaIds = new HashSet<ulong>();
+    private const string WorldLiveContentCategory = "Live Content";
+    private const string WorldSystemGeneratedGroup = "System Generated";
 
     // Shared with the Asset Browser so both trees use the authored area.dat name when the
     // installed client knows more than the bundled Jedipedia catalog.
@@ -279,6 +296,7 @@ namespace PugTools {
       Dictionary<string, NodeAsset> newAssetDict = new Dictionary<string, NodeAsset>();
       worldAreaOverrides = WorldAreaNameOverrides.LoadEntries();
       worldAreaInternalNames.Clear();
+      worldSystemGeneratedAreaIds.Clear();
       var detectedAreaNames = new List<(ulong Id, string InternalName, string Category, string Group)>();
 
       // mapareasdata is not a complete world list: class phases, old/development maps and some newer areas are
@@ -288,9 +306,22 @@ namespace PugTools {
       var candidateIds = new HashSet<ulong>(mapAreas.Keys);
       foreach (WorldAreaCatalogEntry entry in WorldAreaCatalog.Entries) candidateIds.Add(entry.Id);
       foreach (ulong id in worldAreaOverrides.Keys) candidateIds.Add(id);
+
+      // Live clients can contain generated worlds that never appear in mapareasdata or the bundled Jedipedia
+      // catalog. Recover every numeric ID referenced by a KNOWN filename below
+      // /resources/world/livecontent/systemgenerated/ in the filename dictionary, then probe the installed client
+      // for the deterministic <id>/area.dat path. This also discovers an area when only one of its room DAT filenames is
+      // known. The compact PFD1 pool is prefix-searched directly, so this does not walk/materialise millions
+      // of unrelated filenames.
+      foreach (ulong installedAreaId in DiscoverInstalledSystemGeneratedWorldAreaIds()) {
+        candidateIds.Add(installedAreaId);
+        worldSystemGeneratedAreaIds.Add(installedAreaId);
+      }
+
       // RED/HE32/assets_* releases contain development and removed worlds that are not in any current map-area
       // table/catalog. Recover those IDs only for a detected pre-64-bit client so the established Retail/64-bit
-      // world list remains unchanged.
+      // normal-world list remains unchanged. System-generated worlds above are intentionally discovered on all
+      // client generations.
       if (WorldUsesLegacyContent)
         foreach (ulong installedAreaId in DiscoverInstalledWorldAreaIds()) candidateIds.Add(installedAreaId);
 
@@ -304,19 +335,29 @@ namespace PugTools {
         };
 
         File areaFile = null;
+        string areaPath = null;
         foreach (string candidate in candidatePaths) {
           areaFile = currentAssets.FindFile(candidate);
-          if (areaFile != null) break;
+          if (areaFile == null) continue;
+          areaPath = candidate;
+          break;
         }
         if (areaFile == null) continue;
+
+        bool systemGenerated = IsSystemGeneratedWorldPath(areaPath);
+        if (systemGenerated) worldSystemGeneratedAreaIds.Add(id);
 
         string internalName = catalogEntry?.InternalName;
         if (String.IsNullOrWhiteSpace(internalName)) internalName = userEntry?.InternalName;
         if (String.IsNullOrWhiteSpace(internalName)) internalName = ReadAreaInternalName(areaFile);
         if (!String.IsNullOrWhiteSpace(internalName)) worldAreaInternalNames[id] = internalName.Trim();
 
-        string defaultCategory = catalogEntry?.Category ?? WorldAreaNameOverrides.UnassignedCategory;
-        string defaultGroup = catalogEntry?.Group ?? String.Empty;
+        string defaultCategory = systemGenerated
+          ? WorldLiveContentCategory
+          : catalogEntry?.Category ?? WorldAreaNameOverrides.UnassignedCategory;
+        string defaultGroup = systemGenerated
+          ? WorldSystemGeneratedGroup
+          : catalogEntry?.Group ?? String.Empty;
         detectedAreaNames.Add((id, internalName, defaultCategory, defaultGroup));
 
         string name;
@@ -329,16 +370,46 @@ namespace PugTools {
           ? name
           : name + " - " + internalName;
 
-        HashFileInfo hashInfo = new HashFileInfo(areaFile.FileInfo.PrimaryHash, areaFile.FileInfo.SecondaryHash, areaFile);
+        HashFileInfo hashInfo = new HashFileInfo(
+          areaFile.FileInfo.PrimaryHash, areaFile.FileInfo.SecondaryHash, areaFile, true, false
+        );
         newAssetDict.Add("/" + id, new NodeAsset("/" + id, "/", displayName, hashInfo));
       }
 
-      // Append newly discovered IDs after the scan. Existing name/category/group values are preserved. Unknown
-      // areas are generated as category="Unassigned" so they immediately appear in the dedicated catch-all folder.
+      // Append newly discovered IDs after the scan. Existing user name/category/group values are preserved. Unknown
+      // ordinary areas default to Unassigned; generated live-content areas default to Live Content / System Generated.
       WorldAreaNameOverrides.Synchronize(detectedAreaNames);
 
       newAssetDict.Add("/", new NodeAsset("/", "", "Worlds", null));
       loadedAssetDict = newAssetDict;
+    }
+
+    private IEnumerable<ulong> DiscoverInstalledSystemGeneratedWorldAreaIds() {
+      var result = new HashSet<ulong>();
+      const string prefix = "/resources/world/livecontent/systemgenerated/";
+      try {
+        IReadOnlyList<string> knownPaths = HashDictionaryInstance.Instance.Dictionary.FindKnownFileNamesByPathPrefix(prefix);
+        foreach (string path in knownPaths) TryAddSystemGeneratedWorldAreaId(path, result);
+      } catch { }
+      return result;
+    }
+
+    private static void TryAddSystemGeneratedWorldAreaId(string rawPath, HashSet<ulong> result) {
+      if (result == null || String.IsNullOrWhiteSpace(rawPath)) return;
+      string path = rawPath.Replace('\\', '/').Trim();
+      const string prefix = "/resources/world/livecontent/systemgenerated/";
+      int start = path.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+      if (start < 0) return;
+      start += prefix.Length;
+      int slash = path.IndexOf('/', start);
+      string idText = slash < 0 ? path.Substring(start) : path.Substring(start, slash - start);
+      if (UInt64.TryParse(idText, out ulong id) && id != 0) result.Add(id);
+    }
+
+    private static bool IsSystemGeneratedWorldPath(string rawPath) {
+      if (String.IsNullOrWhiteSpace(rawPath)) return false;
+      string path = rawPath.Replace('\\', '/');
+      return path.IndexOf("/resources/world/livecontent/systemgenerated/", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private IEnumerable<ulong> DiscoverInstalledWorldAreaIds() {
@@ -395,7 +466,16 @@ namespace PugTools {
 
     private void BackgroundWorker1_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e) {
       if (e.Error != null) {
-        throw new Exception("Echter Fehler beim Laden: " + e.Error, e.Error);
+        toolStripStatusLabel1.Text = "World Browser could not load the shared SWTOR data.";
+        toolStripProgressBar1.Visible = false;
+        pictureBox1.Visible = false;
+        MessageBox.Show(
+          e.Error.GetBaseException().Message,
+          "World Browser",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Error
+        );
+        return;
       }
 
       foreach (var kvp in loadedAssetDict) {
@@ -480,6 +560,8 @@ namespace PugTools {
       }
       if (m.Msg != WM_MOUSEWHEEL) return false;
       int delta = unchecked((short)((m.WParam.ToInt64() >> 16) & 0xffff));
+      // Let the vertical Jedipedia-style cutaway control own its wheel; otherwise the camera also zooms/speeds up.
+      if (CursorIsOverWorldSliceControl()) { HandleWorldSliceMouseWheel(delta); return true; }
       if (miniMapPanel != null && miniMapPanel.Visible && miniMapPanel.ClientRectangle.Contains(miniMapPanel.PointToClient(Cursor.Position))) {
         if (miniMapPicture != null) {
           Point miniPoint = miniMapPicture.PointToClient(Cursor.Position);
@@ -616,12 +698,29 @@ namespace PugTools {
         if (kvp.Key == "/" || !ulong.TryParse(kvp.Key.Trim('/'), out ulong id)) continue;
         WorldAreaCatalogEntry catalog = WorldAreaCatalog.Entries.FirstOrDefault(x => x.Id == id);
         worldAreaOverrides.TryGetValue(id, out WorldAreaOverride userEntry);
-        string category = !String.IsNullOrWhiteSpace(userEntry?.Category)
-          ? userEntry.Category.Trim()
-          : catalog?.Category ?? WorldAreaNameOverrides.UnassignedCategory;
-        string group = userEntry != null && userEntry.Group != null
-          ? userEntry.Group.Trim()
-          : catalog?.Group ?? String.Empty;
+        bool systemGenerated = worldSystemGeneratedAreaIds.Contains(id);
+        bool userHasCustomFolder = userEntry != null
+          && !String.IsNullOrWhiteSpace(userEntry.Category)
+          && (catalog == null
+              || !String.Equals(userEntry.Category.Trim(), catalog.Category ?? String.Empty, StringComparison.OrdinalIgnoreCase)
+              || !String.Equals((userEntry.Group ?? String.Empty).Trim(), catalog.Group ?? String.Empty, StringComparison.OrdinalIgnoreCase));
+
+        string category;
+        string group;
+        if (systemGenerated && !userHasCustomFolder) {
+          // v3 wrote the old Jedipedia category/group into WorldAreaNames.xml. Treat an unchanged copy of that
+          // stock metadata as migratable so existing users immediately get the new Live Content folder, while a
+          // genuinely custom folder assignment remains respected.
+          category = WorldLiveContentCategory;
+          group = WorldSystemGeneratedGroup;
+        } else {
+          category = !String.IsNullOrWhiteSpace(userEntry?.Category)
+            ? userEntry.Category.Trim()
+            : catalog?.Category ?? WorldAreaNameOverrides.UnassignedCategory;
+          group = userEntry != null && userEntry.Group != null
+            ? userEntry.Group.Trim()
+            : catalog?.Group ?? String.Empty;
+        }
         int entryOrder = catalog != null
           && String.Equals(catalog.Category, category, StringComparison.OrdinalIgnoreCase)
           && String.Equals(catalog.Group ?? String.Empty, group ?? String.Empty, StringComparison.OrdinalIgnoreCase)
@@ -734,7 +833,7 @@ namespace PugTools {
       cmbWorldTextureQuality = new ToolStripComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
       cmbWorldTextureQuality.Items.AddRange(new object[] { "Low", "Medium", "High" });
       cmbWorldTextureQuality.SelectedIndex = (int)worldSettings.TextureQuality;
-      cmbWorldTextureQuality.ToolTipText = "Jedipedia-style DDS mip limit: Low skips two top mip levels, Medium one, High loads the authored full resolution";
+      cmbWorldTextureQuality.ToolTipText = "SWTOR DDS mip limit: Low skips two top mip levels, Medium one, High loads the authored full resolution";
       cmbWorldTextureQuality.SelectedIndexChanged += (_, __) => {
         if (updatingWorldToolbar) return;
         worldSettings.TextureQuality = (WorldTextureQuality)Math.Max(0, cmbWorldTextureQuality.SelectedIndex);
@@ -795,7 +894,7 @@ namespace PugTools {
         SetStatusLabel(v
           ? "Orthographic: wheel = zoom/cut height, right drag = pan, A/D/J/L + I/K = look, Q/E = strafe"
           : "Perspective projection enabled");
-      }, "Jedipedia-style parallel plan/cutaway view; zoom also follows the floor height");
+      }, "Parallel plan/cutaway view; zoom also follows the floor height");
 
       btnWorldRenderMenu.DropDownItems.Add(new ToolStripSeparator());
       var geometryMenu = new ToolStripMenuItem("Geometry");
@@ -943,7 +1042,7 @@ namespace PugTools {
       btnWorldMapEntireArea = new ToolStripMenuItem("Show entire area on map") {
         CheckOnClick = true,
         Checked = false,
-        ToolTipText = "Jedipedia-style map framing: off crops isolated outliers/giant scenery when a useful main-area crop exists"
+        ToolTipText = "Smart map framing: off crops isolated outliers/giant scenery when a useful main-area crop exists"
       };
       btnWorldMapEntireArea.CheckedChanged += (_, __) => {
         if (updatingWorldToolbar) return;
@@ -1006,7 +1105,7 @@ namespace PugTools {
       btnWorldToolsMenu.DropDownItems.Add(btnWorldCurrentRegions);
       btnWorldVolumeList = new ToolStripMenuItem("Current volume list") {
         CheckOnClick = true, Checked = worldSettings.ShowVolumeList,
-        ToolTipText = "Jedipedia-style live region/trigger panel; click an entry to pin it"
+        ToolTipText = "Live region/trigger panel; click an entry to pin it"
       };
       btnWorldVolumeList.CheckedChanged += (_, __) => {
         if (updatingWorldToolbar) return;
@@ -1018,7 +1117,7 @@ namespace PugTools {
 
       btnWorldStats = new ToolStripMenuItem("Live stats") {
         CheckOnClick = true, Checked = false,
-        ToolTipText = "Show lightweight Jedipedia-style FPS and occlusion statistics in the status bar"
+        ToolTipText = "Show lightweight FPS and occlusion statistics in the status bar"
       };
       btnWorldStats.CheckedChanged += (_, __) => { if (toolStripPerfStatus != null) toolStripPerfStatus.Visible = btnWorldStats.Checked; };
       btnWorldToolsMenu.DropDownItems.Add(btnWorldStats);
@@ -1304,7 +1403,7 @@ namespace PugTools {
       };
       var label = new Label {
         AutoSize = true, Left = 14, Top = 18,
-        Text = "SWTOR / Jedipedia coordinates (X, Y, Z):"
+        Text = "SWTOR display coordinates (X, Y, Z):"
       };
       var input = new TextBox {
         Left = 14, Top = 43, Width = 442,
@@ -1501,7 +1600,7 @@ namespace PugTools {
       LoadWorldBookmarks();
       btnWorldBookmarks = new ToolStripMenuItem("Bookmarks") {
         DisplayStyle = ToolStripItemDisplayStyle.Text,
-        ToolTipText = "Jedipedia-style local camera bookmarks; stores position and view direction per area"
+        ToolTipText = "Local camera bookmarks; stores position and view direction per area"
       };
       btnWorldBookmarks.DropDownOpening += (_, __) => RebuildWorldBookmarksMenu();
       btnWorldNavigationMenu?.DropDownItems.Add(btnWorldBookmarks);
@@ -1660,8 +1759,21 @@ namespace PugTools {
     }
 
     private void InitializeUtilitiesMenu() {
-      btnWorldUtilities = new ToolStripMenuItem("Utilities") { ToolTipText = "Jedipedia-style editor/authoring overlays" };
+      btnWorldUtilities = new ToolStripMenuItem("Utilities") { ToolTipText = "Editor and authoring overlays" };
       KeepCheckMenuOpen(btnWorldUtilities);
+
+      var enableAuthoring = new ToolStripMenuItem("Enable authoring helpers") {
+        ToolTipText = "Enable the common editor markers, paths, utility boards and helper geometry without exposing collision/occluder hulls"
+      };
+      enableAuthoring.Click += (_, __) => SetWorldUtilityPreset(true);
+      var disableAuthoring = new ToolStripMenuItem("Disable authoring helpers") {
+        ToolTipText = "Disable editor markers, paths, helper boards and utility overlays"
+      };
+      disableAuthoring.Click += (_, __) => SetWorldUtilityPreset(false);
+      btnWorldUtilities.DropDownItems.Add(enableAuthoring);
+      btnWorldUtilities.DropDownItems.Add(disableAuthoring);
+      btnWorldUtilities.DropDownItems.Add(new ToolStripSeparator());
+
       AddWorldDropDownToggle(btnWorldUtilities, "Spawner / encounter markers", worldSettings.ShowUtilitySpawners, v => worldSettings.ShowUtilitySpawners = v);
       AddWorldDropDownToggle(btnWorldUtilities, "Cover points", worldSettings.ShowUtilityCoverPoints, v => worldSettings.ShowUtilityCoverPoints = v);
       AddWorldDropDownToggle(btnWorldUtilities, "Lights", worldSettings.ShowUtilityLights, v => worldSettings.ShowUtilityLights = v);
@@ -1671,11 +1783,92 @@ namespace PugTools {
       AddWorldDropDownToggle(btnWorldUtilities, "Map roads with paths", worldSettings.ShowUtilityMapRoadPaths, v => worldSettings.ShowUtilityMapRoadPaths = v);
       AddWorldDropDownToggle(btnWorldUtilities, "Parent / child connections", worldSettings.ShowUtilityConnections, v => worldSettings.ShowUtilityConnections = v);
       AddWorldDropDownToggle(btnWorldUtilities, "Region / trigger volumes", worldSettings.ShowUtilityVolumes, v => worldSettings.ShowUtilityVolumes = v);
-      AddWorldDropDownToggle(btnWorldUtilities, "Phase gateways (green gate)", worldSettings.ShowPhaseGateways, v => worldSettings.ShowPhaseGateways = v, "Show INSTANCE_GATEWAY boundaries as the translucent green phase gate used by SWTOR/Jedipedia; enabled by default");
-      AddWorldDropDownToggle(btnWorldUtilities, "Other helpers", worldSettings.ShowUtilityOther, v => worldSettings.ShowUtilityOther = v);
+      AddWorldDropDownToggle(btnWorldUtilities, "Phase gateways (green gate)", worldSettings.ShowPhaseGateways, v => worldSettings.ShowPhaseGateways = v, "Show INSTANCE_GATEWAY boundaries as translucent green phase gates; enabled by default");
+      AddWorldDropDownToggle(btnWorldUtilities, "Other helpers / authoring boards", worldSettings.ShowUtilityOther, v => {
+        worldSettings.ShowUtilityOther = v;
+        if (v) QueueWorldAuthoringGeometryReload();
+      }, "Show stage/map/effect/audio/camera helpers plus EditorOnly and Hidden+PolyType=Ignore authoring geometry");
       btnWorldUtilities.DropDownItems.Add(new ToolStripSeparator());
-      AddWorldDropDownToggle(btnWorldUtilities, "Show hidden occluders && colliders", worldSettings.ShowHiddenGeometry, v => worldSettings.ShowHiddenGeometry = v, "Reveal Hidden/EditorOnly collision, occlusion and helper geometry");
+      AddWorldDropDownToggle(btnWorldUtilities, "Show hidden occluders && colliders", worldSettings.ShowHiddenGeometry, v => worldSettings.ShowHiddenGeometry = v, "Reveal hidden collision and occlusion geometry for diagnostics");
       btnWorldLayersMenu?.DropDownItems.Add(btnWorldUtilities);
+    }
+
+    private void SetWorldUtilityPreset(bool enabled) {
+      worldSettings.ShowUtilitySpawners = enabled;
+      worldSettings.ShowUtilityCoverPoints = enabled;
+      worldSettings.ShowUtilityLights = enabled;
+      worldSettings.ShowUtilitySeedPoints = enabled;
+      worldSettings.ShowUtilityPaths = enabled;
+      worldSettings.ShowUtilityMapRoadPaths = enabled;
+      worldSettings.ShowUtilityConnections = enabled;
+      worldSettings.ShowUtilityVolumes = enabled;
+      worldSettings.ShowPhaseGateways = enabled;
+      worldSettings.ShowUtilityOther = enabled;
+      // Collision/occluder hulls are intentionally not part of the normal authoring preset; they can be very noisy.
+      if (enabled) worldSettings.ShowHiddenGeometry = false;
+      SyncWorldUtilityMenuChecks();
+      ApplyWorldSettings();
+      if (enabled) QueueWorldAuthoringGeometryReload();
+    }
+
+    private void QueueWorldAuthoringGeometryReload() {
+      if (_closing || worldAuthoringGeometryLoaded || worldAuthoringGeometryReloading || !worldSettings.ShowUtilityOther) return;
+      if (area == null || info == null || currentAreaId == 0 || panelRender == null) return;
+      // Keep the checkbox interaction instantaneous.  The actual reload runs after the current menu event has
+      // unwound, otherwise WinForms can be left inside ToolStrip layout while the render panel is torn down.
+      try { BeginInvoke(new Action(async () => await ReloadWorldAuthoringGeometryAsync())); } catch { }
+    }
+
+    private async Task ReloadWorldAuthoringGeometryAsync() {
+      if (_closing || worldAuthoringGeometryLoaded || worldAuthoringGeometryReloading || !worldSettings.ShowUtilityOther) return;
+      if (area == null || info == null || currentAreaId == 0 || panelRender == null) return;
+      worldAuthoringGeometryReloading = true;
+      bool wasVisible = renderPanel?.Visible == true;
+      try {
+        SetStatusLabel("Loading authoring boards and helper geometry…");
+        if (renderPanel != null) renderPanel.Visible = false;
+        if (render != null && render.IsAlive) {
+          panelRender.StopRender();
+          // Do not re-introduce an unbounded UI-thread Join while adding a convenience reload.
+          if (!render.Join(2000)) {
+            SetStatusLabel("Authoring geometry reload postponed because the renderer is still stopping.");
+            return;
+          }
+          panelRender.Clear();
+        }
+        await PreviewAREA(info, currentAreaId);
+        worldAuthoringGeometryLoaded = true;
+        SetStatusLabel("Authoring boards and helper geometry loaded.");
+      } catch (Exception ex) {
+        worldAuthoringGeometryLoaded = false;
+        SetStatusLabel("Could not load authoring geometry: " + ex.Message);
+      } finally {
+        worldAuthoringGeometryReloading = false;
+        if (!_closing && renderPanel != null) renderPanel.Visible = wasVisible || render != null;
+      }
+    }
+
+    private void SyncWorldUtilityMenuChecks() {
+      if (btnWorldUtilities == null) return;
+      updatingWorldToolbar = true;
+      try {
+        foreach (ToolStripItem raw in btnWorldUtilities.DropDownItems) {
+          if (!(raw is ToolStripMenuItem item) || !item.CheckOnClick) continue;
+          switch (item.Text) {
+            case "Spawner / encounter markers": item.Checked = worldSettings.ShowUtilitySpawners; break;
+            case "Cover points": item.Checked = worldSettings.ShowUtilityCoverPoints; break;
+            case "Lights": item.Checked = worldSettings.ShowUtilityLights; break;
+            case "Kynapse seed points": item.Checked = worldSettings.ShowUtilitySeedPoints; break;
+            case "Paths": item.Checked = worldSettings.ShowUtilityPaths; break;
+            case "Map roads with paths": item.Checked = worldSettings.ShowUtilityMapRoadPaths; break;
+            case "Parent / child connections": item.Checked = worldSettings.ShowUtilityConnections; break;
+            case "Region / trigger volumes": item.Checked = worldSettings.ShowUtilityVolumes; break;
+            case "Phase gateways (green gate)": item.Checked = worldSettings.ShowPhaseGateways; break;
+            case "Other helpers / authoring boards": item.Checked = worldSettings.ShowUtilityOther; break;
+            case "Show hidden occluders && colliders": item.Checked = worldSettings.ShowHiddenGeometry; break;
+          }
+        }
+      } finally { updatingWorldToolbar = false; }
     }
 
     private void InitializeNpcMenu() {
@@ -1688,7 +1881,7 @@ namespace PugTools {
       btnWorldNpcs.DropDownItems.Add(new ToolStripSeparator());
       AddWorldDropDownToggle(btnWorldNpcs, "SPN placeable objects", worldSettings.ShowSpnObjects, v => worldSettings.ShowSpnObjects = v, "Render plc.* objects referenced by SPN spawners");
       AddWorldDropDownToggle(btnWorldNpcs, "SPN animations", worldSettings.AnimateSpnObjects, v => worldSettings.AnimateSpnObjects = v, "Animate MAG/Morpheme-driven SPN placeables when an idle clip can be resolved");
-      AddWorldDropDownToggle(btnWorldNpcs, "Interactable blue glow", worldSettings.ShowPlaceableGlow, v => worldSettings.ShowPlaceableGlow = v, "Jedipedia/SWTOR blue interaction tint for usable SPN placeables and usable DYN-state parts");
+      AddWorldDropDownToggle(btnWorldNpcs, "Interactable blue glow", worldSettings.ShowPlaceableGlow, v => worldSettings.ShowPlaceableGlow = v, "SWTOR blue interaction tint for usable SPN placeables and usable DYN-state parts");
       AddWorldDropDownToggle(btnWorldNpcs, "Overhead service / quest symbols", worldSettings.ShowInteractionIcons, v => worldSettings.ShowInteractionIcons = v, "Quest/conversation, mail, vendor, taxi, quick-travel, bank, codex and other resolved interaction markers over NPC/SPN objects");
       btnWorldLayersMenu?.DropDownItems.Add(btnWorldNpcs);
     }
@@ -2367,6 +2560,7 @@ namespace PugTools {
         btnWorldSelectedConversation.Text = interaction?.Kind == WorldInteractionKind.MissionBoard ? "Open notice tree…" : "Open conversation…";
       }
       UpdateWorldSelectionInfoActions();
+      UpdateWorldHiddenObjectsMenu();
     }
 
     private static string EllipsizeWorldMenuText(string text, int maxChars) {
@@ -2469,6 +2663,7 @@ namespace PugTools {
       renderPanel.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
       LayoutMiniMapWithinHost();
       LayoutPhaseBanner();
+      LayoutWorldCutawayControl();
     }
 
     private void InitializeWorldLoadingOverlay() {
@@ -2597,15 +2792,20 @@ namespace PugTools {
       miniMapPicture.MouseClick += MiniMapPicture_MouseClick;
       miniMapPicture.MouseLeave += (_, __) => UpdateWorldMapNoteToolTip(null, Point.Empty, miniMapPicture);
 
-      miniMapResizeGrip = new Panel { Width = 15, Height = 15, BackColor = SystemColors.ControlDark, Cursor = Cursors.SizeNWSE };
-      miniMapResizeGrip.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
-      miniMapResizeGrip.MouseDown += MiniMapResizeGrip_MouseDown;
-      miniMapResizeGrip.MouseMove += MiniMapResizeGrip_MouseMove;
-      miniMapResizeGrip.MouseUp += (_, __) => miniMapResizing = false;
+      // Eight resize handles let the minimap grow/shrink independently on either axis.  They deliberately overlay
+      // only a few pixels at the panel border, leaving normal map drag/click behaviour untouched in the content.
+      miniMapResizeGrip = CreateMiniMapResizeHandle(MiniMapResizeEdges.Right | MiniMapResizeEdges.Bottom, Cursors.SizeNWSE, true);
+      CreateMiniMapResizeHandle(MiniMapResizeEdges.Left, Cursors.SizeWE);
+      CreateMiniMapResizeHandle(MiniMapResizeEdges.Right, Cursors.SizeWE);
+      CreateMiniMapResizeHandle(MiniMapResizeEdges.Top, Cursors.SizeNS);
+      CreateMiniMapResizeHandle(MiniMapResizeEdges.Bottom, Cursors.SizeNS);
+      CreateMiniMapResizeHandle(MiniMapResizeEdges.Left | MiniMapResizeEdges.Top, Cursors.SizeNWSE);
+      CreateMiniMapResizeHandle(MiniMapResizeEdges.Right | MiniMapResizeEdges.Top, Cursors.SizeNESW);
+      CreateMiniMapResizeHandle(MiniMapResizeEdges.Left | MiniMapResizeEdges.Bottom, Cursors.SizeNESW);
 
       miniMapPanel.Controls.Add(miniMapPicture);
       miniMapPanel.Controls.Add(miniMapTitleBar);
-      miniMapPanel.Controls.Add(miniMapResizeGrip);
+      foreach (Panel handle in miniMapResizeHandles) miniMapPanel.Controls.Add(handle);
       splitContainer3.Panel1.Controls.Add(miniMapPanel);
       miniMapPanel.BringToFront();
 
@@ -2783,7 +2983,7 @@ namespace PugTools {
         Spring = false,
         TextAlign = ContentAlignment.MiddleLeft,
         IsLink = true,
-        ToolTipText = "Jedipedia/SWTOR display coordinates. Click or press Ctrl+E to teleport."
+        ToolTipText = "SWTOR display coordinates. Click or press Ctrl+E to teleport."
       };
       toolStripPositionStatus.Click += (_, __) => ShowCoordinateTeleportDialog();
       toolStripPhaseStatus = new ToolStripStatusLabel("Phase: none") {
@@ -2793,14 +2993,14 @@ namespace PugTools {
       };
       toolStripShipDestinationStatus = new ToolStripDropDownButton("Ship: --") {
         Visible = false,
-        ToolTipText = "Choose what is visible through the ship cockpit/window (Jedipedia shipVfx)."
+        ToolTipText = "Choose what is visible through the ship cockpit/window."
       };
       toolStripShipDestinationStatus.DropDownOpening += (_, __) => RebuildShipDestinationMenu();
       toolStripPerfStatus = new ToolStripStatusLabel("FPS: --   Occ S/D: 0/0") {
         Spring = false,
         Visible = btnWorldStats?.Checked == true,
         TextAlign = ContentAlignment.MiddleLeft,
-        ToolTipText = "FPS plus static/dynamic receivers currently suppressed by the depth occlusion cache"
+        ToolTipText = "FPS, static/dynamic occlusion suppression, active streaming rooms/assets/decoded models and decode/GPU/material queue depths"
       };
       toolStripRoomStatus = new ToolStripStatusLabel("Current room: unknown") {
         Spring = true,
@@ -3007,7 +3207,10 @@ namespace PugTools {
       miniMapFollowRestoreView = false;
       UpdateMiniMapTitle();
       RefreshMiniMapModeControls();
-      ResizeMiniMapToImageAspect();
+      // Preserve a user-resized rectangle across minimap refreshes/page changes. Automatic aspect fitting is only
+      // used until the first manual edge/corner resize.
+      if (!miniMapUserResized) ResizeMiniMapToImageAspect();
+      else LayoutMiniMapWithinHost();
       miniMapPicture?.Invalidate();
     }
 
@@ -3041,7 +3244,17 @@ namespace PugTools {
     private void MiniMapVisibleWorldBounds(out float minX, out float maxX, out float minZ, out float maxZ) {
       float fullW = Math.Max(.0001f, miniMapMaxX - miniMapMinX), fullH = Math.Max(.0001f, miniMapMaxZ - miniMapMinZ);
       float zoom = Math.Max(1f, Math.Min(MiniMapMaxZoom, miniMapZoom));
-      float visibleW = fullW / zoom, visibleH = fullH / zoom;
+
+      // Preserve world-space aspect when the user freely resizes the minimap. A wider window reveals more world to
+      // the left/right; a taller window reveals more above/below instead of stretching the cached map bitmap.
+      float viewportAspect = miniMapPicture == null || miniMapPicture.ClientSize.Height <= 0
+        ? fullW / fullH
+        : Math.Max(.05f, miniMapPicture.ClientSize.Width / (float)Math.Max(1, miniMapPicture.ClientSize.Height));
+      float fullAspect = fullW / fullH;
+      float baseW = fullW, baseH = fullH;
+      if (viewportAspect > fullAspect) baseW = fullH * viewportAspect;
+      else if (viewportAspect < fullAspect) baseH = fullW / viewportAspect;
+      float visibleW = baseW / zoom, visibleH = baseH / zoom;
       float halfW = visibleW * .5f, halfH = visibleH * .5f;
       // Do not clamp the minimap centre to the cached page bounds.  The player marker is supposed to stay in the
       // exact centre even at an authored map edge.  Painting clips the backing bitmap to the available source area
@@ -3502,31 +3715,128 @@ namespace PugTools {
       LayoutMiniMapWithinHost(false);
     }
 
-    private void MiniMapResizeGrip_MouseDown(object sender, MouseEventArgs e) {
-      if (e.Button != MouseButtons.Left || miniMapPanel == null) return;
+    private Panel CreateMiniMapResizeHandle(MiniMapResizeEdges edges, Cursor cursor, bool visibleGrip = false) {
+      var handle = new Panel {
+        Tag = edges,
+        Cursor = cursor,
+        BackColor = visibleGrip ? SystemColors.ControlDark : Color.FromArgb(28, 28, 28),
+        TabStop = false
+      };
+      handle.MouseDown += MiniMapResizeHandle_MouseDown;
+      handle.MouseMove += MiniMapResizeHandle_MouseMove;
+      handle.MouseUp += MiniMapResizeHandle_MouseUp;
+      miniMapResizeHandles.Add(handle);
+      return handle;
+    }
+
+    private void MiniMapResizeHandle_MouseDown(object sender, MouseEventArgs e) {
+      if (e.Button != MouseButtons.Left || miniMapPanel == null || sender is not Control handle || handle.Tag is not MiniMapResizeEdges edges) return;
       miniMapResizing = true;
+      miniMapResizeEdges = edges;
       miniMapDragStart = Cursor.Position;
       miniMapResizeStart = miniMapPanel.Size;
+      miniMapResizeLocationStart = miniMapPanel.Location;
+      handle.Capture = true;
     }
 
-    private void MiniMapResizeGrip_MouseMove(object sender, MouseEventArgs e) {
-      if (!miniMapResizing || miniMapPanel == null) return;
+    private void MiniMapResizeHandle_MouseMove(object sender, MouseEventArgs e) {
+      if (!miniMapResizing || miniMapPanel == null || splitContainer3?.Panel1 == null) return;
       Point now = Cursor.Position;
-      int requestedWidth = Math.Max(160, miniMapResizeStart.Width + now.X - miniMapDragStart.X);
-      if (miniMapImage != null) ResizeMiniMapToImageAspect(requestedWidth);
-      else {
-        int maxW = Math.Max(160, splitContainer3.Panel1.ClientSize.Width - miniMapPanel.Left - 4);
-        int maxH = Math.Max(120, splitContainer3.Panel1.ClientSize.Height - miniMapPanel.Top - 4);
-        miniMapPanel.Size = new Size(Math.Min(maxW, requestedWidth), Math.Max(120, Math.Min(maxH, miniMapResizeStart.Height + now.Y - miniMapDragStart.Y)));
+      int dx = now.X - miniMapDragStart.X;
+      int dy = now.Y - miniMapDragStart.Y;
+      Rectangle start = new Rectangle(miniMapResizeLocationStart, miniMapResizeStart);
+      Rectangle requested = start;
+
+      if ((miniMapResizeEdges & MiniMapResizeEdges.Left) != 0) { requested.X = start.X + dx; requested.Width = start.Width - dx; }
+      if ((miniMapResizeEdges & MiniMapResizeEdges.Right) != 0) requested.Width = start.Width + dx;
+      if ((miniMapResizeEdges & MiniMapResizeEdges.Top) != 0) { requested.Y = start.Y + dy; requested.Height = start.Height - dy; }
+      if ((miniMapResizeEdges & MiniMapResizeEdges.Bottom) != 0) requested.Height = start.Height + dy;
+
+      var host = splitContainer3.Panel1;
+      int hostTop = (worldToolbar?.Bottom ?? 0) + 6;
+      const int margin = 4;
+      const int minWidth = 160;
+      int minHeight = Math.Max(120, (miniMapTitleBar?.Height ?? 25) + 60);
+
+      // Clamp the moving side first so dragging the left/top edge keeps the opposite edge stationary whenever possible.
+      if ((miniMapResizeEdges & MiniMapResizeEdges.Left) != 0) {
+        int right = requested.Right;
+        requested.X = Math.Max(margin, Math.Min(requested.X, right - minWidth));
+        requested.Width = right - requested.X;
+      } else {
+        requested.Width = Math.Max(minWidth, requested.Width);
       }
+      if ((miniMapResizeEdges & MiniMapResizeEdges.Top) != 0) {
+        int bottom = requested.Bottom;
+        requested.Y = Math.Max(hostTop, Math.Min(requested.Y, bottom - minHeight));
+        requested.Height = bottom - requested.Y;
+      } else {
+        requested.Height = Math.Max(minHeight, requested.Height);
+      }
+
+      int maxRight = Math.Max(margin + minWidth, host.ClientSize.Width - margin);
+      int maxBottom = Math.Max(hostTop + minHeight, host.ClientSize.Height - margin);
+      if (requested.Right > maxRight) {
+        if ((miniMapResizeEdges & MiniMapResizeEdges.Left) != 0 && (miniMapResizeEdges & MiniMapResizeEdges.Right) == 0)
+          requested.X = Math.Max(margin, maxRight - requested.Width);
+        else requested.Width = Math.Max(minWidth, maxRight - requested.X);
+      }
+      if (requested.Bottom > maxBottom) {
+        if ((miniMapResizeEdges & MiniMapResizeEdges.Top) != 0 && (miniMapResizeEdges & MiniMapResizeEdges.Bottom) == 0)
+          requested.Y = Math.Max(hostTop, maxBottom - requested.Height);
+        else requested.Height = Math.Max(minHeight, maxBottom - requested.Y);
+      }
+
+      requested.Width = Math.Min(requested.Width, Math.Max(minWidth, maxRight - requested.X));
+      requested.Height = Math.Min(requested.Height, Math.Max(minHeight, maxBottom - requested.Y));
+      miniMapPanel.Bounds = requested;
+      miniMapUserResized = true;
       PositionMiniMapResizeGrip();
-      miniMapPicture.Invalidate();
+      miniMapPicture?.Invalidate();
     }
+
+    private void MiniMapResizeHandle_MouseUp(object sender, MouseEventArgs e) {
+      if (sender is Control handle) handle.Capture = false;
+      miniMapResizing = false;
+      miniMapResizeEdges = MiniMapResizeEdges.None;
+      LayoutMiniMapWithinHost(false);
+    }
+
+    // Keep the historical method names as tiny wrappers so any designer/event hookup from an older workspace still
+    // behaves correctly. The new handles use the generic edge-aware handlers above.
+    private void MiniMapResizeGrip_MouseDown(object sender, MouseEventArgs e) => MiniMapResizeHandle_MouseDown(sender, e);
+    private void MiniMapResizeGrip_MouseMove(object sender, MouseEventArgs e) => MiniMapResizeHandle_MouseMove(sender, e);
 
     private void PositionMiniMapResizeGrip() {
-      if (miniMapResizeGrip == null || miniMapPanel == null) return;
-      miniMapResizeGrip.Location = new Point(Math.Max(0, miniMapPanel.ClientSize.Width - miniMapResizeGrip.Width), Math.Max(0, miniMapPanel.ClientSize.Height - miniMapResizeGrip.Height));
-      miniMapResizeGrip.BringToFront();
+      if (miniMapPanel == null || miniMapResizeHandles.Count == 0) return;
+      const int edge = 5;
+      const int corner = 12;
+      int width = miniMapPanel.ClientSize.Width;
+      int height = miniMapPanel.ClientSize.Height;
+      foreach (Panel handle in miniMapResizeHandles) {
+        if (handle?.Tag is not MiniMapResizeEdges edges) continue;
+        bool left = (edges & MiniMapResizeEdges.Left) != 0;
+        bool right = (edges & MiniMapResizeEdges.Right) != 0;
+        bool top = (edges & MiniMapResizeEdges.Top) != 0;
+        bool bottom = (edges & MiniMapResizeEdges.Bottom) != 0;
+        bool cornerHandle = (left || right) && (top || bottom);
+        if (cornerHandle) {
+          handle.Bounds = new Rectangle(left ? 0 : Math.Max(0, width - corner), top ? 0 : Math.Max(0, height - corner), corner, corner);
+        } else if (left || right) {
+          handle.Bounds = new Rectangle(left ? 0 : Math.Max(0, width - edge), corner, edge, Math.Max(1, height - corner * 2));
+        } else {
+          handle.Bounds = new Rectangle(corner, top ? 0 : Math.Max(0, height - edge), Math.Max(1, width - corner * 2), edge);
+        }
+      }
+      // Edge strips first, corners last so a corner always wins hit-testing where the handles overlap.
+      foreach (Panel handle in miniMapResizeHandles) {
+        if (handle?.Tag is MiniMapResizeEdges edges && (((edges & MiniMapResizeEdges.Left) != 0 || (edges & MiniMapResizeEdges.Right) != 0) ^ ((edges & MiniMapResizeEdges.Top) != 0 || (edges & MiniMapResizeEdges.Bottom) != 0)))
+          handle.BringToFront();
+      }
+      foreach (Panel handle in miniMapResizeHandles) {
+        if (handle?.Tag is MiniMapResizeEdges edges && ((edges & (MiniMapResizeEdges.Left | MiniMapResizeEdges.Right)) != 0) && ((edges & (MiniMapResizeEdges.Top | MiniMapResizeEdges.Bottom)) != 0))
+          handle.BringToFront();
+      }
     }
 
     private void LayoutMiniMapWithinHost(bool keepCurrentPosition = true) {
@@ -3909,9 +4219,10 @@ namespace PugTools {
           List<float> miniMin = WorldFloatVector(WorldInteractionDataValue(page, "mapPageMiniMinCoord", "4611686035821970007"));
           List<float> miniMax = WorldFloatVector(WorldInteractionDataValue(page, "mapPageMiniMaxCoord", "4611686035821970006"));
 
-          // Preserve the existing 64-bit path preference first (including its two systemgenerated exceptions), then
-          // add the alternate location and the pre-release unsuffixed DDS as fallbacks for 32-bit/Beta clients.
-          bool retailSystemGenerated = areaId == 36268000006UL || areaId == 3758002374UL;
+          // Prefer the directory from which area.dat was actually loaded. This automatically covers every
+          // discovered systemgenerated world instead of hard-coding the two IDs known to older Jedipedia builds.
+          // Keep the alternate location and the pre-release unsuffixed DDS as fallbacks for legacy clients.
+          bool retailSystemGenerated = IsSystemGeneratedWorldPath(targetArea.Path);
           string preferredPrefix = retailSystemGenerated ? "livecontent/systemgenerated" : "areas";
           string alternatePrefix = retailSystemGenerated ? "areas" : "livecontent/systemgenerated";
           string[] imageCandidates = {
@@ -3970,9 +4281,12 @@ namespace PugTools {
         if (token.Length == 0) continue;
         switch (token) {
           case "dbo":
-            // DBO = design-blockout/editor placeholder geometry. Jedipedia's normal world view does not draw it.
-            // Stronghold rooms contain several of these authored stand-ins; one of them looks like a giant turret
-            // when rendered as ordinary art. Match both the common dbo_* filenames and designblockout folders.
+            // Design-blockout/editor assets are part of the authoring view.  They still stay out of the normal
+            // geometry pass, but must be admitted to the streaming catalogue while authoring helpers are enabled;
+            // their EditorOnly/Hidden materials remain gated by View_AREA.IsMaterialHiddenFromWorld.  Previously
+            // these assets were discarded before the renderer ever saw them, which is why the large Act/levels/
+            // faction/Quest Start boards could never appear no matter which utility visibility flags were enabled.
+            if (worldSettings?.ShowUtilityOther == true) break;
             if (file.StartsWith("dbo_", StringComparison.OrdinalIgnoreCase) ||
                 path.Contains("/dbo/") || path.Contains("/dbo_") ||
                 path.Contains("designblockout")) return true;
@@ -4086,6 +4400,9 @@ namespace PugTools {
 
     private async Task PreviewAREA(HashFileInfo info, ulong areaId) {
       ShowWorldLoading("Loading world…", "Reading area.dat and phase metadata…");
+      // If authoring helpers are active during this load, ShouldIgnoreAreaModel admits DBO/editor models into the
+      // streamer catalogue.  Remember that fact so toggling other utility checkboxes does not repeatedly reload.
+      worldAuthoringGeometryLoaded = worldSettings.ShowUtilityOther;
       try {
         ResetWorldSpaceCombatEncounterCache();
         area = new FileFormats.Area(info, currentAssets, areaId);
@@ -4204,17 +4521,42 @@ namespace PugTools {
       worldConversationPlaybackForm = null;
       if (worldCodexPreviewForm != null && !worldCodexPreviewForm.IsDisposed) worldCodexPreviewForm.Dispose();
       worldCodexPreviewForm = null;
-      if (render != null) {
-        panelRender.StopRender();
-        render.Join();
-        panelRender.Clear();
+
+      View_AREA renderer = panelRender;
+      Thread renderThread = render;
+      panelRender = null;
+      render = null;
+
+      void CleanupWorldRenderResources() {
+        try { renderer?.Clear(); } catch { }
+        try { renderer?.Dispose(); } catch { }
+        try { materials.Clear(); } catch { }
+        try { models.Clear(); } catch { }
+        try { assetDict.Clear(); } catch { }
+        try { nodeKeys.Clear(); } catch { }
       }
-      materials.Clear();
-      models.Clear();
-      panelRender?.Dispose();
-      assetDict.Clear();
-      nodeKeys.Clear();
-      Dispose();
+
+      if (renderer == null) {
+        CleanupWorldRenderResources();
+        return;
+      }
+
+      try { renderer.StopRender(); } catch { }
+      Boolean stopped = renderThread == null || !renderThread.IsAlive;
+      if (!stopped) {
+        try { stopped = renderThread.Join(750); } catch { }
+      }
+
+      if (stopped) {
+        CleanupWorldRenderResources();
+      } else {
+        // A slow D3D shutdown must not freeze every open PugTools browser. Finish cleanup after
+        // the render thread has actually exited instead of blocking the WinForms message loop.
+        ThreadPool.QueueUserWorkItem(_ => {
+          try { renderThread.Join(); } catch { }
+          CleanupWorldRenderResources();
+        });
+      }
     }
 
     public void SetStatusLabel(string message) {

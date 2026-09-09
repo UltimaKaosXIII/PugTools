@@ -18,6 +18,8 @@
     // x=SourceOffset, y=has illumination cookie, z=has falloff cookie, w=has authored ramp.
     float4 LocalLightProjectorParams[4];
     float4 HeightRange;
+    // Jedipedia map-viewer Y-slice: x=enabled, y=maximum visible world Y. Geometry above the plane is clipped in the VS.
+    float4 WorldSliceParams;
     float4 OverlayColor;
     float4 MaterialFlatColor;
     float4 MaterialBloomParams;
@@ -226,6 +228,7 @@ struct SkinnedVSIn {
 };
 struct VSOut {
     float4 Pos:SV_POSITION;
+    float ClipDistance:SV_ClipDistance0;
     float3 WorldPos:TEXCOORD0;
     float3 Normal:TEXCOORD1;
     float3 Tangent:TEXCOORD2;
@@ -238,6 +241,7 @@ VSOut WorldVS(VSIn v) {
     float4 wp = mul(float4(v.Pos,1), World);
     o.WorldPos = wp.xyz;
     o.Pos = mul(wp, ViewProj);
+    o.ClipDistance = WorldSliceParams.x > 0.5 ? WorldSliceParams.y - wp.y : 1.0;
     o.Normal = normalize(mul(float4(v.Normal,0), WorldInvTranspose).xyz);
     o.Tangent = normalize(mul(float4(v.Tan,0), World).xyz);
     o.Tex = v.Tex;
@@ -271,6 +275,7 @@ VSOut SkinnedWorldVS(SkinnedVSIn v) {
     }
     float4 wp=mul(localPos,World);
     o.WorldPos=wp.xyz; o.Pos=mul(wp,ViewProj);
+    o.ClipDistance=WorldSliceParams.x>0.5?WorldSliceParams.y-wp.y:1.0;
     o.Normal=normalize(mul(float4(normalize(localNormal),0),WorldInvTranspose).xyz);
     o.Tangent=normalize(mul(float4(normalize(localTangent),0),World).xyz);
     o.Tex=v.Tex; o.ViewDistance=distance(CameraPosition.xyz,wp.xyz);
@@ -288,6 +293,7 @@ VSOut InstancedWorldVS(InstancedVSIn v) {
     float4 localWp=mul(float4(v.Pos,1),instanceWorld);
     float4 wp=mul(localWp,World);
     o.WorldPos=wp.xyz; o.Pos=mul(wp,ViewProj);
+    o.ClipDistance=WorldSliceParams.x>0.5?WorldSliceParams.y-wp.y:1.0;
     // DYD mesh placements only contain rotation + uniform scale, so the normalized upper 3x3 is
     // sufficient here and avoids shipping one inverse-transpose matrix per instance.
     float3 instanceNormal=normalize(mul(float4(v.Normal,0),instanceWorld).xyz);
@@ -309,6 +315,7 @@ struct DydIn {
 };
 struct DydOut {
     float4 Pos:SV_POSITION;
+    float ClipDistance:SV_ClipDistance0;
     float3 WorldPos:TEXCOORD0;
     float3 Normal:TEXCOORD1;
     float2 Tex:TEXCOORD2;
@@ -353,6 +360,7 @@ DydOut DynamicDetailVS(DydIn v) {
     float verticalOffset=v.Scale*(cardCorner.y*distanceFade-0.9*(1.0-distanceFade));
     o.WorldPos=center+cameraRight*(cardCorner.x*v.Scale*aspect+wind.x)+float3(0,verticalOffset+wind.y,0);
     o.Pos=mul(float4(o.WorldPos,1),ViewProj);
+    o.ClipDistance=WorldSliceParams.x>0.5?WorldSliceParams.y-o.WorldPos.y:1.0;
     if(distanceFade<0.001)o.Pos=float4(2,0,0,1);
     o.Normal=normalize(mul(float4(UnpackGrassNormal(v.PackedNormal),0),WorldInvTranspose).xyz);
     float3 L=normalize(PointLightDir.xyz-o.WorldPos*PointLightDir.w);
@@ -911,7 +919,14 @@ float4 FxGlowPS(VSOut i):SV_Target {
     return float4(MapArtTint.rgb*a*MapArtTint.a,a*MapArtTint.a);
 }
 float4 OverlayPS(VSOut i):SV_Target { return OverlayColor; }
-float4 ShadowVS(VSIn v):SV_POSITION { return mul(mul(float4(v.Pos,1),World),ViewProj); }
+struct ShadowOut { float4 Pos:SV_POSITION; float ClipDistance:SV_ClipDistance0; };
+ShadowOut ShadowVS(VSIn v) {
+    ShadowOut o;
+    float4 wp=mul(float4(v.Pos,1),World);
+    o.Pos=mul(wp,ViewProj);
+    o.ClipDistance=WorldSliceParams.x>0.5?WorldSliceParams.y-wp.y:1.0;
+    return o;
+}
 float4 InstancedAlphaShadowPS(VSOut i):SV_Target {
     // The same instanced shadow technique serves opaque and cutout world batches. Only AlphaMode=Test should punch
     // holes in the shadow; an opaque texture may still carry unrelated alpha data.

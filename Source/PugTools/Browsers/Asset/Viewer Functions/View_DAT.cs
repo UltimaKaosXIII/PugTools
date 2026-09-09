@@ -309,7 +309,7 @@ namespace PugTools {
       reader.BaseStream.Position = 0;
       using MemoryStream copy = new MemoryStream();
       reader.BaseStream.CopyTo(copy);
-      String text = Encoding.UTF8.GetString(copy.ToArray()).TrimEnd('\0');
+      String text = DecodeText(copy.ToArray());
 
       if (text.IndexOf("! Area Specification", StringComparison.OrdinalIgnoreCase) >= 0)
         return ParseAreaText(text);
@@ -319,9 +319,151 @@ namespace PugTools {
         return ParseRoomText(text, areaAssets);
       }
 
+      if (text.IndexOf("! Character Specification", StringComparison.OrdinalIgnoreCase) >= 0)
+        return ParseCharacterText(text);
+
       throw new InvalidDataException(
-        "This .dat file is not an SWTOR area.dat or room specification file."
+        "This .dat file is not an SWTOR area, room or character specification file."
       );
+    }
+
+    private static String DecodeText(Byte[] data) {
+      if (data == null || data.Length == 0) return String.Empty;
+
+      Encoding encoding = Encoding.UTF8;
+      Int32 offset = 0;
+      Int32 length = data.Length;
+
+      if (length >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF) {
+        encoding = new UTF8Encoding(false, false);
+        offset = 3;
+      } else if (length >= 2 && data[0] == 0xFF && data[1] == 0xFE) {
+        encoding = Encoding.Unicode;
+        offset = 2;
+      } else if (length >= 2 && data[0] == 0xFE && data[1] == 0xFF) {
+        encoding = Encoding.BigEndianUnicode;
+        offset = 2;
+      } else {
+        Int32 sample = Math.Min(length, 256);
+        Int32 evenNulls = 0;
+        Int32 oddNulls = 0;
+        for (Int32 i = 0; i < sample; i++) {
+          if (data[i] != 0) continue;
+          if ((i & 1) == 0) evenNulls++;
+          else oddNulls++;
+        }
+
+        if (oddNulls >= 3 && oddNulls > evenNulls * 2)
+          encoding = Encoding.Unicode;
+        else if (evenNulls >= 3 && evenNulls > oddNulls * 2)
+          encoding = Encoding.BigEndianUnicode;
+      }
+
+      length -= offset;
+      if ((encoding == Encoding.Unicode || encoding == Encoding.BigEndianUnicode) && (length & 1) != 0)
+        length--;
+      if (length <= 0) return String.Empty;
+
+      return encoding.GetString(data, offset, length).TrimStart('\uFEFF').TrimEnd('\0');
+    }
+
+    private static ArrayList ParseCharacterText(String text) {
+      String[] lines = Regex.Split(text ?? String.Empty, "\\r\\n|\\n|\\r");
+      String character = String.Empty;
+      Int32 partsStart = -1;
+
+      for (Int32 i = 0; i < lines.Length; i++) {
+        String line = (lines[i] ?? String.Empty).Trim();
+        const String characterPrefix = "! Character Specification for ";
+        if (line.StartsWith(characterPrefix, StringComparison.OrdinalIgnoreCase))
+          character = line.Substring(characterPrefix.Length).Trim();
+        if (String.Equals(line, "[PARTS]", StringComparison.OrdinalIgnoreCase)) {
+          partsStart = i + 1;
+          break;
+        }
+      }
+
+      if (partsStart < 0)
+        throw new InvalidDataException("Character DAT has no [PARTS] section.");
+
+      var parameters = new List<KeyValuePair<String, String>>();
+      for (Int32 i = partsStart; i < lines.Length; i++) {
+        String line = (lines[i] ?? String.Empty).Trim();
+        if (line.Length == 0 || line[0] == '!' || line[0] == ';' || line[0] == '#') continue;
+        if (line.StartsWith("[", StringComparison.Ordinal) && line.EndsWith("]", StringComparison.Ordinal)) break;
+        Int32 equals = line.IndexOf('=');
+        String key = equals < 0 ? line : line.Substring(0, equals).Trim();
+        String value = equals < 0 ? String.Empty : line.Substring(equals + 1).Trim();
+        parameters.Add(new KeyValuePair<String, String>(key, value));
+      }
+
+      var roots = new ArrayList();
+      NodeListItem summary = Branch("Character Specification");
+      summary.children.Add(Leaf("Format", "Text / Version 2"));
+      if (!String.IsNullOrWhiteSpace(character)) summary.children.Add(Leaf("Character", character));
+      summary.children.Add(Leaf("Parameters", parameters.Count.ToString("N0", Invariant)));
+      roots.Add(summary);
+
+      var references = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+      if (!String.IsNullOrWhiteSpace(character))
+        references.Add(NormalizeResourcePath("/resources/art/dynamic/spec/" + character + ".gr2"));
+
+      NodeListItem parametersRoot = Branch("Parameters (" + parameters.Count.ToString("N0", Invariant) + ")");
+      foreach (KeyValuePair<String, String> pair in parameters) {
+        NodeListItem parameter = Leaf(pair.Key, pair.Value);
+        foreach (String resource in CharacterParameterResources(pair.Key, pair.Value)) {
+          references.Add(resource);
+          parameter.children.Add(Leaf("Resource", resource));
+        }
+        parametersRoot.children.Add(parameter);
+      }
+      roots.Add(parametersRoot);
+
+      if (references.Count > 0) {
+        NodeListItem refs = Branch("Referenced Resources (" + references.Count.ToString("N0", Invariant) + ")");
+        foreach (String resource in references.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+          refs.children.Add(Leaf(resource, String.Empty));
+        roots.Add(refs);
+      }
+      return roots;
+    }
+
+    private static IEnumerable<String> CharacterParameterResources(String key, String value) {
+      var result = new HashSet<String>(StringComparer.OrdinalIgnoreCase);
+      if (String.IsNullOrWhiteSpace(key) || String.IsNullOrWhiteSpace(value)) return result;
+
+      void Add(String path) {
+        String normalized = NormalizeResourcePath(path);
+        if (!String.IsNullOrWhiteSpace(normalized)) result.Add(normalized);
+      }
+
+      switch (key.Trim().ToLowerInvariant()) {
+        case "model":
+          Add("/resources/art/dynamic/spec/" + value);
+          break;
+        case "mesh":
+        case "animlibraryfqn":
+        case "animsharemetadatafqn":
+          Add("/resources/" + value);
+          break;
+        case "material":
+          foreach (String material in value.Split(new[] { ' ', '\t', ',' }, StringSplitOptions.RemoveEmptyEntries))
+            Add("/resources/art/shaders/materials/" + material + ".mat");
+          break;
+        case "animmetadatafqn":
+          foreach (String metadata in value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            Add("/resources/" + metadata.Trim());
+          break;
+      }
+      return result;
+    }
+
+    private static String NormalizeResourcePath(String path) {
+      if (String.IsNullOrWhiteSpace(path)) return String.Empty;
+      String normalized = path.Trim().Replace('\\', '/');
+      while (normalized.Contains("//")) normalized = normalized.Replace("//", "/");
+      if (!normalized.StartsWith("/", StringComparison.Ordinal)) normalized = "/" + normalized;
+      return normalized.ToLowerInvariant();
     }
 
     private static String PeekBinaryMagic(BinaryReader reader) {

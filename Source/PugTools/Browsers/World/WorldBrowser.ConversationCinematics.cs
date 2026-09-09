@@ -333,7 +333,7 @@ namespace PugTools {
       if (mark == null || String.IsNullOrWhiteSpace(mark.Stage) || String.IsNullOrWhiteSpace(mark.Mark)) return null;
       if (!TryResolveWorldConversationActorMark(mark.Stage, mark.Mark, out Vector3 position, out float yaw, out Room markRoom)) return null;
       var anchor = new WorldNpcPlacement {
-        Room = markRoom ?? worldConversationPrimaryNpc?.Room ?? area?.RoomList?.FirstOrDefault(x => x != null),
+        Room = markRoom ?? WorldConversationAnchorRoom() ?? area?.RoomList?.FirstOrDefault(x => x != null),
         Instance = null,
         SourceFqn = actor,
         Name = actor,
@@ -374,13 +374,101 @@ namespace PugTools {
         text == "vote winner" || text == "vote loser" || text == "vote loser 1" || text == "vote loser 2" || text == "vote loser 3";
     }
 
+    private Room WorldConversationAnchorRoom() {
+      if (worldConversationPrimaryNpc?.Room != null) return worldConversationPrimaryNpc.Room;
+      if (worldConversationPrimarySpn?.Room != null) return worldConversationPrimarySpn.Room;
+      return null;
+    }
+
+    private bool TryGetWorldConversationAnchor(out Matrix world, out Room room) {
+      world = Matrix.Identity;
+      room = null;
+      if (worldConversationPrimaryNpc != null) {
+        room = worldConversationPrimaryNpc.Room;
+        if (worldConversationPrimaryNpc.ConversationWorld.HasValue) {
+          world = worldConversationPrimaryNpc.ConversationWorld.Value;
+          return room != null && WorldConversationFiniteMatrix(world);
+        }
+        if (worldConversationPrimaryNpc.Instance != null && room != null) {
+          try { world = worldConversationPrimaryNpc.Instance.GetAbsoluteTransform(room); return WorldConversationFiniteMatrix(world); } catch { }
+        }
+      }
+      if (worldConversationPrimarySpn?.Instance != null && worldConversationPrimarySpn.Room != null) {
+        room = worldConversationPrimarySpn.Room;
+        try { world = worldConversationPrimarySpn.Instance.GetAbsoluteTransform(room); return WorldConversationFiniteMatrix(world); } catch { }
+      }
+      room = null;
+      world = Matrix.Identity;
+      return false;
+    }
+
+    private static bool WorldConversationFiniteMatrix(Matrix value) {
+      return !(Single.IsNaN(value.M11) || Single.IsInfinity(value.M11) || Single.IsNaN(value.M12) || Single.IsInfinity(value.M12) ||
+        Single.IsNaN(value.M13) || Single.IsInfinity(value.M13) || Single.IsNaN(value.M21) || Single.IsInfinity(value.M21) ||
+        Single.IsNaN(value.M22) || Single.IsInfinity(value.M22) || Single.IsNaN(value.M23) || Single.IsInfinity(value.M23) ||
+        Single.IsNaN(value.M31) || Single.IsInfinity(value.M31) || Single.IsNaN(value.M32) || Single.IsInfinity(value.M32) ||
+        Single.IsNaN(value.M33) || Single.IsInfinity(value.M33) || Single.IsNaN(value.M41) || Single.IsInfinity(value.M41) ||
+        Single.IsNaN(value.M42) || Single.IsInfinity(value.M42) || Single.IsNaN(value.M43) || Single.IsInfinity(value.M43));
+    }
+
+    private Matrix WorldConversationFallbackStageAnchor(string stageFqn, GomObjectData stageData, Matrix anchorWorld) {
+      Vector3 entity = new Vector3(anchorWorld.M41, anchorWorld.M42, anchorWorld.M43);
+      WorldConversationStagingInfo staging = ReadWorldConversationStaging(worldConversationPlaybackConversation, worldConversationPlaybackNode?.NodeId ?? 0);
+      if (staging == null || stageData == null) {
+        Matrix simple = Matrix.Identity; simple.M41 = entity.X; simple.M42 = entity.Y; simple.M43 = entity.Z; return simple;
+      }
+
+      WorldConversationStageMarkRef speakerRef = null;
+      ulong speakerId = worldConversationPlaybackNode != null && worldConversationPlaybackNode.SpeakerId != 0
+        ? worldConversationPlaybackNode.SpeakerId : worldConversationPlaybackConversation?.DefaultSpeakerId ?? 0;
+      if (speakerId != 0) staging.Speakers.TryGetValue(speakerId, out speakerRef);
+      if (speakerRef == null && staging.Speakers.Count == 1) speakerRef = staging.Speakers.Values.FirstOrDefault();
+      if (speakerRef != null && !String.Equals(NormalizeWorldConversationStageFqn(speakerRef.Stage), stageFqn, StringComparison.OrdinalIgnoreCase)) speakerRef = null;
+      WorldConversationStageMarkRef playerRef = staging.Player;
+      if (playerRef != null && !String.Equals(NormalizeWorldConversationStageFqn(playerRef.Stage), stageFqn, StringComparison.OrdinalIgnoreCase)) playerRef = null;
+
+      object actorMarks = WorldInteractionDataValue(stageData, "stgTemplateActorMarkList_ForPrototype", "4611686042788570002");
+      GomObjectData speakerMark = speakerRef == null ? null : WorldConversationNamedObject(actorMarks, speakerRef.Mark);
+      GomObjectData playerMark = playerRef == null ? null : WorldConversationNamedObject(actorMarks, playerRef.Mark);
+      GomObjectData pinnedMark = speakerMark ?? playerMark;
+      if (pinnedMark == null) {
+        Matrix simple = Matrix.Identity; simple.M41 = entity.X; simple.M42 = entity.Y; simple.M43 = entity.Z; return simple;
+      }
+
+      Vector3 here = SpnDynVector3(WorldInteractionDataValue(pinnedMark, "stgMarkPosition", "4611686024438910010"), Vector3.Zero);
+      float yaw = 0f;
+      if (speakerMark != null && playerMark != null) {
+        Vector3 there = SpnDynVector3(WorldInteractionDataValue(playerMark, "stgMarkPosition", "4611686024438910010"), Vector3.Zero);
+        float toward = (float)Math.Atan2(-(there.Z - here.Z), there.X - here.X);
+        Vector3 cameraStart = worldConversationOriginCameraPosition ?? (panelRender != null ? panelRender.CurrentCameraPosition : entity + Vector3.UnitZ);
+        float wanted = (float)Math.Atan2(-(cameraStart.Z - entity.Z), cameraStart.X - entity.X);
+        yaw = wanted - toward;
+      }
+
+      Matrix result = Matrix.RotationY(yaw);
+      Vector3 turned = Vector3.TransformCoordinate(here, result);
+      result.M41 = entity.X - turned.X;
+      result.M42 = entity.Y - turned.Y;
+      result.M43 = entity.Z - turned.Z;
+      return result;
+    }
+
+    private static Matrix WorldConversationUprightStageAnchor(Matrix source) {
+      Vector3 position = new Vector3(source.M41, source.M42, source.M43);
+      float yaw = 0f;
+      Vector3 right = new Vector3(source.M11, 0f, source.M13);
+      if (right.LengthSquared() > .000001f) yaw = (float)Math.Atan2(-right.Z, right.X);
+      Matrix result = Matrix.RotationY(yaw);
+      result.M41 = position.X; result.M42 = position.Y; result.M43 = position.Z;
+      return result;
+    }
+
     private Matrix WorldConversationPlayerFallbackWorld() {
-      Matrix world = Matrix.Identity;
-      if (worldConversationPrimaryNpc?.Instance == null || worldConversationPrimaryNpc.Room == null) return world;
+      if (!TryGetWorldConversationAnchor(out Matrix anchor, out _)) return Matrix.Identity;
+      Matrix world = WorldConversationUprightStageAnchor(anchor);
       try {
-        world = worldConversationPrimaryNpc.Instance.GetAbsoluteTransform(worldConversationPrimaryNpc.Room);
-        // Only a fallback until cnvStagePresetMarksPCs places the player. Keep the stand-in near the NPC rather than
-        // exactly inside it for conversations without a PC staging preset.
+        // Only a fallback until cnvStagePresetMarksPCs places the player. Keep the stand-in near the clicked NPC or
+        // placeable (datacrons included) rather than at world origin for conversations without a PC staging preset.
         Vector3 forward = new Vector3(world.M31, 0f, world.M33);
         if (forward.LengthSquared() < .000001f) forward = Vector3.UnitZ; else forward.Normalize();
         world.M41 += forward.X * 1.5f; world.M43 += forward.Z * 1.5f;
@@ -406,7 +494,7 @@ namespace PugTools {
         List<GR2> playerModels = GetNpcAppearanceModels(appearance, appearanceCache, bodyType);
         if (playerModels == null || playerModels.Count == 0) return null;
 
-        Room room = worldConversationPrimaryNpc?.Room ?? worldNpcPlacements?.FirstOrDefault(x => x?.Room != null)?.Room ?? area?.RoomList?.FirstOrDefault(x => x != null);
+        Room room = WorldConversationAnchorRoom() ?? worldNpcPlacements?.FirstOrDefault(x => x?.Room != null)?.Room ?? area?.RoomList?.FirstOrDefault(x => x != null);
         if (room == null) return null;
         Matrix world = WorldConversationPlayerFallbackWorld();
 
@@ -435,7 +523,7 @@ namespace PugTools {
         return existing;
       }
       try {
-        Room room = roomHint ?? worldConversationPrimaryNpc?.Room ?? area?.RoomList?.FirstOrDefault(x => x != null);
+        Room room = roomHint ?? WorldConversationAnchorRoom() ?? area?.RoomList?.FirstOrDefault(x => x != null);
         if (room == null) return null;
         Npc npc = null;
         try { npc = currentDom.NpcLoader.Load(clean); } catch { }
@@ -731,14 +819,8 @@ namespace PugTools {
       bool found = false;
       float bestDistance = Single.MaxValue;
       Vector3 reference = Vector3.Zero;
-      bool hasReference = false;
-      if (worldConversationPrimaryNpc?.Instance != null && worldConversationPrimaryNpc.Room != null) {
-        try {
-          Matrix primaryWorld = worldConversationPrimaryNpc.Instance.GetAbsoluteTransform(worldConversationPrimaryNpc.Room);
-          reference = new Vector3(primaryWorld.M41, primaryWorld.M42, primaryWorld.M43);
-          hasReference = true;
-        } catch { }
-      }
+      bool hasReference = TryGetWorldConversationAnchor(out Matrix anchorWorld, out Room anchorRoom);
+      if (hasReference) reference = new Vector3(anchorWorld.M41, anchorWorld.M42, anchorWorld.M43);
 
       foreach (Room room in area.RoomList) {
         if (room?.InstancesById == null) continue;
@@ -754,6 +836,15 @@ namespace PugTools {
           }
           if (!found || distance < bestDistance) { found = true; bestDistance = distance; bestWorld = world; bestRoom = room; }
         }
+      }
+      // Datacrons and many other placeable conversations reference an STG template without placing that STG as a
+      // room instance. In that case the game instantiates the stage relative to the interaction object. Do the same
+      // here so actor marks, animations, Set Camera and Move Camera all get a real world-space frame instead of
+      // silently failing and leaving the camera at the point where playback started.
+      if (!found && hasReference) {
+        found = true;
+        bestRoom = anchorRoom;
+        bestWorld = WorldConversationFallbackStageAnchor(clean, stageData, anchorWorld);
       }
       if (!found) return false;
       context = new WorldConversationStageContext {

@@ -9,11 +9,12 @@ namespace PugTools {
     None,
     New,
     Changed,
-    Removed
+    Removed,
+    Unchanged
   }
 
   internal sealed class BuildFileRecord {
-    internal String Identity { get; set; }
+    internal UInt64 Identity { get; set; }
     internal Int32 ArchiveIndex { get; set; }
     internal Library Library { get; set; }
     internal HashFileInfo HashInfo { get; set; }
@@ -41,12 +42,21 @@ namespace PugTools {
 
   internal static class BuildAssetComparer {
     internal static List<BuildFileDifference> Compare(Assets currentAssets,
-                                                       Assets previousAssets) {
-      Dictionary<String, BuildFileRecord> current = BuildSnapshot(currentAssets);
-      Dictionary<String, BuildFileRecord> previous = BuildSnapshot(previousAssets);
-      List<BuildFileDifference> differences = new List<BuildFileDifference>();
+                                                       Assets previousAssets,
+                                                       Boolean includeUnchanged = false,
+                                                       Func<Boolean> shouldCancel = null) {
+      Dictionary<UInt64, BuildFileRecord> current = BuildSnapshot(currentAssets, shouldCancel);
+      ThrowIfCancelled(shouldCancel);
+      Dictionary<UInt64, BuildFileRecord> previous = BuildSnapshot(previousAssets, shouldCancel);
+      // When Unchanged is requested the result is usually close to the complete build. Reserve
+      // the current-build size up front to avoid repeatedly growing a million-entry list.
+      List<BuildFileDifference> differences = includeUnchanged
+        ? new List<BuildFileDifference>(current.Count)
+        : new List<BuildFileDifference>();
 
-      foreach (KeyValuePair<String, BuildFileRecord> pair in current) {
+      Int32 cancellationCounter = 0;
+      foreach (KeyValuePair<UInt64, BuildFileRecord> pair in current) {
+        if ((cancellationCounter++ & 1023) == 0) ThrowIfCancelled(shouldCancel);
         if (!previous.TryGetValue(pair.Key, out BuildFileRecord oldRecord)) {
           differences.Add(new BuildFileDifference {
             State = BuildFileState.New,
@@ -62,10 +72,18 @@ namespace PugTools {
             Current = pair.Value,
             Previous = oldRecord
           });
+        } else if (includeUnchanged) {
+          differences.Add(new BuildFileDifference {
+            State = BuildFileState.Unchanged,
+            Current = pair.Value,
+            Previous = oldRecord
+          });
         }
       }
 
-      foreach (KeyValuePair<String, BuildFileRecord> pair in previous) {
+      cancellationCounter = 0;
+      foreach (KeyValuePair<UInt64, BuildFileRecord> pair in previous) {
+        if ((cancellationCounter++ & 1023) == 0) ThrowIfCancelled(shouldCancel);
         if (!current.ContainsKey(pair.Key)) {
           differences.Add(new BuildFileDifference {
             State = BuildFileState.Removed,
@@ -74,10 +92,19 @@ namespace PugTools {
         }
       }
 
+      cancellationCounter = 0;
       foreach (BuildFileDifference difference in differences) {
-        HydrateUnknownExtension(difference.Current);
-        HydrateUnknownExtension(difference.Previous);
+        if ((cancellationCounter++ & 1023) == 0) ThrowIfCancelled(shouldCancel);
+        // Only the version shown by the browser needs an extension guess. Hydrating both sides
+        // doubles header reads for Changed/Unchanged unknown files without changing the UI.
+        HydrateUnknownExtension(difference.DisplayRecord);
       }
+
+      // PreparedTree sorts the browser tree later. Sorting every unchanged file here as well can
+      // cost seconds and substantial temporary memory on a full SWTOR build, so keep the large
+      // include-Unchanged result in snapshot order. Preserve the old deterministic ordering for
+      // callers that ask for differences only.
+      if (includeUnchanged) return differences;
 
       return differences
         .OrderBy(x => x.State)
@@ -85,29 +112,45 @@ namespace PugTools {
         .ToList();
     }
 
-    private static Dictionary<String, BuildFileRecord> BuildSnapshot(Assets assets) {
-      Dictionary<String, BuildFileRecord> raw =
-        new Dictionary<String, BuildFileRecord>(StringComparer.OrdinalIgnoreCase);
+    private static void ThrowIfCancelled(Func<Boolean> shouldCancel) {
+      if (shouldCancel != null && shouldCancel()) throw new OperationCanceledException();
+    }
 
-      if (assets == null) return raw;
+    private static Dictionary<UInt64, BuildFileRecord> BuildSnapshot(Assets assets, Func<Boolean> shouldCancel) {
+      Dictionary<UInt64, BuildFileRecord> snapshot =
+        new Dictionary<UInt64, BuildFileRecord>();
+
+      if (assets == null) return snapshot;
 
       foreach (Library lib in assets.Libraries) {
+        ThrowIfCancelled(shouldCancel);
         if (!lib.Loaded) lib.Load();
+        ThrowIfCancelled(shouldCancel);
+
+        // A file can occur in several TORs inside one logical Library. Select the effective
+        // physical copy for this library first, then merge it into the build-wide snapshot.
+        // The build identity deliberately does NOT include the library name: BioWare can move
+        // an unchanged path/hash between TOR/library groups from one patch to the next. Treating
+        // "library:hash" as the identity made such moves look like one Removed + one New file.
+        var libraryFiles = new Dictionary<UInt64, BuildFileRecord>();
 
         foreach (KeyValuePair<Int32, Archive> archive in lib.Archives) {
+          ThrowIfCancelled(shouldCancel);
+          Int32 fileCounter = 0;
           foreach (TorArchive.File file in archive.Value.EnumerateFiles()) {
+            if ((fileCounter++ & 2047) == 0) ThrowIfCancelled(shouldCancel);
             UInt32 ph = file.FileInfo.PrimaryHash;
             UInt32 sh = file.FileInfo.SecondaryHash;
-            String identity = lib.Name + ":" + ph.ToString("X8") + sh.ToString("X8");
+            UInt64 identity = ((UInt64)ph << 32) | sh;
 
             // The same file hash can exist in more than one TOR in a library.
             // The highest archive number is the newest effective copy.
-            if (raw.TryGetValue(identity, out BuildFileRecord existing)
+            if (libraryFiles.TryGetValue(identity, out BuildFileRecord existing)
                 && existing.ArchiveIndex >= archive.Key) {
               continue;
             }
 
-            raw[identity] = new BuildFileRecord {
+            libraryFiles[identity] = new BuildFileRecord {
               Identity = identity,
               ArchiveIndex = archive.Key,
               Library = lib,
@@ -115,26 +158,31 @@ namespace PugTools {
             };
           }
         }
+        // For named files, ask this Library's metadata table for the effective archive copy.
+        // This is more precise than assuming the numerically highest TOR always wins.
+        Int32 recordCounter = 0;
+        foreach (BuildFileRecord record in libraryFiles.Values) {
+          if ((recordCounter++ & 2047) == 0) ThrowIfCancelled(shouldCancel);
+          if (record.HashInfo != null && record.HashInfo.IsNamed) {
+            String path = record.HashInfo.Directory + "/" + record.HashInfo.FileName;
+            TorArchive.File effective = record.Library?.FindFile(path);
+            if (effective != null && !Object.ReferenceEquals(effective, record.HashInfo.File)) {
+              record.HashInfo = new HashFileInfo(
+                effective.FileInfo.PrimaryHash, effective.FileInfo.SecondaryHash,
+                effective, false, false
+              );
+            }
+          }
+
+          if (IsIgnored(record.HashInfo)) continue;
+
+          // Assets.FindFile() also walks Libraries in order and returns the first match. Mirroring
+          // that precedence here prevents duplicate physical copies from being counted twice.
+          if (!snapshot.ContainsKey(record.Identity)) snapshot.Add(record.Identity, record);
+        }
       }
 
-      // For named files, ask the Assets metadata table for the effective archive copy.
-      // This is more precise than assuming the numerically highest TOR always wins.
-      foreach (BuildFileRecord record in raw.Values) {
-        if (record.HashInfo == null || !record.HashInfo.IsNamed) continue;
-
-        String path = record.HashInfo.Directory + "/" + record.HashInfo.FileName;
-        TorArchive.File effective = record.Library?.FindFile(path);
-        if (effective == null || Object.ReferenceEquals(effective, record.HashInfo.File)) continue;
-
-        record.HashInfo = new HashFileInfo(
-          effective.FileInfo.PrimaryHash, effective.FileInfo.SecondaryHash, effective, false, false
-        );
-      }
-
-      // Archive housekeeping files are not useful in a build comparison.
-      return raw
-        .Where(x => !IsIgnored(x.Value.HashInfo))
-        .ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase);
+      return snapshot;
     }
 
     private static void HydrateUnknownExtension(BuildFileRecord record) {

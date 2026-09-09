@@ -15,11 +15,16 @@ namespace PugTools {
     delegate void SetTextCallback(String text);
     delegate void SetText2Callback(String text);
 
-    // Should probably replicate this for the model and node viewers.
-    Form AssetBrowser = null;
-    Form ModelBrowser = null;
-    Form NodeBrowser = null;
-    Form WorldBrowser = null;
+    private static Boolean HasOpenDataBrowserWindows() {
+      return Application.OpenForms.Cast<Form>().Any(form =>
+        form != null
+        && !form.IsDisposed
+        && (form is global::PugTools.AssetBrowser
+            || form is global::PugTools.AssetBrowserFileTable
+            || form is global::PugTools.ModelBrowser
+            || form is global::PugTools.NodeBrowser
+            || form is global::PugTools.WorldBrowser));
+    }
 
     private void AddToList1(String text) {
       if (listBox1.InvokeRequired) {
@@ -41,31 +46,26 @@ namespace PugTools {
       }
     }
     private void BtnAssetBrowser_Click(Object sender, EventArgs e) {
-      if (AssetBrowser == null || AssetBrowser.IsDisposed) {
-        if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
-          MessageBox.Show(
-            "Please select a Previous Game Path before opening the browser in compare mode.",
-            "Compare Builds",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Warning
-          );
-          return;
-        }
-
-        Boolean usePTS = chkAssetsUsePTS.Checked;
-        AssetBrowser = new AssetBrowser(
-          txtAssetsPath.Text,
-          usePTS,
-          txtPrevAssetsPath.Text,
-          chkPrevAssetsUsePTS.Checked,
-          chkBuildCompare.Checked
+      if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
+        MessageBox.Show(
+          "Please select a Previous Game Path before opening the browser in compare mode.",
+          "Compare Builds",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Warning
         );
-        AssetBrowser.FormClosed += OnAssetBrowserClosed;
-        AssetBrowser.Show();
-        AssetBrowser.Focus();
-      } else {
-        AssetBrowser.Focus();
+        return;
       }
+
+      Boolean usePTS = chkAssetsUsePTS.Checked;
+      Form browser = new AssetBrowser(
+        txtAssetsPath.Text,
+        usePTS,
+        txtPrevAssetsPath.Text,
+        chkPrevAssetsUsePTS.Checked,
+        chkBuildCompare.Checked
+      );
+      browser.Show();
+      browser.Focus();
     }
     private void BtnAssetsPath_Click(Object sender, EventArgs e) {
       FolderBrowserDialog fbd = new FolderBrowserDialog {
@@ -339,60 +339,49 @@ namespace PugTools {
       EnableButtons();
     }
     private void BtnModelBrowser_Click(Object sender, EventArgs e) {
-      if (ModelBrowser == null || ModelBrowser.IsDisposed) {
-        if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
-          MessageBox.Show(
-            "Please select a Previous Game Path before opening the browser in compare mode.",
-            "Compare Builds",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Warning
-          );
-          return;
-        }
-
-        Boolean usePTS = chkAssetsUsePTS.Checked;
-        ModelBrowser =
-          new ModelBrowser(
-            txtAssetsPath.Text,
-            usePTS,
-            txtPrevAssetsPath.Text,
-            chkPrevAssetsUsePTS.Checked,
-            chkBuildCompare.Checked
-          );
-        ModelBrowser.FormClosed += OnModelBrowserClosed;
-        ModelBrowser.Show();
-        ModelBrowser.Focus();
-      } else {
-        ModelBrowser.Focus();
+      if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
+        MessageBox.Show(
+          "Please select a Previous Game Path before opening the browser in compare mode.",
+          "Compare Builds",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Warning
+        );
+        return;
       }
+
+      Boolean usePTS = chkAssetsUsePTS.Checked;
+      Form browser = new ModelBrowser(
+        txtAssetsPath.Text,
+        usePTS,
+        txtPrevAssetsPath.Text,
+        chkPrevAssetsUsePTS.Checked,
+        chkBuildCompare.Checked
+      );
+      browser.Show();
+      browser.Focus();
     }
     private void BtnNodeBrowser_Click(Object sender, EventArgs e) {
-      if (NodeBrowser == null || NodeBrowser.IsDisposed) {
-        if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
-          MessageBox.Show(
-            "Please select a Previous Game Path before opening the browser in compare mode.",
-            "Compare Builds",
-            MessageBoxButtons.OK,
-            MessageBoxIcon.Warning
-          );
-          return;
-        }
-
-        Boolean usePTS = chkAssetsUsePTS.Checked;
-        NodeBrowser = new NodeBrowser(
-          txtAssetsPath.Text,
-          usePTS,
-          txtExtractPath.Text,
-          txtPrevAssetsPath.Text,
-          chkPrevAssetsUsePTS.Checked,
-          chkBuildCompare.Checked
+      if (chkBuildCompare.Checked && String.IsNullOrWhiteSpace(txtPrevAssetsPath.Text)) {
+        MessageBox.Show(
+          "Please select a Previous Game Path before opening the browser in compare mode.",
+          "Compare Builds",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Warning
         );
-        System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
-        NodeBrowser.Show();
-        NodeBrowser.Focus();
-      } else {
-        NodeBrowser.Focus();
+        return;
       }
+
+      Boolean usePTS = chkAssetsUsePTS.Checked;
+      Form browser = new NodeBrowser(
+        txtAssetsPath.Text,
+        usePTS,
+        txtExtractPath.Text,
+        txtPrevAssetsPath.Text,
+        chkPrevAssetsUsePTS.Checked,
+        chkBuildCompare.Checked
+      );
+      browser.Show();
+      browser.Focus();
     }
     private void BtnPrevAssetsPath_Click(Object sender, EventArgs e) {
       FolderBrowserDialog fbd = new FolderBrowserDialog {
@@ -433,6 +422,19 @@ namespace PugTools {
       }
     }
     private async void BtnUnloadAllData_Click(Object sender, EventArgs e) {
+      // Open browsers deliberately share Assets/DOM/hash caches. Disposing those process-wide
+      // objects out from underneath a browser produces use-after-dispose/null races. Make an
+      // explicit unload safe and predictable instead of allowing one window to kill the others.
+      if (HasOpenDataBrowserWindows()) {
+        MessageBox.Show(
+          "Close the open Asset / Model / Node / World Browser windows before unloading shared data.",
+          "Shared SWTOR data is in use",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Information
+        );
+        return;
+      }
+
       DisableButtons();
       Clearlist();
       AddToList1("All Assets & DOM - Clearing");
@@ -441,27 +443,21 @@ namespace PugTools {
       EnableButtons();
     }
     private void BtnWorldBrowser_Click(Object sender, EventArgs e) {
-      if (WorldBrowser == null || WorldBrowser.IsDisposed) {
-        Boolean usePTS = chkAssetsUsePTS.Checked;
-        WorldBrowser = new WorldBrowser(txtAssetsPath.Text, usePTS);
-        System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
-        WorldBrowser.Show();
-        WorldBrowser.Focus();
-      } else {
-        WorldBrowser.Focus();
-      }
+      Boolean usePTS = chkAssetsUsePTS.Checked;
+      Form browser = new PugTools.WorldBrowser(txtAssetsPath.Text, usePTS);
+      browser.Show();
+      browser.Focus();
     }
     private void CbxExtractFormat_Changed(Object sender, EventArgs e) {
       s_outputTypeName = cbxExtractFormat.SelectedItem.ToString();
     }
     private void ChkBuildCompare_Changed(Object sender, EventArgs e) {
       if (chkBuildCompare.Checked && s_loaded && PreviousDom == null) {
-        DisableButtons();
-        Clearlist();
-        AddToList1("All Assets & DOM - Clearing");
-        UnloadAll();
-        AddToList1("All Assets & DOM - Cleared");
-        EnableButtons();
+        // Do not dispose the current shared DOM just because compare mode was enabled while
+        // browser windows are open. Mark the Tools-side load state stale; the next LoadData()
+        // reuses the already loaded current Assets/DOM and adds the previous build alongside it.
+        s_loaded = false;
+        AddToList1("Compare mode enabled; previous build will be loaded alongside current data.");
       }
     }
     private void ChkCrossLinkDom_Changed(Object sender, EventArgs e) {
@@ -469,6 +465,18 @@ namespace PugTools {
       Config.Save();
     }
     private async void ChkPrevUsePTSAssets_Changed(Object sender, EventArgs e) {
+      Boolean previousModeChanged = chkPrevAssetsUsePTS.Checked != Config.PrevAssetsUsePTS;
+      if (previousModeChanged && HasOpenDataBrowserWindows()) {
+        MessageBox.Show(
+          "Close the open browser windows before changing the Previous Build LIVE/PTS source.",
+          "Shared SWTOR data is in use",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Information
+        );
+        chkPrevAssetsUsePTS.Checked = Config.PrevAssetsUsePTS;
+        return;
+      }
+
       Config.PrevAssetsUsePTS = chkPrevAssetsUsePTS.Checked;
       Config.Save();
 
@@ -486,7 +494,7 @@ namespace PugTools {
           btnPrevAssetsPath.Image = Properties.Resources.ShieldRed;
       }
 
-      if (s_loaded) {
+      if (s_loaded && previousModeChanged) {
         DisableButtons();
         Clearlist();
         AddToList1("Previous Assets & DOM - Clearing");
@@ -500,6 +508,18 @@ namespace PugTools {
       s_removeUnchanged = chkRemoveElements.CheckState == CheckState.Checked;
     }
     private async void ChkUsePTSAssets_Changed(Object sender, EventArgs e) {
+      Boolean modeChanged = chkAssetsUsePTS.Checked != Config.AssetsUsePTS;
+      if (modeChanged && HasOpenDataBrowserWindows()) {
+        MessageBox.Show(
+          "Close the open browser windows before changing the Current Build LIVE/PTS source.",
+          "Shared SWTOR data is in use",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Information
+        );
+        chkAssetsUsePTS.Checked = Config.AssetsUsePTS;
+        return;
+      }
+
       Config.AssetsUsePTS = chkAssetsUsePTS.Checked;
       Config.Save();
 
@@ -517,7 +537,7 @@ namespace PugTools {
           btnAssetsPath.Image = Properties.Resources.ShieldRed;
       }
 
-      if (s_loaded) {
+      if (s_loaded && modeChanged) {
         DisableButtons();
         Clearlist();
         AddToList1("Current Assets & DOM - Clearing");
@@ -646,18 +666,6 @@ namespace PugTools {
 
       return ret;
     }
-    public void OnAssetBrowserClosed(Object sender, FormClosedEventArgs e) {
-      AssetBrowser = null;
-      System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
-        System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
-      GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced);
-    }
-    private void OnModelBrowserClosed(Object sender, FormClosedEventArgs e) {
-      ModelBrowser = null;
-      System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
-        System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
-      GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced);
-    }
     private void ProgressUpdate(Int32 progress, Int32 count) {
       if (progressBar1.InvokeRequired) {
         ProgressCallback d = new ProgressCallback(ProgressUpdate);
@@ -674,6 +682,19 @@ namespace PugTools {
       String path = txtAssetsPath.Text;
 
       if (path.Length > 0 && !path.EndsWith("\\")) path += "\\";
+
+      String configuredPath = Config.AssetsPath ?? String.Empty;
+      Boolean pathChanged = !String.Equals(path, configuredPath, StringComparison.OrdinalIgnoreCase);
+      if (pathChanged && HasOpenDataBrowserWindows()) {
+        MessageBox.Show(
+          "Close the open browser windows before changing the Current Game Path.",
+          "Shared SWTOR data is in use",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Information
+        );
+        txtAssetsPath.Text = configuredPath;
+        return;
+      }
 
       Config.AssetsPath = path;
       Config.Save();
@@ -694,7 +715,7 @@ namespace PugTools {
         btnAssetsPath.Image = Properties.Resources.ShieldGreen;
       }
 
-      if (s_loaded) {
+      if (s_loaded && pathChanged) {
         DisableButtons();
         Clearlist();
         AddToList1("Current Assets & DOM - Clearing");
@@ -719,6 +740,19 @@ namespace PugTools {
 
       if (path.Length > 0 && !path.EndsWith("\\")) path += "\\";
 
+      String configuredPreviousPath = Config.PrevAssetsPath ?? String.Empty;
+      Boolean previousPathChanged = !String.Equals(path, configuredPreviousPath, StringComparison.OrdinalIgnoreCase);
+      if (previousPathChanged && HasOpenDataBrowserWindows()) {
+        MessageBox.Show(
+          "Close the open browser windows before changing the Previous Game Path.",
+          "Shared SWTOR data is in use",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Information
+        );
+        txtPrevAssetsPath.Text = configuredPreviousPath;
+        return;
+      }
+
       Boolean hasLive = PathContainsLiveAssets(path);
       Boolean hasPTS = PathContainsPTSAssets(path);
 
@@ -738,7 +772,7 @@ namespace PugTools {
       Config.PrevAssetsPath = path;
       Config.Save();
 
-      if (s_loaded) {
+      if (s_loaded && previousPathChanged) {
         DisableButtons();
         Clearlist();
         AddToList1("Previous Assets & DOM - Clearing");

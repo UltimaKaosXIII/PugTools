@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
@@ -25,6 +26,33 @@ namespace nsHashDictionary {
       Int32 length = m_offsets[index + 1] - start;
       if (start < 0 || length <= 0 || start + length > m_pool.Length) return String.Empty;
       return Encoding.UTF8.GetString(m_pool, start, length);
+    }
+
+    /// <summary>
+    /// Finds a contiguous range in the sorted PFD1 filename pool without materialising the whole pool.
+    /// PFD1 saves names with StringComparer.Ordinal, so a normal lower-bound search can jump directly to
+    /// a resource-path prefix and only decode O(log n + matches) strings. SWTOR resource paths in the
+    /// dictionary are normalized to lower-case; callers should pass a normalized lower-case prefix.
+    /// </summary>
+    internal IReadOnlyList<String> FindByPrefix(String prefix) {
+      var result = new System.Collections.Generic.List<String>();
+      if (String.IsNullOrEmpty(prefix) || Count == 0) return result;
+
+      Int32 low = 0;
+      Int32 high = Count;
+      while (low < high) {
+        Int32 mid = low + ((high - low) >> 1);
+        String value = GetName(mid);
+        if (StringComparer.Ordinal.Compare(value, prefix) < 0) low = mid + 1;
+        else high = mid;
+      }
+
+      for (Int32 i = low; i < Count; i++) {
+        String value = GetName(i);
+        if (!value.StartsWith(prefix, StringComparison.Ordinal)) break;
+        result.Add(value);
+      }
+      return result;
     }
 
 

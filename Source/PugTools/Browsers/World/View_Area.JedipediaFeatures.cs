@@ -219,6 +219,11 @@ namespace PugTools {
     private readonly List<LineGpu> utilityLightFallbackGpu = new List<LineGpu>();
     private readonly List<LineGpu> utilitySeedFallbackGpu = new List<LineGpu>();
     private readonly List<LineGpu> utilityOtherGpu = new List<LineGpu>();
+    private readonly List<LineGpu> gameplayTargetGpu = new List<LineGpu>();
+    private readonly object gameplayTargetLock = new object();
+    private Vector3? gameplayTargetRequestedPosition;
+    private Vector3? gameplayTargetGpuPosition;
+    private bool gameplayTargetDirty;
 
     private SpriteRenderer npcTextSprite;
     private FontCache npcTextFont;
@@ -303,8 +308,15 @@ namespace PugTools {
       double fps = worldRenderStatsFrames * 1000.0 / Math.Max(1L, elapsedMs);
       int staticHidden = objectOcclusionUseThisFrame ? objectOcclusionHidden.Count : 0;
       int dynamicHidden = objectOcclusionUseThisFrame ? dynamicOcclusionHidden.Count : 0;
+      int streamRooms = activeStreamRoomNames.Count;
+      int streamAssets = activeStreamAssetIds.Count;
+      int decodedModels = streamedWorldModels.Count;
+      int decodeQueue = modelStreamer?.OutstandingCount ?? 0;
+      int gpuQueue = pendingModelGpuUploads.Count;
+      int materialQueue = pendingStreamedModelMaterials.Count;
       worldRenderStatsSnapshot = String.Format(System.Globalization.CultureInfo.InvariantCulture,
-        "FPS: {0:0.0}   Occ S/D: {1}/{2}", fps, staticHidden, dynamicHidden);
+        "FPS: {0:0.0}   Occ S/D: {1}/{2}   Stream R/A/D: {3}/{4}/{5}   Q D/G/M: {6}/{7}/{8}",
+        fps, staticHidden, dynamicHidden, streamRooms, streamAssets, decodedModels, decodeQueue, gpuQueue, materialQueue);
       worldRenderStatsFrames = 0;
       worldRenderStatsClock.Restart();
     }
@@ -585,6 +597,7 @@ namespace PugTools {
     private void BuildJedipediaOverlayResources() {
       DisposeLines(utilityPathGpu); DisposeLines(utilityMapPathGpu); DisposeLines(utilityConnectionGpu); DisposeLines(utilityVolumeGpu); DisposeLines(phaseGatewayGpu); DisposeLines(phaseGatewayPlaneGpu);
       DisposeLines(utilitySpawnerFallbackGpu); DisposeLines(utilityCoverFallbackGpu); DisposeLines(utilityLightFallbackGpu); DisposeLines(utilitySeedFallbackGpu); DisposeLines(utilityOtherGpu);
+      DisposeLines(gameplayTargetGpu); gameplayTargetGpuPosition = null;
       utilityRenderEntries.Clear();
       phaseRegionTriggers.Clear();
       if (area == null) return;
@@ -699,7 +712,12 @@ namespace PugTools {
       if (ext == "spn_c" && path.IndexOf("spn/test/path/seed_point", StringComparison.OrdinalIgnoreCase) >= 0) return "spn_seed";
       if (ext == "fol") return "spn_mov";
       if (ext == "spn_c" && path.StartsWith("enc", StringComparison.OrdinalIgnoreCase)) return "spn_enc";
-      return ext;
+      switch (ext) {
+        case "prt": case "fxp": case "zzp": case "fla": case "ext": case "wws": case "amk":
+        case "bil": case "mir": case "sfq": case "box": case "cdr": case "phj": case "bon": case "rbd":
+        case "cam": case "spn_activator": return "pedestal";
+        default: return ext;
+      }
     }
 
     private static byte UtilityCategory(string ext, string path) {
@@ -834,6 +852,65 @@ namespace PugTools {
     }
 
     private static void DisposeLines(List<LineGpu> lines) { foreach (LineGpu line in lines) line?.Dispose(); lines.Clear(); }
+
+    public void SetGameplayMapNoteHighlight(AreaMapNote note) {
+      lock (gameplayTargetLock) {
+        gameplayTargetRequestedPosition = note?.Position;
+        gameplayTargetDirty = true;
+      }
+    }
+
+    public void ClearGameplayMapNoteHighlight() {
+      lock (gameplayTargetLock) {
+        gameplayTargetRequestedPosition = null;
+        gameplayTargetDirty = true;
+      }
+    }
+
+    private void DrawGameplayMapNoteHighlight(Matrix vp, WorldRenderSettings s) {
+      if (s == null || s.Mode == WorldRenderMode.Heightmap) return;
+      Vector3? requested = null;
+      bool rebuild = false;
+      lock (gameplayTargetLock) {
+        if (gameplayTargetDirty) {
+          requested = gameplayTargetRequestedPosition;
+          gameplayTargetDirty = false;
+          rebuild = true;
+        }
+      }
+      if (rebuild) {
+        DisposeLines(gameplayTargetGpu);
+        gameplayTargetGpuPosition = requested;
+        if (requested.HasValue && Device != null) {
+          List<Vector3> points = BuildGameplayTargetMarker(requested.Value);
+          if (points.Count >= 2) gameplayTargetGpu.Add(BuildLine(points, new Vector4(1f, .22f, .90f, 1f)));
+        }
+      }
+      if (gameplayTargetGpu.Count == 0 || !gameplayTargetGpuPosition.HasValue) return;
+      DrawLines(gameplayTargetGpu, vp, s.Mode == WorldRenderMode.Map ? float.MaxValue : camera.FarZ);
+    }
+
+    private static List<Vector3> BuildGameplayTargetMarker(Vector3 center) {
+      const int segments = 24;
+      const float radius = .48f;
+      float baseY = center.Y + .10f;
+      float topY = center.Y + 2.8f;
+      List<Vector3> points = new List<Vector3>(segments * 4 + 10);
+      for (int i = 0; i < segments; i++) {
+        float a0 = (float)(Math.PI * 2.0 * i / segments);
+        float a1 = (float)(Math.PI * 2.0 * (i + 1) / segments);
+        Vector3 b0 = new Vector3(center.X + (float)Math.Cos(a0) * radius, baseY, center.Z + (float)Math.Sin(a0) * radius);
+        Vector3 b1 = new Vector3(center.X + (float)Math.Cos(a1) * radius, baseY, center.Z + (float)Math.Sin(a1) * radius);
+        points.Add(b0); points.Add(b1);
+      }
+      // A tall diamond/cross remains visible from normal walking-camera angles, while the ring is useful on M-map.
+      points.Add(new Vector3(center.X - radius, topY, center.Z)); points.Add(new Vector3(center.X, topY + .45f, center.Z));
+      points.Add(new Vector3(center.X, topY + .45f, center.Z)); points.Add(new Vector3(center.X + radius, topY, center.Z));
+      points.Add(new Vector3(center.X, topY, center.Z - radius)); points.Add(new Vector3(center.X, topY + .45f, center.Z));
+      points.Add(new Vector3(center.X, topY + .45f, center.Z)); points.Add(new Vector3(center.X, topY, center.Z + radius));
+      points.Add(new Vector3(center.X, baseY, center.Z)); points.Add(new Vector3(center.X, topY + .45f, center.Z));
+      return points;
+    }
 
     private void DrawJedipediaUtilities(Matrix vp, HashSet<string> visible, WorldRenderSettings s) {
       if (s == null) return;
@@ -3168,6 +3245,8 @@ namespace PugTools {
       lock (pinnedVolumeGpu) { DisposeLines(pinnedVolumeGpu); pinnedVolumeGpuByKey.Clear(); pinnedVolumePointsByKey.Clear(); }
       DisposeLines(phaseGatewayGpu); DisposeLines(phaseGatewayPlaneGpu);
       DisposeLines(utilitySpawnerFallbackGpu); DisposeLines(utilityCoverFallbackGpu); DisposeLines(utilityLightFallbackGpu); DisposeLines(utilitySeedFallbackGpu); DisposeLines(utilityOtherGpu);
+      DisposeLines(gameplayTargetGpu); gameplayTargetGpuPosition = null;
+      lock (gameplayTargetLock) { gameplayTargetRequestedPosition = null; gameplayTargetDirty = false; }
       utilityRenderEntries.Clear();
       phaseRegionTriggers.Clear();
       currentPhaseName = implicitPhaseName ?? String.Empty;

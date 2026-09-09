@@ -166,16 +166,16 @@ namespace PugTools {
       _outputList = null;
       _rootList = null;
       _searchNodes = null;
+      _nodeSearchIndex = Array.Empty<NodeSearchEntry>();
+      _fullNodeTree = null;
       if (_fieldDiffForm != null && !_fieldDiffForm.IsDisposed) _fieldDiffForm.Dispose();
       _fieldDiffForm = null;
-
-      Dispose(true);
-
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
     }
     private void NodeBrowserFormClosing(Object sender, FormClosingEventArgs e) {
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.LowLatency;
       _closing = true;
+      try { _nodeTreeFilterCancellation?.Cancel(); } catch { }
+      try { _nodeTreeFilterTimer?.Stop(); } catch { }
+      try { _nodePreviewRenderer?.StopRender(); } catch { }
     }
     private void NodeBrowserFormResize(Object sender, EventArgs e) {
       var treeSize =
@@ -189,8 +189,6 @@ namespace PugTools {
     #region Background Workers
     private void BackgroundWorker1Run(Object sender, DoWorkEventArgs e) {
       if (_closing) return;
-
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.LowLatency;
 
       _currentAssets = AssetHandler.Instance.GetCurrentAssets(_assetsLocation, _assetsUsePts);
       LocalizationResolver.Apply(_currentAssets, Config.Language);
@@ -206,7 +204,16 @@ namespace PugTools {
       if (_closing) return;
 
       if (e.Error != null) {
-        throw new Exception("Echter Fehler beim Laden: " + e.Error, e.Error);
+        ProgressBarHide();
+        LoadingSwirlHide();
+        StatusLabel1Text("Node Browser could not load the shared SWTOR data.");
+        MessageBox.Show(
+          e.Error.GetBaseException().Message,
+          "Node Browser",
+          MessageBoxButtons.OK,
+          MessageBoxIcon.Error
+        );
+        return;
       }
 
       _assetDict = new Dictionary<String, NodeAsset> {
@@ -248,6 +255,7 @@ namespace PugTools {
         Int32 nodesTotal = _nodeDict.Count;
 
         foreach (KeyValuePair<String, DomType> node in _nodeDict) {
+          if (_closing) return;
           GomObject obj = (GomObject)node.Value;
           String display = node.Key;
           String parent;
@@ -287,6 +295,7 @@ namespace PugTools {
         }
 
         foreach (String dir in nodeDirs) {
+          if (_closing) return;
           String[] temp = dir.Split('.');
           Int32 intLength = temp.Length;
 
@@ -298,6 +307,7 @@ namespace PugTools {
         }
 
         foreach (String dir in allDirs) {
+          if (_closing) return;
           String[] temp = dir.Split('.');
           String parentDir = String.Join(".", temp.Take(temp.Length - 1));
 
@@ -317,10 +327,12 @@ namespace PugTools {
       const String newRoot = "/root/new";
       const String changedRoot = "/root/changed";
       const String removedRoot = "/root/removed";
+      const String unchangedRoot = "/root/unchanged";
 
       Int32 newCount = 0;
       Int32 changedCount = 0;
       Int32 removedCount = 0;
+      Int32 unchangedCount = 0;
       HashSet<String> directoryIds = new HashSet<String>(StringComparer.Ordinal);
 
       HashSet<String> names = new HashSet<String>(StringComparer.Ordinal);
@@ -357,7 +369,14 @@ namespace PugTools {
           displayObject = current;
           categoryRoot = changedRoot;
           changedCount++;
+        } else if (current != null && previous != null) {
+          state = BuildFileState.Unchanged;
+          displayObject = current;
+          categoryRoot = unchangedRoot;
+          unchangedCount++;
         } else {
+          // NodeLookup is expected to contain GomObject values, but do not create a synthetic
+          // Unchanged leaf if either dictionary contains an unexpected non-object entry.
           done++;
           backgroundWorker2.ReportProgress(done * 100 / total);
           continue;
@@ -390,8 +409,12 @@ namespace PugTools {
       _assetDict[removedRoot] = new NodeAsset(
         removedRoot, rootId, "Removed Nodes (" + removedCount.ToString("N0") + ")", null
       );
+      _assetDict[unchangedRoot] = new NodeAsset(
+        unchangedRoot, rootId, "Unchanged Nodes (" + unchangedCount.ToString("N0") + ")", null
+      );
 
       foreach (String dirId in directoryIds.OrderBy(x => x, StringComparer.OrdinalIgnoreCase)) {
+        if (_closing) return;
         if (_assetDict.ContainsKey(dirId)) continue;
 
         Int32 slash = dirId.LastIndexOf('/');
@@ -399,7 +422,9 @@ namespace PugTools {
           ? changedRoot
           : dirId.StartsWith(newRoot + "/", StringComparison.OrdinalIgnoreCase)
             ? newRoot
-            : removedRoot;
+            : dirId.StartsWith(removedRoot + "/", StringComparison.OrdinalIgnoreCase)
+              ? removedRoot
+              : unchangedRoot;
         String logical = slash >= 0 ? dirId.Substring(slash + 1) : dirId;
         Int32 dot = logical.LastIndexOf('.');
         String display = dot >= 0 ? logical.Substring(dot + 1) : logical;
@@ -512,7 +537,8 @@ namespace PugTools {
       }
 
       _fullNodeTree = TreeViewFast.Controls.TreeViewFast.PrepareItems(
-        _assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, compare
+        _assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, compare,
+        () => _closing
       );
     }
     private void BackgroundWorker3Completed(Object sender, RunWorkerCompletedEventArgs e) {
@@ -537,13 +563,11 @@ namespace PugTools {
       ProgressBarHide();
       StatusLabel1Text(
         _compareNodes
-          ? "Comparison loaded. Showing New, Changed and Removed nodes only."
+          ? "Comparison loaded. Showing New, Changed, Removed and Unchanged nodes."
           : "Loading Complete."
       );
       ProgressBarValue(0);
       ProgressBarStyle(System.Windows.Forms.ProgressBarStyle.Continuous);
-
-      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.Interactive;
 
       LoadingSwirlHide();
       TreeViewGrid1Show();
@@ -1151,12 +1175,14 @@ namespace PugTools {
           filtered[id] = item;
       }
 
-      TreeViewFast.Controls.TreeViewFast.PreparedTree prepared = PrepareNodeFilterTree(filtered.Values);
+      TreeViewFast.Controls.TreeViewFast.PreparedTree prepared = PrepareNodeFilterTree(
+        filtered.Values, () => token.IsCancellationRequested || _closing
+      );
       return new NodeTreeFilterResult(filtered, displayMatches, totalMatches, truncated, prepared);
     }
 
     private static TreeViewFast.Controls.TreeViewFast.PreparedTree PrepareNodeFilterTree(
-      IEnumerable<NodeAsset> items
+      IEnumerable<NodeAsset> items, Func<Boolean> shouldCancel = null
     ) {
       String getId(NodeAsset x) => x.id;
       String getParentId(NodeAsset x) => x.parentId;
@@ -1170,7 +1196,7 @@ namespace PugTools {
         return String.Compare(x?.id, y?.id, StringComparison.Ordinal);
       }
       return TreeViewFast.Controls.TreeViewFast.PrepareItems(
-        items, getId, getParentId, getDisplayName, getImageIndex, compare
+        items, getId, getParentId, getDisplayName, getImageIndex, compare, shouldCancel
       );
     }
 
@@ -1269,7 +1295,7 @@ namespace PugTools {
         btnClearSearch.Enabled = false;
         StatusLabel1Text(
           _compareNodes
-            ? "Comparison loaded. Showing New, Changed and Removed nodes only."
+            ? "Comparison loaded. Showing New, Changed, Removed and Unchanged nodes."
             : "Showing all nodes."
         );
         return;

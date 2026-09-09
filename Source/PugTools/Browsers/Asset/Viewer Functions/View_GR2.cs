@@ -64,6 +64,7 @@ namespace PugTools {
     private Int32 _jbaFrame = -1;
     private Boolean _jbaPlaying;
     private Boolean _jbaLoop = true;
+    private Single _jbaPlaybackSpeed = 1.0F;
 
     // JBA playback is driven from an absolute high-resolution clock instead of
     // accumulating render-loop deltas. This mirrors Jedipedia's wall-clock
@@ -750,6 +751,7 @@ namespace PugTools {
       _jbaPlaybackStartTime = 0.0;
       _jbaBasePlaybackStartTime = 0.0;
       _jbaPlaying = animation != null;
+      _jbaPlaybackSpeed = 1.0F;
       Util.ReleaseCom(ref _jbaBoneBuffer);
       _jbaBoneVertexCount = 0;
       _jbaBoneBufferCapacity = 0;
@@ -846,6 +848,31 @@ namespace PugTools {
         _jbaPlaybackClock.Restart();
     }
 
+    internal void SetAnimationSpeed(Single speed) {
+      speed = Math.Max(0.05F, Math.Min(8.0F, speed));
+      Boolean running = _jbaPlaybackClock.IsRunning;
+      if (running) UpdateJbaPlaybackTime();
+      _jbaPlaybackSpeed = speed;
+      _jbaPlaybackStartTime = _jbaTime;
+      _jbaBasePlaybackStartTime = _jbaBaseTime;
+      if (_jbaPlaying && running) _jbaPlaybackClock.Restart();
+    }
+
+    internal void SeekAnimation(Single timeSeconds) {
+      if (_jbaAnimation == null) return;
+      Single length = Math.Max(0.0F, _jbaAnimation.Length);
+      _jbaTime = Math.Max(0.0F, Math.Min(length, timeSeconds));
+      if (_jbaBaseAnimation != null && _jbaBaseAnimation.Length > 0.0F)
+        _jbaBaseTime = _jbaTime % _jbaBaseAnimation.Length;
+      else
+        _jbaBaseTime = 0.0F;
+      _jbaFrame = -1;
+      _jbaPlaybackStartTime = _jbaTime;
+      _jbaBasePlaybackStartTime = _jbaBaseTime;
+      if (_jbaPlaying) _jbaPlaybackClock.Restart();
+      else _jbaPlaybackClock.Reset();
+    }
+
     private void UpdateJbaPlaybackTime() {
       if (!_jbaPlaying
           || _jbaAnimation == null
@@ -863,7 +890,7 @@ namespace PugTools {
         return;
       }
 
-      Double elapsed = _jbaPlaybackClock.Elapsed.TotalSeconds;
+      Double elapsed = _jbaPlaybackClock.Elapsed.TotalSeconds * _jbaPlaybackSpeed;
       Double time = _jbaPlaybackStartTime + elapsed;
       Double length = _jbaAnimation.Length;
 
@@ -2661,17 +2688,19 @@ namespace PugTools {
       _lastMousePos = mEvnt.Location;
     }
     protected override void OnMouseUp(Object sender, MouseEventArgs mEvnt) {
-      Window.Controls.Find(RenderPanelName, true).First().Capture = true;
+      Window.Controls.Find(RenderPanelName, true).First().Capture = false;
     }
+    internal void ZoomByWheelDelta(Int32 delta) {
+      Single notches = delta / 120.0F;
+      if (notches == 0.0F) return;
+
+      Single fraction = Util.IsKeyDown(Keys.ShiftKey) ? 0.025F : 0.12F;
+      _cameraZoomSpeed = Math.Max(_camera.Radius * fraction, 0.01F);
+      _camera.Zoom(-notches * _cameraZoomSpeed);
+    }
+
     protected override void OnMouseWheel(Object sender, MouseEventArgs mEvnt) {
-      Double zoom = -mEvnt.Delta * SystemInformation.MouseWheelScrollLines;
-
-      _cameraZoomSpeed = !Util.IsKeyDown(Keys.ShiftKey) ? 0.00025F : 0.000025F;
-
-      while (zoom != 0) {
-        _camera.Zoom(zoom < 0 ? -_cameraZoomSpeed : _cameraZoomSpeed);
-        zoom = Math.Truncate(zoom * 750) / 1000;
-      }
+      ZoomByWheelDelta(mEvnt.Delta);
     }
     public override void OnResize() {
       base.OnResize();

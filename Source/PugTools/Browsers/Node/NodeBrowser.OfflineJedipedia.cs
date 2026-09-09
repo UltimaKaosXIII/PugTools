@@ -14,6 +14,12 @@ namespace PugTools {
     private LinkLabel _nodeReferencesHeader;
     private ListView _nodeReferencesList;
     private Boolean _nodeReferencesExpanded;
+    private LinkLabel _nodeOutgoingHeader;
+    private ListView _nodeOutgoingList;
+    private Boolean _nodeOutgoingExpanded;
+    private Int32 _nodeOutgoingReferenceCount;
+    private Int32 _nodeOutgoingNodeCount;
+    private Boolean _nodeOutgoingTruncated;
     private Task<Dictionary<UInt64, List<NodeReverseReference>>> _nodeReferenceIndexTask;
     private Dictionary<UInt64, List<NodeReverseReference>> _nodeReverseReferenceIndex;
     private readonly Object _nodeReferenceIndexLock = new Object();
@@ -25,8 +31,49 @@ namespace PugTools {
       public String FieldPath { get; init; }
     }
 
+    private sealed class NodeOutgoingReference {
+      public String TargetFqn { get; init; }
+      public String TargetClass { get; init; }
+      public String FieldPath { get; init; }
+    }
+
     private void InitializeNodeReferenceUi() {
       if (_nodePreviewInfoPanel == null || _nodeReferencesHeader != null) return;
+
+      _nodeOutgoingHeader = new LinkLabel {
+        AutoSize = false,
+        Height = 22,
+        Text = "References to: 0",
+        TextAlign = ContentAlignment.MiddleLeft,
+        LinkBehavior = LinkBehavior.HoverUnderline,
+        Visible = true
+      };
+      _nodeOutgoingHeader.LinkClicked += delegate {
+        if (_nodeOutgoingList == null || _nodeOutgoingList.Items.Count == 0) return;
+        _nodeOutgoingExpanded = !_nodeOutgoingExpanded;
+        _nodeOutgoingList.Visible = _nodeOutgoingExpanded;
+        RenderNodeOutgoingHeader();
+        ResizeNodePreviewLayout();
+      };
+      _nodePreviewInfoPanel.Controls.Add(_nodeOutgoingHeader);
+
+      _nodeOutgoingList = new ListView {
+        FullRowSelect = true,
+        GridLines = true,
+        HideSelection = false,
+        MultiSelect = false,
+        View = View.Details,
+        Visible = false
+      };
+      _nodeOutgoingList.Columns.Add("Node", 310);
+      _nodeOutgoingList.Columns.Add("Base class", 135);
+      _nodeOutgoingList.Columns.Add("Field", 420);
+      _nodeOutgoingList.DoubleClick += delegate {
+        if (_nodeOutgoingList.SelectedItems.Count == 0) return;
+        String fqn = _nodeOutgoingList.SelectedItems[0].Tag as String;
+        if (!String.IsNullOrWhiteSpace(fqn)) NavigateToNodeName(fqn);
+      };
+      _nodePreviewInfoPanel.Controls.Add(_nodeOutgoingList);
 
       _nodeReferencesHeader = new LinkLabel {
         AutoSize = false,
@@ -73,6 +120,8 @@ namespace PugTools {
       Boolean hasIpp = _nodePreviewIppSetCheck != null && _nodePreviewIppSetCheck.Visible;
       Boolean hasConversation = _nodeConversationButton != null && _nodeConversationButton.Visible;
       Boolean hasIcon = _nodePreviewIcon != null && _nodePreviewIcon.Visible;
+      Boolean hasOutgoing = _nodeOutgoingHeader != null && _nodeOutgoingHeader.Visible;
+      Boolean expandedOutgoing = hasOutgoing && _nodeOutgoingList != null && _nodeOutgoingList.Visible;
       Boolean hasReferences = _nodeReferencesHeader != null && _nodeReferencesHeader.Visible;
       Boolean expandedReferences = hasReferences && _nodeReferencesList != null && _nodeReferencesList.Visible;
 
@@ -80,6 +129,8 @@ namespace PugTools {
       if (hasIpp) height = Math.Max(height, 106);
       if (hasConversation) height = Math.Max(height, 112);
       if (hasText) height += 82;
+      if (hasOutgoing) height += 26;
+      if (expandedOutgoing) height += 126;
       if (hasReferences) height += 26;
       if (expandedReferences) height += 126;
       return Math.Max(78, height);
@@ -92,6 +143,8 @@ namespace PugTools {
       Boolean hasConversation = _nodeConversationButton != null && _nodeConversationButton.Visible;
       Boolean hasText = _nodePreviewText != null && _nodePreviewText.Visible
         && !String.IsNullOrWhiteSpace(_nodePreviewText.Text);
+      Boolean hasOutgoing = _nodeOutgoingHeader != null && _nodeOutgoingHeader.Visible;
+      Boolean expandedOutgoing = hasOutgoing && _nodeOutgoingList != null && _nodeOutgoingList.Visible;
       Boolean hasReferences = _nodeReferencesHeader != null && _nodeReferencesHeader.Visible;
       Boolean expandedReferences = hasReferences && _nodeReferencesList != null && _nodeReferencesList.Visible;
 
@@ -106,7 +159,9 @@ namespace PugTools {
         top = 112;
       }
 
-      Int32 reserveReferences = hasReferences ? 26 : 0;
+      Int32 reserveReferences = hasOutgoing ? 26 : 0;
+      if (expandedOutgoing) reserveReferences += 126;
+      if (hasReferences) reserveReferences += 26;
       if (expandedReferences) reserveReferences += 126;
 
       if (hasText) {
@@ -114,6 +169,18 @@ namespace PugTools {
         _nodePreviewText.Location = new Point(8, top);
         _nodePreviewText.Size = new Size(width, Math.Max(48, available));
         top += _nodePreviewText.Height + 4;
+      }
+
+      if (hasOutgoing) {
+        _nodeOutgoingHeader.Location = new Point(8, top);
+        _nodeOutgoingHeader.Width = width;
+        top += 24;
+      }
+
+      if (expandedOutgoing) {
+        _nodeOutgoingList.Location = new Point(8, top);
+        _nodeOutgoingList.Size = new Size(width, 122);
+        top += 126;
       }
 
       if (hasReferences) {
@@ -131,6 +198,7 @@ namespace PugTools {
     private void UpdateNodeReferencePanel(GomObject gom) {
       if (_nodeReferencesHeader == null || gom == null) return;
       _nodeReferencesCurrentId = gom.Id;
+      RenderNodeOutgoingReferences(gom);
       _nodeReferencesList.Items.Clear();
       _nodeReferencesList.Visible = false;
       _nodeReferencesExpanded = false;
@@ -296,6 +364,128 @@ namespace PugTools {
       }
     }
 
+    private void RenderNodeOutgoingReferences(GomObject source) {
+      if (_nodeOutgoingHeader == null || _nodeOutgoingList == null || source == null || _currentDom == null) return;
+      List<NodeOutgoingReference> refs = new List<NodeOutgoingReference>();
+      HashSet<String> seen = new HashSet<String>(StringComparer.Ordinal);
+      Int32 budget = 5000;
+      try {
+        GomObjectData data = source.Data;
+        if (data?.Dictionary != null) {
+          foreach (KeyValuePair<String, Object> field in data.Dictionary) {
+            if (budget <= 0) break;
+            if (String.Equals(field.Key, "Script_Type", StringComparison.OrdinalIgnoreCase)) continue;
+            ScanOutgoingReferences(source.Id, field.Value, field.Key, _currentDom, refs, seen, ref budget, 0);
+          }
+        }
+      } catch { }
+
+      refs.Sort((a, b) => {
+        Int32 cmp = StringComparer.OrdinalIgnoreCase.Compare(a.TargetFqn, b.TargetFqn);
+        return cmp != 0 ? cmp : StringComparer.OrdinalIgnoreCase.Compare(a.FieldPath, b.FieldPath);
+      });
+
+      _nodeOutgoingList.BeginUpdate();
+      try {
+        _nodeOutgoingList.Items.Clear();
+        foreach (NodeOutgoingReference reference in refs.Take(1200)) {
+          ListViewItem item = new ListViewItem(reference.TargetFqn ?? String.Empty) { Tag = reference.TargetFqn };
+          item.SubItems.Add(reference.TargetClass ?? String.Empty);
+          item.SubItems.Add(reference.FieldPath ?? String.Empty);
+          _nodeOutgoingList.Items.Add(item);
+        }
+        if (refs.Count > 1200) {
+          ListViewItem more = new ListViewItem("… " + (refs.Count - 1200).ToString("N0") + " more references");
+          more.SubItems.Add(String.Empty);
+          more.SubItems.Add("Additional outgoing references omitted from the preview.");
+          _nodeOutgoingList.Items.Add(more);
+        }
+      } finally {
+        _nodeOutgoingList.EndUpdate();
+      }
+
+      _nodeOutgoingReferenceCount = refs.Count;
+      _nodeOutgoingTruncated = budget <= 0;
+      _nodeOutgoingNodeCount = refs.Select(x => x.TargetFqn).Where(x => !String.IsNullOrWhiteSpace(x))
+        .Distinct(StringComparer.OrdinalIgnoreCase).Count();
+      _nodeOutgoingExpanded = false;
+      _nodeOutgoingList.Visible = false;
+      RenderNodeOutgoingHeader();
+    }
+
+    private void RenderNodeOutgoingHeader() {
+      if (_nodeOutgoingHeader == null || _nodeOutgoingList == null) return;
+      Int32 count = _nodeOutgoingReferenceCount;
+      Int32 nodes = _nodeOutgoingNodeCount;
+      String marker = count > 0 ? (_nodeOutgoingExpanded ? " ▼" : " ▶") : String.Empty;
+      String prefix = _nodeOutgoingTruncated ? "at least " : String.Empty;
+      _nodeOutgoingHeader.Text = "References to (" + prefix + nodes.ToString("N0") + " nodes, " + prefix + count.ToString("N0") + " references)" + marker;
+      _nodeOutgoingHeader.Links.Clear();
+      if (count > 0) _nodeOutgoingHeader.Links.Add(0, _nodeOutgoingHeader.Text.Length);
+    }
+
+    private void ScanOutgoingReferences(UInt64 sourceId, Object value, String path, DataObjectModel dom,
+                                        List<NodeOutgoingReference> output, HashSet<String> seen,
+                                        ref Int32 budget, Int32 depth) {
+      if (value == null || budget-- <= 0 || depth > 8) return;
+
+      if (TryResolveReferencedNode(value, dom, out GomObject target)) {
+        if (target != null && target.Id != sourceId) {
+          String normalizedPath = String.IsNullOrWhiteSpace(path) ? "(unknown field)" : path;
+          String unique = target.Id + "\u001f" + normalizedPath;
+          if (seen.Add(unique)) {
+            output.Add(new NodeOutgoingReference {
+              TargetFqn = target.Name,
+              TargetClass = target.DomClass?.Name ?? "unknown",
+              FieldPath = normalizedPath
+            });
+          }
+        }
+        return;
+      }
+
+      if (value is GomObjectData objectData && objectData.Dictionary != null) {
+        foreach (KeyValuePair<String, Object> field in objectData.Dictionary) {
+          if (budget <= 0) break;
+          ScanOutgoingReferences(sourceId, field.Value, AppendReferencePath(path, field.Key), dom, output, seen, ref budget, depth + 1);
+        }
+        return;
+      }
+
+      if (value is IDictionary dictionary) {
+        foreach (DictionaryEntry entry in dictionary) {
+          if (budget <= 0) break;
+          String keyText = entry.Key?.ToString();
+          ScanOutgoingReferences(sourceId, entry.Key, AppendReferencePath(path, "[key]"), dom, output, seen, ref budget, depth + 1);
+          ScanOutgoingReferences(sourceId, entry.Value, AppendReferencePath(path, String.IsNullOrWhiteSpace(keyText) ? "[value]" : "[" + ShortReferenceKey(keyText) + "]"), dom, output, seen, ref budget, depth + 1);
+        }
+        return;
+      }
+
+      if (value is IEnumerable enumerable && value is not String && value is not Byte[]) {
+        Int32 i = 0;
+        foreach (Object child in enumerable) {
+          if (budget <= 0) break;
+          Object actualChild = child;
+          String childPath = AppendReferencePath(path, "[" + i + "]");
+          try {
+            Type type = child?.GetType();
+            System.Reflection.PropertyInfo keyProperty = type?.GetProperty("Key");
+            System.Reflection.PropertyInfo valueProperty = type?.GetProperty("Value");
+            if (valueProperty != null) {
+              Object key = keyProperty?.GetValue(child);
+              String keyText = key?.ToString();
+              ScanOutgoingReferences(sourceId, key, AppendReferencePath(path, "[key]"), dom, output, seen, ref budget, depth + 1);
+              actualChild = valueProperty.GetValue(child);
+              childPath = AppendReferencePath(path, String.IsNullOrWhiteSpace(keyText) ? "[" + i + "]" : "[" + ShortReferenceKey(keyText) + "]");
+            }
+          } catch { }
+          ScanOutgoingReferences(sourceId, actualChild, childPath, dom, output, seen, ref budget, depth + 1);
+          i++;
+        }
+      }
+    }
+
     private static String AppendReferencePath(String path, String child) {
       if (String.IsNullOrWhiteSpace(path)) return child ?? String.Empty;
       if (String.IsNullOrWhiteSpace(child)) return path;
@@ -429,6 +619,7 @@ namespace PugTools {
         _nodeReferenceIndexTask = null;
       }
       _nodeReferencesList?.Items.Clear();
+      _nodeOutgoingList?.Items.Clear();
     }
 
     private String BuildQuestJournalPreview(Quest quest) {

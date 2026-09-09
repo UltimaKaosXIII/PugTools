@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using Newtonsoft.Json;
 
@@ -194,10 +194,17 @@ namespace GomLib.Models {
   public class SubEffectFunctionParam {
     [JsonConverter(typeof(LongConverter))]
     public Int64 Key { get; set; }
+    /// <summary>
+    /// Human-readable ScriptEnum key from the GOM schema when available.  Older PugTools builds
+    /// discarded this and kept only <see cref="Key"/>, which made Jedipedia-style effect
+    /// inspection unnecessarily opaque.
+    /// </summary>
+    public String KeyName { get; set; }
     public Int32 Type { get; set; }
     public Object Value { get; set; }
-    public SubEffectFunctionParam(Int64 key, Int32 type, Object value) {
+    public SubEffectFunctionParam(Int64 key, Int32 type, Object value, String keyName = null) {
       Key = key;
+      KeyName = keyName;
       Type = type;
       Value = value;
     }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -239,19 +239,19 @@ namespace GomLib.ModelLoader {
       output.Params = new List<SubEffectFunctionParam>();
       Dictionary<object, object> boolParams = obj.ValueOrDefault<Dictionary<object, object>>("effBoolParams");
       foreach (KeyValuePair<object, object> kvp in boolParams) {
-        output.Params.Add(new SubEffectFunctionParam(((ScriptEnum)kvp.Key).Value, 1, (bool)kvp.Value));
+        output.Params.Add(MakeParam(kvp.Key, 1, (bool)kvp.Value));
       }
       Dictionary<object, object> stringParams = obj.ValueOrDefault<Dictionary<object, object>>("effStringParams");
       foreach (KeyValuePair<object, object> kvp in stringParams) {
-        output.Params.Add(new SubEffectFunctionParam(((ScriptEnum)kvp.Key).Value, 2, (string)kvp.Value));
+        output.Params.Add(MakeParam(kvp.Key, 2, (string)kvp.Value));
       }
       Dictionary<object, object> intParams = obj.ValueOrDefault<Dictionary<object, object>>("effIntParams");
       foreach (KeyValuePair<object, object> kvp in intParams) {
-        output.Params.Add(new SubEffectFunctionParam(((ScriptEnum)kvp.Key).Value, 3, (long)kvp.Value));
+        output.Params.Add(MakeParam(kvp.Key, 3, (long)kvp.Value));
       }
       Dictionary<object, object> floatParams = obj.ValueOrDefault<Dictionary<object, object>>("effFloatParams");
       foreach (KeyValuePair<object, object> kvp in floatParams) {
-        output.Params.Add(new SubEffectFunctionParam(((ScriptEnum)kvp.Key).Value, 4, (float)kvp.Value));
+        output.Params.Add(MakeParam(kvp.Key, 4, (float)kvp.Value));
       }
       Dictionary<object, object> functionTags = obj.ValueOrDefault<Dictionary<object, object>>("effFunctionTags");
       output.Tags = new List<long>();
@@ -261,7 +261,7 @@ namespace GomLib.ModelLoader {
       }
       Dictionary<object, object> timeParams = obj.ValueOrDefault<Dictionary<object, object>>("effTimeIntervalParams");
       foreach (KeyValuePair<object, object> kvp in timeParams) {
-        output.Params.Add(new SubEffectFunctionParam(((ScriptEnum)kvp.Key).Value, 5, (ulong)kvp.Value));
+        output.Params.Add(MakeParam(kvp.Key, 5, (ulong)kvp.Value));
       }
       Dictionary<object, object> floatListParams = obj.ValueOrDefault<Dictionary<object, object>>("effFloatListParams");
       foreach (KeyValuePair<object, object> kvp in floatListParams) {
@@ -269,7 +269,7 @@ namespace GomLib.ModelLoader {
         foreach (float entry in (List<object>)kvp.Value) {
           floatList.Add(entry);
         }
-        output.Params.Add(new SubEffectFunctionParam(((ScriptEnum)kvp.Key).Value, 6, floatList));
+        output.Params.Add(MakeParam(kvp.Key, 6, floatList));
       }
       Dictionary<object, object> intListParams = obj.ValueOrDefault<Dictionary<object, object>>("effIntListParams");
       foreach (KeyValuePair<object, object> kvp in intListParams) {
@@ -277,7 +277,7 @@ namespace GomLib.ModelLoader {
         foreach (long entry in (List<object>)kvp.Value) {
           intList.Add(entry);
         }
-        output.Params.Add(new SubEffectFunctionParam(((ScriptEnum)kvp.Key).Value, 7, intList));
+        output.Params.Add(MakeParam(kvp.Key, 7, intList));
       }
       Dictionary<object, object> idListParams = obj.ValueOrDefault<Dictionary<object, object>>("effIdListParams");
       if (idListParams != null) {
@@ -286,7 +286,7 @@ namespace GomLib.ModelLoader {
           foreach (ulong entry in (List<object>)kvp.Value) {
             idList.Add(entry);
           }
-          output.Params.Add(new SubEffectFunctionParam(((ScriptEnum)kvp.Key).Value, 8, idList));
+          output.Params.Add(MakeParam(kvp.Key, 8, idList));
         }
       }
       //TODO unknown: 4611686346551820000
@@ -302,6 +302,17 @@ namespace GomLib.ModelLoader {
       }
 
       return output;
+    }
+
+    private static SubEffectFunctionParam MakeParam(Object rawKey, Int32 type, Object value) {
+      ScriptEnum key = rawKey as ScriptEnum;
+      if (key == null) return new SubEffectFunctionParam(0, type, value);
+      String name = null;
+      try {
+        name = key.ToString();
+        if (String.IsNullOrWhiteSpace(name) || name.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) name = null;
+      } catch { }
+      return new SubEffectFunctionParam(key.Value, type, value, name);
     }
 
     public void LoadObject(GameObject loadMe, GomObject obj) {

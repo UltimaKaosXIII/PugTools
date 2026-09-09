@@ -42,7 +42,7 @@ namespace PugTools {
           0x53444953u => ParseScriptIdsList(br), // SIDS
           _ => throw new InvalidDataException("Unsupported .list magic 0x" + magic.ToString("X8", CultureInfo.InvariantCulture))
         },
-        _ => throw new NotSupportedException("No Jedipedia structured parser for ." + ext)
+        _ => throw new NotSupportedException("No structured parser for ." + ext)
       };
     }
 
