@@ -42,9 +42,26 @@ namespace PugTools {
             if (archive == null || String.IsNullOrWhiteSpace(archive.FileName)) continue;
             String archiveName = Path.GetFileNameWithoutExtension(archive.FileName);
 
+            Boolean foundArchiveSpecificNames = false;
             foreach (HashData hash in HashDictionaryInstance.Instance.Dictionary.EnumerateArchiveFiles(archiveName)) {
               String fqn = StringTableFqnFromResourcePath(hash?.FileName);
-              if (fqn != null) foundStringTables.Add(fqn);
+              if (fqn == null) continue;
+              foundStringTables.Add(fqn);
+              foundArchiveSpecificNames = true;
+            }
+
+            // Some early beta builds use bare TOR names such as main_1.tor/system_1.tor while
+            // the filename pack learned the same PH/SH values from assets_*, red_* or later
+            // archive families. Resolve those names globally, but only for hashes physically
+            // present in this TOR so resources from another build cannot leak into discovery.
+            if (!foundArchiveSpecificNames) {
+              foreach (TorArchive.File physicalFile in archive.EnumerateFiles()) {
+                TorArchive.FileInfo info = physicalFile.FileInfo;
+                HashData global = HashDictionaryInstance.Instance.Dictionary.SearchHashList(
+                  info.PrimaryHash, info.SecondaryHash);
+                String fqn = StringTableFqnFromResourcePath(global?.FileName);
+                if (fqn != null) foundStringTables.Add(fqn);
+              }
             }
           }
         }

@@ -530,24 +530,41 @@ namespace FileFormats {
       FileToShaderResource(ref device, complexionDDS, ref complexionSRV, textureFirstMipLevel);
     }
 
+    private static Single DynamicPaletteComponent(GomObjectData data, String name, Single fallback) {
+      if (data?.Dictionary == null || !data.Dictionary.TryGetValue(name, out object raw) || raw == null) return fallback;
+      try { return Convert.ToSingle(raw, CultureInfo.InvariantCulture); }
+      catch { return fallback; }
+    }
+
+    // Live stores palette vectors as a structured GOM object, while older clients also store them as the
+    // serialized "(r, g, b, a)" form.  Keep the already-resolved material value for unknown encodings; a
+    // cosmetic palette mismatch is preferable to making an otherwise valid NPC impossible to preview.
+    private static Vector4 DynamicPaletteVector(object raw, Vector4 fallback) {
+      if (raw is String text) return ParseVector4(text, fallback);
+      if (raw is GomObject gom) raw = gom.Data;
+      if (raw is not GomObjectData data) return fallback;
+      return new Vector4(
+        DynamicPaletteComponent(data, "r", fallback.X),
+        DynamicPaletteComponent(data, "g", fallback.Y),
+        DynamicPaletteComponent(data, "b", fallback.Z),
+        DynamicPaletteComponent(data, "a", fallback.W)
+      );
+    }
+
     public void SetDynamicColor(GomObject dynObj, Int32 paletteNum = 0) {
+      if (dynObj?.Data == null) return;
       Single hue = dynObj.Data.ValueOrDefault<Single>("appPaletteHue", 0);
       Single saturation = dynObj.Data.ValueOrDefault("appPaletteSaturation", 0.5F);
       Single brightness = dynObj.Data.ValueOrDefault<Single>("appPaletteBrightness", 0);
       Single contrast = dynObj.Data.ValueOrDefault("appPaletteContrast", 1.0F);
 
       Vector4 palette = new Vector4(hue, saturation, brightness, contrast);
-      GomObjectData specData = (GomObjectData)dynObj.Data.Dictionary["appPaletteSpecular"];
-      Vector4 specular = new Vector4(
-        (Single)specData.Dictionary["r"], (Single)specData.Dictionary["g"],
-        (Single)specData.Dictionary["b"], (Single)specData.Dictionary["a"]
-      );
-      GomObjectData metSpecData =
-        (GomObjectData)dynObj.Data.Dictionary["appPaletteMetallicSpecular"];
-      Vector4 metallicSpecular = new Vector4(
-        (Single)metSpecData.Dictionary["r"], (Single)metSpecData.Dictionary["g"],
-        (Single)metSpecData.Dictionary["b"], (Single)metSpecData.Dictionary["a"]
-      );
+      Vector4 fallbackSpecular = paletteNum == 2 ? palette2Spec : palette1Spec;
+      Vector4 fallbackMetallicSpecular = paletteNum == 2 ? palette2MetSpec : palette1MetSpec;
+      dynObj.Data.Dictionary.TryGetValue("appPaletteSpecular", out object rawSpecular);
+      dynObj.Data.Dictionary.TryGetValue("appPaletteMetallicSpecular", out object rawMetallicSpecular);
+      Vector4 specular = DynamicPaletteVector(rawSpecular, fallbackSpecular);
+      Vector4 metallicSpecular = DynamicPaletteVector(rawMetallicSpecular, fallbackMetallicSpecular);
 
       if (paletteNum != 0) {
         if (paletteNum == 1) {

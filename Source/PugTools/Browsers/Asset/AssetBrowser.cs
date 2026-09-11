@@ -4229,10 +4229,17 @@ namespace PugTools {
             "/resources/gamedata/str/stb.manifest"
           );
 
-          stb_parser.ParseSTBManifest(manifest.OpenCopyInMemory());
+          // RED/Beta builds can predate the global STB manifest. It is an
+          // optional filename source, so do not abort the complete finder.
+          if (manifest != null) {
+            using Stream manifestStream = manifest.OpenCopyInMemory();
+            stb_parser.ParseSTBManifest(manifestStream);
+            m_filesSearched++;
+          } else {
+            System.Diagnostics.Debug.WriteLine("Filename Finder: stb.manifest is absent in this client build.");
+          }
 
           m_namesFound = stb_parser.FileNames.Count;
-          m_filesSearched++;
 
           stb_parser.WriteFile();
           break;

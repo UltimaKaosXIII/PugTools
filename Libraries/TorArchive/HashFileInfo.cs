@@ -37,18 +37,27 @@ namespace TorArchive {
       }
 
       FileInfo info = file.FileInfo;
-      HashData data =
-        HashDictionaryInstance.Instance.Dictionary.SearchHashList(ph,
-                                                                  sh,
-                                                                  file.Archive.StrippedFileName);
+      nsHashDictionary.HashDictionary dictionary = HashDictionaryInstance.Instance.Dictionary;
+      HashData archiveData = dictionary.SearchHashList(ph, sh, file.Archive.StrippedFileName);
+
+      // A resource path hashes to the same PH/SH regardless of which physical TOR filename a
+      // particular SWTOR build uses. Beta/dev clients have used main_1.tor, assets_main_*.tor,
+      // red_*.tor and other layouts for the same named resources. Keep exact archive data for
+      // CRC/change tracking, but fall back to the global PH/SH name when this archive alias is
+      // absent from the filename pack.
+      HashData nameData = archiveData;
+      if (nameData == null || String.IsNullOrEmpty(nameData.FileName)) {
+        HashData globalData = dictionary.SearchHashList(ph, sh);
+        if (globalData != null && !String.IsNullOrEmpty(globalData.FileName)) nameData = globalData;
+      }
 
       _FileRef = file;
       Source = file.Archive.FileName.Split('\\').Last();
-      if (data != null) FirstSeenVersion = data.FirstSeenVersion;
+      if (nameData != null) FirstSeenVersion = nameData.FirstSeenVersion;
 
-      if (data != null && data.FileName.Length > 0) {
+      if (nameData != null && nameData.FileName.Length > 0) {
         IsNamed = true;
-        FileName = data.FileName;
+        FileName = nameData.FileName;
         Extension = FileName.Split('.').Last();
 
         String[] temp = FileName.Split('/');
@@ -56,14 +65,18 @@ namespace TorArchive {
         Directory = String.Join("/", temp.Take(temp.Length - 1));
         FileName = temp.Last();
 
-        if (info.CRC != data.Crc) {
+        if (archiveData == null) {
+          // The name came from another archive family/version. Do not copy that archive's CRC
+          // into this one and do not create a duplicate PFD1 row merely to preserve the name.
+          FileState = State.New;
+        } else if (info.CRC != archiveData.Crc) {
           FileState = State.Modified;
           if (updateDictionary)
-            HashDictionaryInstance.Instance.Dictionary.UpdateCRC(info.PrimaryHash,
-                                                                 info.SecondaryHash,
-                                                                 info.CRC,
-                                                                 file.Archive.StrippedFileName);
-        } else if (info.CRC == data.Crc) {
+            dictionary.UpdateCRC(info.PrimaryHash,
+                                 info.SecondaryHash,
+                                 info.CRC,
+                                 file.Archive.StrippedFileName);
+        } else {
           FileState = State.Unchanged;
         }
       } else {
@@ -71,23 +84,23 @@ namespace TorArchive {
         Directory = "/" + Source;
         Extension = detectUnknownExtension ? FileExtension.Instance.GuessExtension(file) : "";
 
-        if (data == null) {
+        if (archiveData == null) {
           FileState = State.New;
           FileName = $"{info.Checksum:X8}_{info.FileId:X16}";
           if (updateDictionary)
-            HashDictionaryInstance.Instance.Dictionary.AddHash(info.PrimaryHash,
-                                                               info.SecondaryHash,
-                                                               "",
-                                                               info.CRC,
-                                                               file.Archive.StrippedFileName);
-        } else if (info.CRC != data.Crc) {
+            dictionary.AddHash(info.PrimaryHash,
+                               info.SecondaryHash,
+                               "",
+                               info.CRC,
+                               file.Archive.StrippedFileName);
+        } else if (info.CRC != archiveData.Crc) {
           FileState = State.Modified;
           if (updateDictionary)
-            HashDictionaryInstance.Instance.Dictionary.UpdateCRC(info.PrimaryHash,
-                                                                 info.SecondaryHash,
-                                                                 info.CRC,
-                                                                 file.Archive.StrippedFileName);
-        } else if (info.CRC == data.Crc) {
+            dictionary.UpdateCRC(info.PrimaryHash,
+                                 info.SecondaryHash,
+                                 info.CRC,
+                                 file.Archive.StrippedFileName);
+        } else {
           FileState = State.Unchanged;
         }
 

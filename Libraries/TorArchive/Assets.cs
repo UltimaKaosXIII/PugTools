@@ -199,7 +199,7 @@ namespace TorArchive {
       // and metadata.bin is not required merely to browse/extract an archive.
       String[] prefixes = isPTS
         ? new[] { "swtor_test_" }
-        : new[] { "swtor_", "he32_", "red_", "assets_", "green_" };
+        : new[] { "swtor_", "he32_", "red_", "assets_", "green_", "" };
 
       foreach (String prefix in prefixes) {
         String familyStart = prefix + fileGroup;
@@ -221,7 +221,10 @@ namespace TorArchive {
             .Select(item => item.Path)
             .ToArray();
 
-          Libraries.Add(new Library(prefix.TrimEnd('_') + "_" + group.Key, paths));
+          String libraryName = String.IsNullOrEmpty(prefix)
+            ? group.Key
+            : prefix.TrimEnd('_') + "_" + group.Key;
+          Libraries.Add(new Library(libraryName, paths));
           foreach (String path in paths) m_loadedArchivePaths.Add(Path.GetFullPath(path));
         }
 

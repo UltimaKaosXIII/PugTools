@@ -57,6 +57,9 @@ namespace nsHashDictionary {
     // cached in m_fileName.
     internal String FileNameForSerialization =>
       m_fileName ?? m_nameStore?.GetName(m_nameIndex) ?? String.Empty;
+    internal Boolean HasFileName => m_fileName != null
+      ? m_fileName.Length > 0
+      : m_nameStore != null && m_nameIndex >= 0;
     public Int32 Crc { get; internal set; }
     /// <summary>Earliest reliably known SWTOR patch for this hash, or null when history is unavailable.</summary>
     public String FirstSeenVersion { get; internal set; }
@@ -116,6 +119,10 @@ namespace nsHashDictionary {
     private const UInt32 CompactMagic = 0x31444650; // PFD1
     private const UInt16 CompactVersion = 2;
     private readonly SortedList<String, SortedList<UInt64, HashData>> m_hashList;
+    // Filename hashes are independent of the physical TOR name. Keep one canonical entry per
+    // PH/SH pair so beta/live builds that package the same resource under different archive
+    // filenames can still resolve names in O(1) without duplicating every row in PFD1.
+    private Dictionary<UInt64, HashData> m_globalHashList;
     private Boolean m_helpersCreated;
     private readonly Dictionary<UInt64, HashSet<String>> m_masterArchiveHashList;
     private readonly HashSet<String> m_runtimeFileNameChanges;
@@ -155,7 +162,9 @@ namespace nsHashDictionary {
           m_hashList.Add(archiveName, new SortedList<UInt64, HashData>());
 
         if (!m_hashList[archiveName].ContainsKey(sig)) {
-          m_hashList[archiveName].Add(sig, new HashData(ph, sh, name, crc, archiveName));
+          HashData added = new HashData(ph, sh, name, crc, archiveName);
+          m_hashList[archiveName].Add(sig, added);
+          AddGlobalHash(sig, added);
 
           NeedsSave = true;
 
@@ -167,6 +176,7 @@ namespace nsHashDictionary {
           }
         } else {
           UpdateHash(ph, sh, name, crc, archiveName);
+          AddGlobalHash(sig, m_hashList[archiveName][sig]);
         }
       }
     }
@@ -177,6 +187,43 @@ namespace nsHashDictionary {
       } else {
         m_masterArchiveHashList.Add(sig, new HashSet<String>() { archiveName });
       }
+    }
+
+    private void AddGlobalHash(UInt64 sig, HashData data) {
+      // The cross-archive index is intentionally lazy. Normal retail archive lookups stay on
+      // the exact archive fast path and pay no extra startup/RAM cost. It is built only when a
+      // caller actually needs a name from another archive family/version.
+      if (data == null || m_globalHashList == null) return;
+
+      if (!m_globalHashList.TryGetValue(sig, out HashData existing)) {
+        m_globalHashList.Add(sig, data);
+        return;
+      }
+
+      // Prefer a named row over an unnamed archive-local placeholder. The same PH/SH maps to
+      // the same resource path across SWTOR archive generations; archive membership and CRC are
+      // deliberately kept on the per-archive row instead.
+      if (!existing.HasFileName && data.HasFileName) {
+        m_globalHashList[sig] = data;
+      }
+    }
+
+    private void EnsureGlobalHashList() {
+      if (m_globalHashList != null) return;
+
+      var global = new Dictionary<UInt64, HashData>();
+      foreach (SortedList<UInt64, HashData> archive in m_hashList.Values) {
+        for (Int32 i = 0; i < archive.Count; i++) {
+          UInt64 sig = archive.Keys[i];
+          HashData data = archive.Values[i];
+          if (data == null) continue;
+
+          if (!global.TryGetValue(sig, out HashData existing)
+              || (!existing.HasFileName && data.HasFileName))
+            global[sig] = data;
+        }
+      }
+      m_globalHashList = global;
     }
 
     /// <summary>
@@ -331,6 +378,7 @@ namespace nsHashDictionary {
       m_archiveList.Clear();
       m_archiveReverseList.Clear();
       m_hashList.Clear();
+      m_globalHashList = null;
       m_masterArchiveHashList.Clear();
       m_dirListing.Clear();
       m_extListing.Clear();
@@ -518,7 +566,9 @@ namespace nsHashDictionary {
       UInt64 sig = (UInt64)ph << 32 | sh;
       if (!m_hashList.ContainsKey(archive))
         m_hashList.Add(archive, new SortedList<UInt64, HashData>());
-      m_hashList[archive].Add(sig, new HashData(ph, sh, fileName, crc, archive));
+      HashData data = new HashData(ph, sh, fileName, crc, archive);
+      m_hashList[archive].Add(sig, data);
+      AddGlobalHash(sig, data);
     }
 
     private void LoadHashFile(UInt32 ph, UInt32 sh, CompactFileNameStore names, Int32 nameIndex,
@@ -533,6 +583,7 @@ namespace nsHashDictionary {
         : new HashData(ph, sh, String.Empty, crc, archive);
       data.FirstSeenVersion = firstSeenVersion;
       m_hashList[archive].Add(sig, data);
+      AddGlobalHash(sig, data);
     }
 
     /// <summary>
@@ -841,16 +892,8 @@ namespace nsHashDictionary {
     public HashData SearchHashList(UInt32 ph, UInt32 sh) {
       lock (m_hashListLock) {
         UInt64 sig = (UInt64)ph << 32 | sh;
-        HashData result = null;
-
-        for (Int32 i = 0; i < m_hashList.Count; i++) {
-          if (m_hashList.Values[i].ContainsKey(sig)) {
-            result = m_hashList.Values[i][sig];
-            break;
-          }
-        }
-
-        return result;
+        EnsureGlobalHashList();
+        return m_globalHashList.TryGetValue(sig, out HashData result) ? result : null;
       }
     }
 
@@ -1009,8 +1052,12 @@ namespace nsHashDictionary {
       lock (m_hashListLock) {
         UInt64 sig = (UInt64)ph << 32 | sh;
 
-        if (m_hashList[archiveName].ContainsKey(sig) && m_hashList[archiveName][sig].Crc != crc) {
-          m_hashList[archiveName][sig].Crc = crc;
+        if (String.IsNullOrWhiteSpace(archiveName)
+            || !m_hashList.TryGetValue(archiveName, out SortedList<UInt64, HashData> archiveHashes))
+          return;
+
+        if (archiveHashes.ContainsKey(sig) && archiveHashes[sig].Crc != crc) {
+          archiveHashes[sig].Crc = crc;
           NeedsSave = true;
         }
       }
@@ -1057,6 +1104,8 @@ namespace nsHashDictionary {
             m_hashList[archive][sig].Crc = crc;
             NeedsSave = true;
           }
+
+          AddGlobalHash(sig, m_hashList[archive][sig]);
         }
         return result;
       }

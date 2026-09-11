@@ -2108,7 +2108,12 @@ namespace PugTools {
         panelRender?.ClearWorldInteractionTarget();
         return;
       }
-      if (interaction?.Kind == WorldInteractionKind.Conversation) {
+      // A number of quest and service NPCs expose a real cnv resource while retaining their primary service
+      // classification (vendor, trainer, quest giver, ...).  Requiring Kind == Conversation made a normal click
+      // merely report that service and discarded the usable dialog.  Restrict the fallback to NPC placements so
+      // generic placeables with incidental conversation metadata keep their dedicated interaction behavior.
+      if (interaction?.Kind == WorldInteractionKind.Conversation ||
+          (panelRender?.InteractionTargetWorldNpcPlacement != null && interaction?.HasConversation == true)) {
         HideWorldSelectionInfo();
         StartWorldConversationPlayback(interaction);
         panelRender?.ClearWorldInteractionTarget();
