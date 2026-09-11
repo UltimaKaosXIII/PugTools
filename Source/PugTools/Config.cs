@@ -14,6 +14,7 @@ namespace PugTools {
     private static String _language = "en-us";
     private static String _prevAssetsPath = ".";
     private static Boolean _prevAssetsUsePTS;
+    private static Int32 _nodePreviewTextHeight = 260;
 
     public static String AssetsPath {
       get => _assetsPath;
@@ -53,6 +54,10 @@ namespace PugTools {
     public static Boolean PrevAssetsUsePTS {
       get => _prevAssetsUsePTS;
       set => _prevAssetsUsePTS = value;
+    }
+    public static Int32 NodePreviewTextHeight {
+      get => _nodePreviewTextHeight;
+      set => _nodePreviewTextHeight = Math.Max(100, Math.Min(1400, value));
     }
 
     private static readonly List<String> liveGamePaths = new List<String> {
@@ -133,6 +138,11 @@ namespace PugTools {
       // UI / localized asset language
       str = ConfigFile.AppSettings.Settings["Language"]?.Value;
       if (!String.IsNullOrWhiteSpace(str)) Language = str;
+
+      // Remember the Node Browser interpreted-text height so abl/ach/qst/etc. do
+      // not snap back to the default after every selection or application restart.
+      str = ConfigFile.AppSettings.Settings["NodePreviewTextHeight"]?.Value;
+      if (Int32.TryParse(str, out Int32 previewHeight)) NodePreviewTextHeight = previewHeight;
     }
     public static void Save() {
       // Path to the asset files
@@ -167,6 +177,12 @@ namespace PugTools {
       str = Language;
       if (ConfigFile.AppSettings.Settings["Language"] == null) ConfigFile.AppSettings.Settings.Add("Language", str);
       else ConfigFile.AppSettings.Settings["Language"].Value = str;
+
+      str = NodePreviewTextHeight.ToString();
+      if (ConfigFile.AppSettings.Settings["NodePreviewTextHeight"] == null)
+        ConfigFile.AppSettings.Settings.Add("NodePreviewTextHeight", str);
+      else
+        ConfigFile.AppSettings.Settings["NodePreviewTextHeight"].Value = str;
 
       ConfigFile.Save(ConfigurationSaveMode.Modified);
       ConfigurationManager.RefreshSection("appSettings");

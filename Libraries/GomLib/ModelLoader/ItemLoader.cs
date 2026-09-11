@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -480,17 +480,23 @@ namespace GomLib.ModelLoader {
       var sourceProto = _dom.GetObject("itmSourceProto");
 
       if (sourceProto != null) {
-        var sourceLookup = sourceProto.Data.Get<Dictionary<object, object>>("itmSourceNameIdTable");
-        var souceNameLookup = _dom.StringTable.Find("str.gui.item_source");
+        // Current SWTOR schema uses "itmSources" for the source-id -> string-id map.
+        // Keep the legacy field name as a fallback for older game data.
+        var sourceLookup = sourceProto.Data.ValueOrDefault<Dictionary<object, object>>("itmSources", null)
+          ?? sourceProto.Data.ValueOrDefault<Dictionary<object, object>>("itmSourceNameIdTable", null);
+        var sourceNameLookup = _dom.StringTable.Find("str.gui.item_source");
 
-        itm.StrongholdSourceNameDict = new Dictionary<long, string>();
-        itm.LocalizedStrongholdSourceNameDict = new Dictionary<long, Dictionary<string, string>>();
-        foreach (var source in sourceList) {
-          sourceLookup.TryGetValue(source, out object sourceNameId);
-          if (sourceNameId != null) {
-            string name = souceNameLookup.GetText((long)sourceNameId, "str.gui.item_source");
-            itm.StrongholdSourceNameDict.Add((long)sourceNameId, name);
-            itm.LocalizedStrongholdSourceNameDict.Add((long)sourceNameId, souceNameLookup.GetLocalizedText((long)sourceNameId, "str.gui.item_source"));
+        if (sourceLookup != null && sourceNameLookup != null) {
+          itm.StrongholdSourceNameDict = new Dictionary<long, string>();
+          itm.LocalizedStrongholdSourceNameDict = new Dictionary<long, Dictionary<string, string>>();
+          foreach (var source in sourceList) {
+            if (sourceLookup.TryGetValue(source, out object sourceNameId) && sourceNameId != null) {
+              long sourceNameIdValue = Convert.ToInt64(sourceNameId);
+              string name = sourceNameLookup.GetText(sourceNameIdValue, "str.gui.item_source");
+              itm.StrongholdSourceNameDict[sourceNameIdValue] = name;
+              itm.LocalizedStrongholdSourceNameDict[sourceNameIdValue] =
+                sourceNameLookup.GetLocalizedText(sourceNameIdValue, "str.gui.item_source");
+            }
           }
         }
       }

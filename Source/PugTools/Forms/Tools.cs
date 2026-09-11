@@ -58,6 +58,8 @@ namespace PugTools {
       Config.Load();
       LocalizationResolver.ApplyRequested(Config.Language);
       InitializeComponent();
+      InitializeShaderBrowserButton();
+      InitializeDomBrowserButton();
       txtAssetsPath.Text = Config.AssetsPath;
       chkAssetsUsePTS.Checked = Config.AssetsUsePTS;
       txtPrevAssetsPath.Text = Config.PrevAssetsPath;
@@ -505,6 +507,18 @@ namespace PugTools {
       //MessageBox.Show("the raw list has been generated there are " + i + " Objects");
       EnableButtons();
     }
+    private void ReportArchiveLoadWarnings(TorArchive.Assets assets, String label) {
+      if (assets == null) return;
+      String[] warnings = assets.ArchiveLoadWarnings
+        .Where(warning => !String.IsNullOrWhiteSpace(warning))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+      if (warnings.Length == 0) return;
+
+      AddToList1($"{label}: skipped {warnings.Length:N0} invalid TOR archive(s); details are shown below.");
+      foreach (String warning in warnings) AddToList2(label + ": " + warning);
+    }
+
     public void LoadData() {
       if (!s_loaded) {
         Clearlist();
@@ -520,6 +534,7 @@ namespace PugTools {
 
         Clearlist();
         AddToList1("Loading Current Data Object Model. - Done");
+        ReportArchiveLoadWarnings(CurrentAssets, "Current assets");
 
         if (chkBuildCompare.Checked && txtPrevAssetsPath.Text != "") {
           AddToList1("Loading Previous Data Object Model.");
@@ -534,6 +549,8 @@ namespace PugTools {
           Clearlist();
           AddToList1("Loading Current Data Object Model. - Done");
           AddToList1("Loading Previous Data Object Model. - Done");
+          ReportArchiveLoadWarnings(CurrentAssets, "Current assets");
+          ReportArchiveLoadWarnings(PreviousAssets, "Previous assets");
         }
 
         if (chkCrossLinkDom.Checked) {
@@ -926,7 +943,7 @@ namespace PugTools {
         GomObject currentDataObject = CurrentDom.GetObject(gameObj.Key);
 
         if (currentDataObject != null) { // Fix to ensure old game assets don't throw exceptions.
-          currentDataProto = currentDataObject.Data.Get<Dictionary<Object, Object>>(gameObj.Value);
+          currentDataProto = ReadPrototypeTable(currentDataObject, gameObj.Value, out _);
           currentDataObject.Unload();
         }
 

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -62,16 +62,15 @@ namespace PugTools {
       // The hash dictionary is a process-wide cache used by all browser windows. This child
       // window only drops its own UI data; unloading the shared cache here races other browsers.
 
-      if (treeViewFast1 != null) {
-        treeViewFast1.Dispose();
-        treeViewFast1 = null;
-      }
+      // Designer-owned tree is disposed by Form.Dispose(); avoid a second deep subtree walk.
+      treeViewFast1 = null;
 
       _assetDict = null;
       _fileDict = null;
     }
     private void AssetBrowserFileTable_FormClosing(Object sender, FormClosingEventArgs e) {
       _closing = true;
+      try { if (backgroundWorker1.WorkerSupportsCancellation && backgroundWorker1.IsBusy) backgroundWorker1.CancelAsync(); } catch { }
     }
     protected override void AdjustFormScrollbars(Boolean displayScrollbars) {
       base.AdjustFormScrollbars(displayScrollbars);

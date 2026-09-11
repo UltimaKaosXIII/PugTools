@@ -38,6 +38,11 @@ namespace GomLib.Models {
     public bool IsAccountUnlock { get; set; }
     public bool UnknownBool2 { get; set; }
     public long LinkedMTXEntryId { get; set; }
+    public bool IsOnSale { get; set; }
+    public bool IsPlatform { get; set; }
+    public bool CanGift { get; set; }
+    public long Flags { get; set; }
+    public ulong VisibilityConditionId { get; set; }
 
     public override int GetHashCode() {
       int hash = Id.GetHashCode();
@@ -51,6 +56,11 @@ namespace GomLib.Models {
       hash ^= IsAccountUnlock.GetHashCode();
       hash ^= UnknownBool2.GetHashCode();
       hash ^= LinkedMTXEntryId.GetHashCode();
+      hash ^= IsOnSale.GetHashCode();
+      hash ^= IsPlatform.GetHashCode();
+      hash ^= CanGift.GetHashCode();
+      hash ^= Flags.GetHashCode();
+      hash ^= VisibilityConditionId.GetHashCode();
       if (LocalizedName != null) foreach (var x in LocalizedName) { hash ^= x.GetHashCode(); } //dictionaries need to hashed like this
       if (Localizedunknowntext != null) foreach (var x in Localizedunknowntext) { hash ^= x.GetHashCode(); }
       if (LocalizedRarityDesc != null) foreach (var x in LocalizedRarityDesc) { hash ^= x.GetHashCode(); }
@@ -103,6 +113,9 @@ namespace GomLib.Models {
         }
       }
       if (LinkedMTXEntryId != mtx.LinkedMTXEntryId)
+        return false;
+      if (IsOnSale != mtx.IsOnSale || IsPlatform != mtx.IsPlatform || CanGift != mtx.CanGift
+          || Flags != mtx.Flags || VisibilityConditionId != mtx.VisibilityConditionId)
         return false;
 
       var ssComp = new DictionaryComparer<string, string>();

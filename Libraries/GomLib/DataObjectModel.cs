@@ -45,6 +45,7 @@ namespace GomLib {
     private List<String> m_bucketFiles;
     private Boolean m_crossLinked;
     private Boolean m_loaded;
+    private Boolean m_schemaLoaded;
     private Boolean m_legacyGom;
     private readonly Dictionary<String, HashSet<String>> m_namedMap;
     private DomTypeLoaders.FileInstanceLoader m_prototypeLoader;
@@ -386,16 +387,40 @@ namespace GomLib {
       Models.Tooltip.Flush();
     }
 
+    /// <summary>
+    /// Loads only the schema stored in client.gom. This intentionally skips buckets,
+    /// prototypes and gameplay helper tables and is therefore suitable for schema/DOM
+    /// inspection tools that should open quickly without building the complete node model.
+    /// A later call to Load() upgrades the same instance to the full model.
+    /// </summary>
+    public void LoadSchemaOnly() {
+      if (m_loaded || m_schemaLoaded) return;
+
+      LoadTypeNames();
+      GomTypeLoader = new GomTypeLoader(this);
+      LoadClientGom();
+      LinkDomTypes();
+      m_schemaLoaded = true;
+    }
+
+    private void LinkDomTypes() {
+      // Link() is deliberately repeatable: LoadSchemaOnly() may be followed by Load().
+      // DomClass.Link clears its resolved lists before rebuilding them.
+      foreach (DomType domType in DomTypeMap.Values) domType.Link(this);
+    }
+
     public void Load() {
       if (m_loaded) {
         return;
       }
 
-      LoadTypeNames();
+      if (!m_schemaLoaded) {
+        LoadTypeNames();
+        GomTypeLoader = new GomTypeLoader(this);
+        LoadClientGom();
+        m_schemaLoaded = true;
+      }
 
-      GomTypeLoader = new GomTypeLoader(this);
-
-      LoadClientGom();
       LoadBuckets();
       LoadPrototypes();
 
@@ -411,10 +436,7 @@ namespace GomLib {
       AlignmentData = new Models.AlignmentData(this);
       GroupFinderContentData = new Models.GroupFinderContentData(this);
 
-      foreach (DomType domType in DomTypeMap.Values) {
-        // Debug.WriteLine(t.Name);
-        domType.Link(this);
-      }
+      LinkDomTypes();
 
       InitializeModelLoaders();
     }
@@ -904,6 +926,7 @@ namespace GomLib {
 
       GC.Collect();
       m_loaded = false;
+      m_schemaLoaded = false;
     }
 
     #endregion Methods

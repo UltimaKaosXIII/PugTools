@@ -30,8 +30,12 @@ namespace GomLib.ModelLoader {
         PackageId = gomObj.ValueOrDefault<ulong>("ablAbilityDataPackage", 0)
       };
       List<object> ranks = gomObj.ValueOrDefault<List<object>>("ablAbilityDataRanks", null);
-      foreach (var rank in ranks) {
-        result.Levels.Add((int)(long)rank);
+      if (ranks != null) foreach (var rank in ranks) {
+        try { result.Levels.Add(Convert.ToInt32(rank)); } catch { }
+      }
+      List<object> attackWaves = gomObj.ValueOrDefault<List<object>>("ablAbilityActiveDuringAttackWaves", null);
+      if (attackWaves != null) foreach (Object wave in attackWaves) {
+        try { result.AttackWaves.Add(Convert.ToInt64(wave)); } catch { }
       }
       if (result.Levels.Count > 0) {
         result.Level = result.Levels[0];

@@ -262,13 +262,15 @@ namespace PugTools {
 
       if (mtxStore != null) {
         Dictionary<Object, Object> mtxItems =
-          mtxStore.Data.ValueOrDefault<Dictionary<Object, Object>>("mtxStorefrontData", null);
+          mtxStore.Data.ValueOrDefault<Dictionary<Object, Object>>("mtxStorefrontItems", null)
+          ?? mtxStore.Data.ValueOrDefault<Dictionary<Object, Object>>("mtxStorefrontData", null);
 
         if (mtxItems != null) {
           foreach (KeyValuePair<Object, Object> item in mtxItems) {
             Searched++;
             GomObjectData item2 = (GomObjectData)item.Value;
-            item2.Dictionary.TryGetValue("mtxStorefrontIcon", out Object icon_string);
+            if (!item2.Dictionary.TryGetValue("mtxStorefrontItemImage", out Object icon_string))
+              item2.Dictionary.TryGetValue("mtxStorefrontIcon", out icon_string);
 
             if (icon_string != null) {
               String icon = icon_string.ToString().ToLower();
@@ -324,15 +326,19 @@ namespace PugTools {
       if (colCollectionItemsProto != null) {
         Dictionary<Object, Object> colItems =
           colCollectionItemsProto.Data.ValueOrDefault<Dictionary<Object, Object>>(
-            "colCollectionItemsData",
-            null
-          );
+            "colMtxItemIdToCollectionItem", null)
+          ?? colCollectionItemsProto.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            "4611686297655094008", null)
+          ?? colCollectionItemsProto.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            "colCollectionItemsData", null);
 
         if (colItems != null) {
           foreach (KeyValuePair<Object, Object> item in colItems) {
             Searched++;
             GomObjectData item2 = (GomObjectData)item.Value;
-            item2.Dictionary.TryGetValue("colCollectionIcon", out Object icon_string);
+            item2.Dictionary.TryGetValue("colItemImage", out Object icon_string);
+            if (icon_string == null) item2.Dictionary.TryGetValue("4611686297655094004", out icon_string);
+            if (icon_string == null) item2.Dictionary.TryGetValue("colCollectionIcon", out icon_string);
 
             if (icon_string != null) {
               String icon = icon_string.ToString().ToLower();

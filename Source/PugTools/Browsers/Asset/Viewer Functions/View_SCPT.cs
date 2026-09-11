@@ -7,6 +7,7 @@ using System.Linq;
 using System.Numerics;
 using System.Text;
 using GomLib;
+using Iced.Intel;
 
 namespace PugTools {
   /// <summary>
@@ -855,6 +856,7 @@ namespace PugTools {
 
       if (file.ContentVersion != 4) {
         root.children.Add(BuildSectionsGroup("Code sections", payload.CodeSections));
+        root.children.Add(BuildNativeAssemblyGroup(file, payload));
         root.children.Add(BuildSectionsGroup("Data sections", payload.DataSections));
         root.children.Add(BuildSymbolsGroup(file, payload));
         root.children.Add(BuildRelocationsGroup(payload));
@@ -983,6 +985,116 @@ namespace PugTools {
         root.children.Add(node);
       }
       return root;
+    }
+
+
+    private static NodeListItem BuildNativeAssemblyGroup(ScptFileInfo file, ScptPayloadInfo payload) {
+      Int32 bitness = payload.Architecture == 2 ? 64 : 32;
+      NodeListItem root = new NodeListItem("Native assembly", bitness + "-bit x86; NASM syntax");
+      if (payload.CodeSections == null || payload.CodeSections.Count == 0) {
+        root.children.Add(new NodeListItem("Status", "No native code sections in this payload."));
+        return root;
+      }
+
+      for (Int32 sectionIndex = 0; sectionIndex < payload.CodeSections.Count; sectionIndex++) {
+        ScptSectionInfo section = payload.CodeSections[sectionIndex];
+        NodeListItem sectionNode = new NodeListItem(
+          "Section #" + sectionIndex.ToString(CultureInfo.InvariantCulture),
+          section == null ? "missing" : section.Length.ToString("N0", CultureInfo.InvariantCulture) + " bytes"
+        );
+        root.children.Add(sectionNode);
+        if (section == null || !section.HasData || section.Data == null || section.Data.Length == 0) {
+          sectionNode.children.Add(new NodeListItem("Status", "BSS / no stored code bytes"));
+          continue;
+        }
+
+        Dictionary<UInt64, List<String>> labels = new Dictionary<UInt64, List<String>>();
+        for (Int32 symbolIndex = 0; symbolIndex < payload.Symbols.Count; symbolIndex++) {
+          ScptSymbolInfo symbol = payload.Symbols[symbolIndex];
+          if (symbol.SectionIndex != sectionIndex || symbol.Offset < 0) continue;
+          UInt64 offset = unchecked((UInt64)symbol.Offset);
+          if (!labels.TryGetValue(offset, out List<String> names)) {
+            names = new List<String>();
+            labels[offset] = names;
+          }
+          names.Add(ResolveAssemblySymbol(file, payload, symbolIndex));
+        }
+
+        Dictionary<Int32, List<ScptRelocationInfo>> relocations = payload.Relocations
+          .Where(x => x != null && x.SectionIndex == sectionIndex && x.Offset >= 0 && x.Offset <= Int32.MaxValue)
+          .GroupBy(x => (Int32)x.Offset)
+          .ToDictionary(x => x.Key, x => x.ToList());
+
+        try {
+          ByteArrayCodeReader codeReader = new ByteArrayCodeReader(section.Data);
+          Iced.Intel.Decoder decoder = Iced.Intel.Decoder.Create(bitness, codeReader);
+          decoder.IP = 0;
+          NasmFormatter formatter = new NasmFormatter();
+          formatter.Options.SpaceAfterOperandSeparator = true;
+          StringOutput output = new StringOutput();
+          Int32 instructionCount = 0;
+          const Int32 MaxInstructionsPerSection = 20000;
+
+          while (codeReader.CanReadByte && instructionCount < MaxInstructionsPerSection) {
+            UInt64 ip = decoder.IP;
+            if (labels.TryGetValue(ip, out List<String> names)) {
+              foreach (String name in names.Distinct(StringComparer.Ordinal))
+                sectionNode.children.Add(new NodeListItem(name + ":", "symbol @ +0x" + ip.ToString("X", CultureInfo.InvariantCulture)));
+            }
+
+            Instruction instruction = decoder.Decode();
+            if (instruction.Length == 0) break;
+            formatter.Format(instruction, output);
+            String asm = output.ToStringAndReset();
+
+            Int32 byteIndex = checked((Int32)ip);
+            Int32 length = Math.Min(instruction.Length, Math.Max(0, section.Data.Length - byteIndex));
+            String bytes = length > 0
+              ? BitConverter.ToString(section.Data, byteIndex, length).Replace("-", " ")
+              : String.Empty;
+
+            List<String> annotations = new List<String>();
+            UInt64 nextIp = instruction.NextIP;
+            for (UInt64 relocationOffset = ip; relocationOffset < nextIp && relocationOffset <= Int32.MaxValue; relocationOffset++) {
+              if (!relocations.TryGetValue((Int32)relocationOffset, out List<ScptRelocationInfo> atOffset)) continue;
+              foreach (ScptRelocationInfo relocation in atOffset) {
+                String target = relocation.SymbolIndex >= 0 && relocation.SymbolIndex < payload.Symbols.Count
+                  ? ResolveAssemblySymbol(file, payload, relocation.SymbolIndex)
+                  : "symbol#" + relocation.SymbolIndex.ToString(CultureInfo.InvariantCulture);
+                String kind = relocation.Type == 1 ? "abs32" : relocation.Type == 2 ? "rel32" : "reloc" + relocation.Type.ToString(CultureInfo.InvariantCulture);
+                annotations.Add(kind + " → " + target + (relocation.Addend == 0 ? String.Empty : " + " + relocation.Addend.ToString(CultureInfo.InvariantCulture)));
+              }
+            }
+
+            String address = "+0x" + ip.ToString(bitness == 64 ? "X8" : "X6", CultureInfo.InvariantCulture);
+            String value = asm;
+            if (annotations.Count > 0) value += "    ; " + String.Join(", ", annotations);
+            NodeListItem line = new NodeListItem(address, value);
+            line.children.Add(new NodeListItem("Bytes", bytes));
+            sectionNode.children.Add(line);
+            instructionCount++;
+          }
+
+          if (codeReader.CanReadByte)
+            sectionNode.children.Add(new NodeListItem("…", "Assembly truncated after " + MaxInstructionsPerSection.ToString("N0", CultureInfo.InvariantCulture) + " instructions."));
+          sectionNode.children.Insert(0, new NodeListItem("Decoded instructions", instructionCount.ToString("N0", CultureInfo.InvariantCulture)));
+        }
+        catch (Exception ex) {
+          sectionNode.children.Add(new NodeListItem("Disassembly error", ex.Message));
+        }
+      }
+      return root;
+    }
+
+    private static String ResolveAssemblySymbol(ScptFileInfo file, ScptPayloadInfo payload, Int32 index) {
+      if (index < 0 || index >= payload.Symbols.Count) return "symbol#" + index.ToString(CultureInfo.InvariantCulture);
+      ScptSymbolInfo symbol = payload.Symbols[index];
+      String name = null;
+      if (symbol.FunctionNameIndex >= 0) name = ResolveName(file, payload, symbol.FunctionNameIndex);
+      else if (symbol.FunctionIndex >= 0 && symbol.FunctionIndex < payload.Functions.Count)
+        name = ResolveName(file, payload, payload.Functions[symbol.FunctionIndex].NameIndex);
+      if (String.IsNullOrWhiteSpace(name)) name = "symbol#" + index.ToString(CultureInfo.InvariantCulture);
+      return name + " [" + SymbolTypeName(symbol.Type) + "]";
     }
 
     private static NodeListItem BuildSymbolsGroup(ScptFileInfo file, ScptPayloadInfo payload) {

@@ -150,7 +150,7 @@ namespace PugTools {
       _render = null;
       if (renderer != null) {
         try { renderer.StopRender(); } catch { }
-        ThreadPool.QueueUserWorkItem(_ => {
+        BackgroundCleanup.Enqueue(() => {
           Boolean stopped = renderThread == null || !renderThread.IsAlive;
           if (!stopped) try { stopped = renderThread.Join(5000); } catch { stopped = false; }
           // Do not race Direct3D disposal against a render thread that ignored the stop request. It is a background
@@ -199,7 +199,16 @@ namespace PugTools {
     }
     private void ModelBrowserFormResize(Object sender, EventArgs e) {
       treeViewFast1.Size =
-        new System.Drawing.Size(splitContainer2.Panel1.Width, splitContainer2.Panel1.Height - 40);
+        new System.Drawing.Size(splitContainer2.Panel1.Width, Math.Max(0, splitContainer2.Panel1.Height - 60));
+    }
+
+    private Boolean ShowDyeColoring => chkShowDyeColoring != null && chkShowDyeColoring.Checked;
+
+    private void ChkShowDyeColoringCheckedChanged(Object sender, EventArgs e) {
+      if (_closing || treeViewFast1?.SelectedNode?.Tag is not NodeAsset selected) return;
+      // Rebuild the selected preview so palette XML overrides are either applied or omitted.
+      // With overrides omitted GR2_Material keeps the palette values authored in the .mat file.
+      PreviewAsset(selected);
     }
     #endregion
 
@@ -1221,10 +1230,10 @@ namespace PugTools {
           String palette2XML = "";
 
           if (!String.IsNullOrEmpty(mat0)) {
-            if (!String.IsNullOrEmpty(itemData.IPP.PrimaryHue))
+            if (ShowDyeColoring && !String.IsNullOrEmpty(itemData.IPP.PrimaryHue))
               palette1XML = "/resources" + itemData.IPP.PrimaryHue.Split(';').First();
 
-            if (!String.IsNullOrEmpty(itemData.IPP.SecondaryHue))
+            if (ShowDyeColoring && !String.IsNullOrEmpty(itemData.IPP.SecondaryHue))
               palette2XML = "/resources" + itemData.IPP.SecondaryHue.Split(';').First();
 
             mat0 = _currentDom.AppearanceLoader.ApplyPartsMacros(mat0, _bodyType);
@@ -1869,10 +1878,10 @@ namespace PugTools {
                 materialMirror = _currentDom.AppearanceLoader.ApplyPartsMacros(skin1, bodyType);
             }
 
-            String palette1XML = !String.IsNullOrWhiteSpace(slot.PrimaryHue)
+            String palette1XML = ShowDyeColoring && !String.IsNullOrWhiteSpace(slot.PrimaryHue)
               ? "/resources" + slot.PrimaryHue.Split(';').First().Replace('\\', '/')
               : String.Empty;
-            String palette2XML = !String.IsNullOrWhiteSpace(slot.SecondaryHue)
+            String palette2XML = ShowDyeColoring && !String.IsNullOrWhiteSpace(slot.SecondaryHue)
               ? "/resources" + slot.SecondaryHue.Split(';').First().Replace('\\', '/')
               : String.Empty;
 

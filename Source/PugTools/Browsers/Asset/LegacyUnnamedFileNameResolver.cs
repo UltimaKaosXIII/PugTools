@@ -495,6 +495,58 @@ namespace PugTools {
       return result;
     }
 
+    private static readonly String[] SupportedResourceLocales = { "en-us", "de-de", "fr-fr" };
+
+    /// <summary>
+    /// Expands only the locale directory immediately below /resources/. The returned strings are
+    /// probes, not discoveries: the Filename Finder must still compare each generated PH+SH with
+    /// an unresolved hash from the current SWTOR build before it persists the filename. Keeping
+    /// this at the final validation boundary means every finder (CNV, BNK, STB, tutorial images,
+    /// imported candidate lists, etc.) gets identical locale handling without teaching each file
+    /// parser about which language archives happen to be installed.
+    /// </summary>
+    internal static IEnumerable<String> ExpandLocalizedCandidate(String raw) {
+      String line = NormalizePath(raw);
+      if (String.IsNullOrWhiteSpace(line) || line.Contains('?')) yield break;
+
+      const String grammarLocale = "<<grammar::locpath>>";
+      if (line.IndexOf(grammarLocale, StringComparison.OrdinalIgnoreCase) >= 0) {
+        foreach (String locale in SupportedResourceLocales)
+          yield return line.Replace(grammarLocale, locale, StringComparison.OrdinalIgnoreCase);
+        yield break;
+      }
+
+      const String resourcesPrefix = "/resources/";
+      if (!line.StartsWith(resourcesPrefix, StringComparison.OrdinalIgnoreCase)) {
+        yield return line;
+        yield break;
+      }
+
+      Int32 localeStart = resourcesPrefix.Length;
+      Int32 localeEnd = line.IndexOf('/', localeStart);
+      if (localeEnd <= localeStart) {
+        yield return line;
+        yield break;
+      }
+
+      String localeSegment = line.Substring(localeStart, localeEnd - localeStart);
+      Boolean isSupportedLocale = false;
+      foreach (String locale in SupportedResourceLocales) {
+        if (!String.Equals(localeSegment, locale, StringComparison.OrdinalIgnoreCase)) continue;
+        isSupportedLocale = true;
+        break;
+      }
+
+      if (!isSupportedLocale) {
+        yield return line;
+        yield break;
+      }
+
+      String suffix = line.Substring(localeEnd);
+      foreach (String locale in SupportedResourceLocales)
+        yield return resourcesPrefix + locale + suffix;
+    }
+
     /// <summary>
     /// Expands cheap, structurally-related filename candidates before TOR validation. These are
     /// probes only; callers must still require an exact current-build hash hit before persisting.

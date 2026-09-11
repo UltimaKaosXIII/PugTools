@@ -49,6 +49,9 @@ namespace FileFormats {
     public ShaderResourceView paletteMaskSRV;
     public ShaderResourceView paletteSRV;
     public Boolean parsed;
+    // Runtime-generated materials (currently native SpeedTree geometry) have no backing .mat file.
+    // Keep their resolved texture metadata alive when the world texture LRU evicts only the GPU SRVs.
+    public Boolean runtimeGenerated;
     // SWTOR uses these authoring flags to keep editor/utility geometry out of the in-game render.
     public String polyType;
     public String visibility;

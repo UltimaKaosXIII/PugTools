@@ -14,7 +14,7 @@ namespace PugTools {
   /// Jedipedia-style reader for SWTOR area.dat and room .dat files.
   /// Supports the current binary formats and the legacy text formats.
   /// </summary>
-  internal static class View_DAT {
+  internal static partial class View_DAT {
     private sealed class RoomPropertyInfo {
       internal String Name { get; }
       internal String Type { get; }
@@ -866,9 +866,17 @@ namespace PugTools {
         for (UInt32 j = 0; j < propertyCount; j++) {
           Byte type = br.ReadByte();
           UInt32 id = br.ReadUInt32();
-          String value = ReadRoomPropertyValue(br, type);
           RoomProperties.TryGetValue(id, out RoomPropertyInfo info);
           String name = info?.Name ?? $"0x{id:X8}";
+          // Jedipedia gives several world-node properties their own embedded readers
+          // instead of presenting the serialized char[]/binary payload as a string.
+          // Do the same before the generic type reader consumes the bytes.
+          if (TryReadEmbeddedRoomProperty(br, type, id, assetName, name, out NodeListItem embeddedProperty)) {
+            instance.children.Add(embeddedProperty);
+            continue;
+          }
+
+          String value = ReadRoomPropertyValue(br, type);
           // The type byte stored in the room file is authoritative. The Jedipedia
           // metadata table is used for the friendly property name only because a
           // small number of properties legitimately occur with more than one type.
@@ -900,6 +908,7 @@ namespace PugTools {
       NodeListItem visible = Branch("Visible");
       NodeListItem instances = Branch("Instances");
       NodeListItem current = null;
+      String currentAssetName = String.Empty;
       String section = String.Empty;
 
       foreach (String original in lines) {
@@ -921,6 +930,7 @@ namespace PugTools {
                 String assetName = areaAssets != null && areaAssets.TryGetValue(assetId, out String resolved)
                   ? resolved
                   : "Asset " + assetIdText;
+                currentAssetName = assetName;
                 current = Branch(assetName, instanceId);
                 current.children.Add(Leaf("Instance ID", instanceId));
                 current.children.Add(Leaf("Asset ID", assetIdText));
@@ -931,7 +941,10 @@ namespace PugTools {
               if (equals > 5) {
                 String name = original.Substring(5, equals - 5).Trim();
                 String value = original.Substring(equals + 1).Trim();
-                current.children.Add(Leaf(name, value));
+                if (TryCreateEmbeddedTextRoomProperty(name, value, currentAssetName, out NodeListItem embeddedProperty))
+                  current.children.Add(embeddedProperty);
+                else
+                  current.children.Add(Leaf(name, value));
               }
             }
             break;

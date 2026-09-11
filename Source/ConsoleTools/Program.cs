@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -783,7 +783,23 @@ namespace ConsoleTools {
       GomObject currentDataObject = dom.GetObject(prototype);
       if (currentDataObject != null) //fix to ensure old game assets don't throw exceptions.
       {
-        currentDataProto = currentDataObject.Data.Get<Dictionary<Object, Object>>(dataTable);
+        if (String.Equals(dataTable, "mtxStorefrontData", StringComparison.OrdinalIgnoreCase)) {
+          currentDataProto = currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            "mtxStorefrontItems", null)
+            ?? currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+              "mtxStorefrontData", new Dictionary<Object, Object>());
+        } else if (String.Equals(dataTable, "colCollectionItemsData", StringComparison.OrdinalIgnoreCase)
+                   || String.Equals(dataTable, "colMtxItemIdToCollectionItem", StringComparison.OrdinalIgnoreCase)) {
+          currentDataProto = currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            "colMtxItemIdToCollectionItem", null)
+            ?? currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+              "4611686297655094008", null)
+            ?? currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+              "colCollectionItemsData", new Dictionary<Object, Object>());
+        } else {
+          currentDataProto = currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            dataTable, new Dictionary<Object, Object>());
+        }
         currentDataObject.Unload();
       }
 

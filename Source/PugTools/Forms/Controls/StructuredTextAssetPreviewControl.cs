@@ -253,6 +253,155 @@ namespace PugTools {
         _summary.Text += "   showing first " + VisibleRowLimit.ToString("n0", CultureInfo.InvariantCulture);
     }
 
+    public void LoadIni(String sourcePath, String text) {
+      ClearPreview();
+      _raw.Text = text ?? String.Empty;
+      _title.Text = "INI keybindings";
+
+      var rows = new List<IniRow>();
+      String section = String.Empty;
+      Int32 comments = 0;
+      foreach (String rawLine in (text ?? String.Empty).Replace("\0", String.Empty)
+                 .Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None)) {
+        String line = rawLine.Trim();
+        if (line.Length == 0) continue;
+        if (line.StartsWith(";", StringComparison.Ordinal) || line.StartsWith("#", StringComparison.Ordinal)
+            || line.StartsWith("//", StringComparison.Ordinal)) {
+          comments++;
+          continue;
+        }
+        if (line.Length >= 2 && line[0] == '[' && line[line.Length - 1] == ']') {
+          section = line.Substring(1, line.Length - 2).Trim();
+          continue;
+        }
+
+        Int32 equals = line.IndexOf('=');
+        String key = equals >= 0 ? line.Substring(0, equals).Trim() : line;
+        String value = equals >= 0 ? line.Substring(equals + 1).Trim() : String.Empty;
+        String device = String.Empty, control = String.Empty;
+        SplitBinding(value, out device, out control);
+        rows.Add(new IniRow { Section = section, Key = key, Value = value, Device = device, Control = control });
+      }
+
+      var bindings = CreateGrid();
+      bindings.Columns.Add("section", "Section");
+      bindings.Columns.Add("key", "Command / key");
+      bindings.Columns.Add("value", "Binding / value");
+      bindings.Columns.Add("device", "Device");
+      bindings.Columns.Add("control", "Control");
+      bindings.Columns[1].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+      bindings.Columns[2].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+      foreach (IniRow row in rows.Take(VisibleRowLimit))
+        bindings.Rows.Add(row.Section, row.Key, row.Value, row.Device, row.Control);
+      AddTab("Bindings", bindings);
+
+      var sections = CreateGrid();
+      sections.Columns.Add("section", "Section");
+      sections.Columns.Add("entries", "Entries");
+      sections.Columns[0].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+      foreach (var group in rows.GroupBy(x => x.Section ?? String.Empty, StringComparer.OrdinalIgnoreCase)
+                                .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+        sections.Rows.Add(String.IsNullOrWhiteSpace(group.Key) ? "(global)" : group.Key, group.Count());
+      AddTab("Sections", sections);
+      AddRawTab();
+
+      _summary.Text = rows.Count.ToString("n0", CultureInfo.InvariantCulture) + " entries   "
+        + rows.Select(x => x.Section ?? String.Empty).Distinct(StringComparer.OrdinalIgnoreCase).Count().ToString("n0", CultureInfo.InvariantCulture)
+        + " sections" + (comments > 0 ? "   " + comments.ToString("n0", CultureInfo.InvariantCulture) + " comments" : String.Empty);
+      if (rows.Count > VisibleRowLimit)
+        _summary.Text += "   showing first " + VisibleRowLimit.ToString("n0", CultureInfo.InvariantCulture);
+    }
+
+    public void LoadLod(String sourcePath, String text) {
+      ClearPreview();
+      _raw.Text = text ?? String.Empty;
+      _title.Text = "LOD schemas";
+      try {
+        var doc = new XmlDocument();
+        doc.LoadXml(text ?? String.Empty);
+        var schemas = new List<LodSchemaRow>();
+        XmlNodeList schemaNodes = doc.SelectNodes("//*[local-name()='LODSchema' or local-name()='lodschema']");
+        if (schemaNodes != null) {
+          foreach (XmlElement schema in schemaNodes.OfType<XmlElement>()) {
+            String name = AttributeIgnoreCase(schema, "name");
+            if (String.IsNullOrWhiteSpace(name)) name = "<unnamed>";
+            var levels = new List<LodLevelRow>();
+            Int32 index = 0;
+            foreach (XmlElement level in schema.ChildNodes.OfType<XmlElement>()
+                     .Where(x => x.Name.Equals("LOD", StringComparison.OrdinalIgnoreCase))) {
+              String threshold = AttributeIgnoreCase(level, "threshold");
+              var extras = new List<String>();
+              foreach (XmlAttribute attribute in level.Attributes) {
+                if (attribute.Name.Equals("threshold", StringComparison.OrdinalIgnoreCase)) continue;
+                extras.Add(attribute.Name + "=" + attribute.Value);
+              }
+              levels.Add(new LodLevelRow {
+                Schema = name,
+                Index = index++,
+                Threshold = threshold,
+                Attributes = String.Join("; ", extras)
+              });
+            }
+            schemas.Add(new LodSchemaRow { Name = name, Levels = levels });
+          }
+        }
+
+        var overview = CreateGrid();
+        overview.Columns.Add("schema", "Schema");
+        overview.Columns.Add("levels", "LOD levels");
+        overview.Columns.Add("thresholds", "Thresholds");
+        overview.Columns[0].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        overview.Columns[2].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        foreach (LodSchemaRow schema in schemas.Take(VisibleRowLimit))
+          overview.Rows.Add(schema.Name, schema.Levels.Count,
+            String.Join(", ", schema.Levels.Select(x => String.IsNullOrWhiteSpace(x.Threshold) ? "?" : x.Threshold)));
+        AddTab("Schemas", overview);
+
+        var levelsGrid = CreateGrid();
+        levelsGrid.Columns.Add("schema", "Schema");
+        levelsGrid.Columns.Add("level", "Level");
+        levelsGrid.Columns.Add("threshold", "Threshold");
+        levelsGrid.Columns.Add("attributes", "Other attributes");
+        levelsGrid.Columns[0].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        levelsGrid.Columns[3].AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+        Int32 emitted = 0;
+        foreach (LodLevelRow level in schemas.SelectMany(x => x.Levels)) {
+          if (emitted++ >= VisibleRowLimit) break;
+          levelsGrid.Rows.Add(level.Schema, level.Index, level.Threshold, level.Attributes);
+        }
+        AddTab("Levels", levelsGrid);
+        AddRawTab();
+
+        Int32 totalLevels = schemas.Sum(x => x.Levels.Count);
+        _summary.Text = schemas.Count.ToString("n0", CultureInfo.InvariantCulture) + " schemas   "
+          + totalLevels.ToString("n0", CultureInfo.InvariantCulture) + " LOD levels";
+        if (schemas.Count > VisibleRowLimit || totalLevels > VisibleRowLimit)
+          _summary.Text += "   preview capped at " + VisibleRowLimit.ToString("n0", CultureInfo.InvariantCulture) + " rows";
+      }
+      catch (Exception ex) {
+        _summary.Text = "Structured parse failed: " + ex.Message;
+        AddRawTab();
+      }
+    }
+
+    private static String AttributeIgnoreCase(XmlElement element, String name) {
+      if (element == null || String.IsNullOrWhiteSpace(name)) return String.Empty;
+      foreach (XmlAttribute attribute in element.Attributes)
+        if (attribute.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) return attribute.Value;
+      return String.Empty;
+    }
+
+    private static void SplitBinding(String value, out String device, out String control) {
+      device = String.Empty;
+      control = String.Empty;
+      if (String.IsNullOrWhiteSpace(value)) return;
+      String first = value.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim() ?? String.Empty;
+      Int32 separator = first.IndexOf("::", StringComparison.Ordinal);
+      if (separator <= 0 || separator + 2 >= first.Length) return;
+      device = first.Substring(0, separator).Trim();
+      control = first.Substring(separator + 2).Trim();
+    }
+
     public void LoadVersionTxt(String sourcePath, String text) {
       ClearPreview();
       _raw.Text = text ?? String.Empty;
@@ -561,6 +710,26 @@ namespace PugTools {
       var rawPage = new TabPage("Raw");
       rawPage.Controls.Add(_raw);
       _tabs.TabPages.Add(rawPage);
+    }
+
+    private sealed class IniRow {
+      public String Section = String.Empty;
+      public String Key = String.Empty;
+      public String Value = String.Empty;
+      public String Device = String.Empty;
+      public String Control = String.Empty;
+    }
+
+    private sealed class LodSchemaRow {
+      public String Name = String.Empty;
+      public List<LodLevelRow> Levels = new List<LodLevelRow>();
+    }
+
+    private sealed class LodLevelRow {
+      public String Schema = String.Empty;
+      public Int32 Index;
+      public String Threshold = String.Empty;
+      public String Attributes = String.Empty;
     }
 
     private sealed class MapNoteRow {

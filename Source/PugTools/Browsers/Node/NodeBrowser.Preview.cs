@@ -39,6 +39,7 @@ namespace PugTools {
     private Boolean _nodePreviewUpdatingIppSetCheck;
     private Boolean _nodePreviewApplyingLayout;
     private Int32 _nodePreviewRememberedModelHeight = -1;
+    private Int32 _nodePreviewRememberedTextHeight = -1;
     private const String NodePreviewModelPanelName = "nodePreviewModelPanel";
     private const String NodePreviewBodyType = "bmn";
 
@@ -59,6 +60,7 @@ namespace PugTools {
       // raw node values, not in the narrow property sidebar. The original property grid and
       // extraction/actions pane on the right therefore stay untouched.
       if (_nodePreviewSplit != null || splitContainer3?.Panel1 == null || treeViewGrid1 == null) return;
+      _nodePreviewRememberedTextHeight = Config.NodePreviewTextHeight;
 
       splitContainer3.Panel1.Controls.Remove(treeViewGrid1);
       splitContainer3.Panel1.Controls.Remove(loadingSwirl1);
@@ -187,11 +189,15 @@ namespace PugTools {
       };
       _nodePreviewContentSplit.Resize += delegate { ResizeNodePreviewContent(); };
       _nodePreviewSplit.SplitterMoved += delegate {
-        // Keep the user's chosen model-preview height while moving between nodes.  Programmatic
-        // layout changes (text-only nodes, initial sizing, window constraints) must not overwrite it.
+        // Keep the user's chosen preview height while moving between nodes. Programmatic layout
+        // changes (initial sizing/window constraints) must not overwrite the remembered values.
         if (_nodePreviewApplyingLayout || _nodePreviewSplit.Panel1Collapsed) return;
-        if (_nodePreviewContentSplit == null || _nodePreviewContentSplit.Panel2Collapsed) return;
-        _nodePreviewRememberedModelHeight = _nodePreviewSplit.SplitterDistance;
+        if (_nodePreviewContentSplit != null && !_nodePreviewContentSplit.Panel2Collapsed) {
+          _nodePreviewRememberedModelHeight = _nodePreviewSplit.SplitterDistance;
+        } else {
+          _nodePreviewRememberedTextHeight = _nodePreviewSplit.SplitterDistance;
+          Config.NodePreviewTextHeight = _nodePreviewRememberedTextHeight;
+        }
       };
 
       ResizeNodePreviewLayout();
@@ -239,7 +245,9 @@ namespace PugTools {
           desiredPreviewHeight = Math.Max(560, _nodePreviewSplit.Height * 90 / 100);
         }
       } else if (hasTextBody) {
-        desiredPreviewHeight = Math.Max(220, CalculateNodePreviewInfoDesiredHeight());
+        desiredPreviewHeight = _nodePreviewRememberedTextHeight > 0
+          ? _nodePreviewRememberedTextHeight
+          : Math.Max(220, CalculateNodePreviewInfoDesiredHeight());
       } else if (hasIppSetOption) {
         desiredPreviewHeight = Math.Max(116, CalculateNodePreviewInfoDesiredHeight());
       } else {
@@ -1574,7 +1582,7 @@ namespace PugTools {
         _nodePreviewRenderer = null;
         _nodePreviewModels = null;
         _nodePreviewResources = null;
-        ThreadPool.QueueUserWorkItem(_ => {
+        BackgroundCleanup.Enqueue(() => {
           Boolean eventuallyStopped = stopped || renderThread == null || !renderThread.IsAlive;
           if (!eventuallyStopped) {
             try { eventuallyStopped = renderThread.Join(5000); } catch { }

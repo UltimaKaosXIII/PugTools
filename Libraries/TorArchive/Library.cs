@@ -62,6 +62,11 @@ namespace TorArchive {
     private readonly Object m_lockObject;
     private readonly Dictionary<UInt64, MetadataEntry> m_metadataLookup;
     private readonly String[] m_explicitArchivePaths;
+    // Jedipedia builds its archive index fault-tolerantly: one malformed TOR is
+    // reported but does not discard every healthy archive selected alongside it.
+    // Keep the same information on the Library so callers can surface diagnostics
+    // after a lazy load without turning normal FindFile calls into UI concerns.
+    private readonly List<String> m_loadWarnings = new List<String>();
 
     private const Byte LIVE = 0;
     private const Byte PTS  = 1;
@@ -157,11 +162,21 @@ namespace TorArchive {
           Int32 archiveIndex = 1;
           foreach (String archivePath in m_explicitArchivePaths) {
             if (!System.IO.File.Exists(archivePath)) continue;
-            Archives[archiveIndex++] = new Archive(archivePath, this);
+            try {
+              Archives[archiveIndex++] = new Archive(archivePath, this);
+            }
+            catch (InvalidDataException ex) {
+              RecordArchiveLoadWarning(archivePath, ex);
+            }
+            catch (EndOfStreamException ex) {
+              RecordArchiveLoadWarning(archivePath, ex);
+            }
           }
 
-          if (Archives.Count == 0)
-            throw new InvalidOperationException($"Cannot find archive files for library named {Name} in {Location}");
+          if (Archives.Count == 0) {
+            String detail = m_loadWarnings.Count > 0 ? " " + m_loadWarnings[0] : String.Empty;
+            throw new InvalidOperationException($"Cannot load any archive files for library named {Name} in {Location}.{detail}");
+          }
 
           Loaded = true;
           return;
@@ -212,6 +227,12 @@ namespace TorArchive {
       }
     }
 
+    private void RecordArchiveLoadWarning(String archivePath, Exception ex) {
+      String warning = $"Skipped invalid TOR '{archivePath}': {ex.Message}";
+      m_loadWarnings.Add(warning);
+      System.Diagnostics.Trace.WriteLine(warning);
+    }
+
     private void LoadMetadataFromFile(File metadataFile) {
       UInt32 numFiles = metadataFile.FileInfo.UncompressedSize / 32;
 
@@ -254,6 +275,7 @@ namespace TorArchive {
 
     #region Properties
     public Dictionary<Int32, Archive> Archives { get; }
+    public IReadOnlyList<String> LoadWarnings => m_loadWarnings;
     public Dictionary<UInt64, String> DuplicateDict => m_duplicateDict;
     public Byte Environment { get; }
     public String Name { get; }

@@ -941,6 +941,46 @@ namespace nsHashDictionary {
     }
 
     /// <summary>
+    /// Finds numeric immediate child directories below a known resource-path prefix. Unlike
+    /// FindKnownFileNamesByPathPrefix this does not allocate one String entry for every matching
+    /// filename in a compact PFD1 dictionary, which matters for /resources/world/areas/.
+    /// </summary>
+    public IReadOnlyCollection<UInt64> FindKnownNumericChildIdsByPathPrefix(String pathPrefix) {
+      if (String.IsNullOrWhiteSpace(pathPrefix)) return Array.Empty<UInt64>();
+      String normalizedPrefix = pathPrefix.Replace('\\', '/').Trim().ToLowerInvariant();
+      if (!normalizedPrefix.EndsWith("/", StringComparison.Ordinal)) normalizedPrefix += "/";
+
+      static void TryAddId(String rawName, String prefix, HashSet<UInt64> ids) {
+        if (String.IsNullOrWhiteSpace(rawName) || ids == null) return;
+        String name = rawName.Replace('\\', '/').Trim();
+        if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return;
+        Int32 start = prefix.Length;
+        Int32 slash = name.IndexOf('/', start);
+        if (slash <= start) return;
+        if (UInt64.TryParse(name.Substring(start, slash - start), out UInt64 id) && id != 0) ids.Add(id);
+      }
+
+      lock (m_hashListLock) {
+        var result = new HashSet<UInt64>();
+        if (m_compactNameStore != null) {
+          foreach (UInt64 id in m_compactNameStore.FindNumericChildIdsByPrefix(normalizedPrefix)) result.Add(id);
+          foreach (String liveName in m_runtimeFileNameChanges) TryAddId(liveName, normalizedPrefix, result);
+          return new List<UInt64>(result);
+        }
+
+        foreach (SortedList<UInt64, HashData> archive in m_hashList.Values) {
+          for (Int32 i = 0; i < archive.Count; i++) {
+            HashData data = archive.Values[i];
+            if (data == null) continue;
+            TryAddId(data.FileNameForSerialization, normalizedPrefix, result);
+          }
+        }
+        foreach (String liveName in m_runtimeFileNameChanges) TryAddId(liveName, normalizedPrefix, result);
+        return new List<UInt64>(result);
+      }
+    }
+
+    /// <summary>
     /// Finds already-known names for a small set of hashes without constructing the global
     /// hash-to-archive master index. Filename Finder uses this after a patch so a name that is
     /// already known in an older/other TOR can be copied to the current archive cheaply.

@@ -17,6 +17,116 @@ namespace FileFormats {
     public int PaintedVertices { get; set; }
   }
 
+  /// <summary>
+  /// One native terrain render vertex from the 0xF1234567 trailing block. SWTOR stores
+  /// grid coordinates plus packed normal/tangent vectors; the first float is still of
+  /// uncertain semantic meaning in the client format, so it is intentionally exposed as U.
+  /// </summary>
+  public struct HeightMapRenderVertex {
+    public float U;
+    public ushort X;
+    public ushort Z;
+    public sbyte NormalX;
+    public sbyte NormalY;
+    public sbyte NormalZ;
+    public sbyte NormalW;
+    public sbyte TangentX;
+    public sbyte TangentY;
+    public sbyte TangentZ;
+    public sbyte TangentW;
+  }
+
+  public sealed class HeightMapRenderLodRange {
+    public int SourceLevel { get; internal set; }
+    public int StartIndex { get; internal set; }
+    public int Count { get; internal set; }
+    public int TriangleCount => Count / 3;
+  }
+
+  /// <summary>
+  /// Jedipedia-compatible decoding of the native heightmap render-mesh trailer. The prefix
+  /// remains opaque, but its length, LOD/batch boundary table, vertex records and indices are
+  /// validated and retained for inspection and optional native terrain topology.
+  /// </summary>
+  public sealed class HeightMapRenderMesh {
+    public const uint Magic = 0xF1234567u;
+    public const uint FooterMagic = 0xABCDEFABu;
+
+    public long MarkerOffset { get; internal set; }
+    public int MinXFixed { get; internal set; }
+    public int MinZFixed { get; internal set; }
+    public int GridWidth { get; internal set; }
+    public int GridDepth { get; internal set; }
+    public int PrefixLength { get; internal set; }
+    public uint LevelCount { get; internal set; }
+    public uint[] BatchBoundaries { get; internal set; } = Array.Empty<uint>();
+    public HeightMapRenderVertex[] Vertices { get; internal set; } = Array.Empty<HeightMapRenderVertex>();
+    public ushort[] Indices { get; internal set; } = Array.Empty<ushort>();
+    public long RecordOffset { get; internal set; }
+    public long IndexOffset { get; internal set; }
+    public int VertexCount { get; internal set; }
+    public int IndexCount { get; internal set; }
+
+    public int TriangleCount => IndexCount / 3;
+    public float MinX => MinXFixed / 64f;
+    public float MinZ => MinZFixed / 64f;
+
+    /// <summary>
+    /// The native table has 4*K batches and therefore 4*K-1 explicit cumulative boundaries.
+    /// Jedipedia has established that they belong to the index-buffer batching, but corpus readers
+    /// do not require whether the stored unit is indices or bytes. Accept only an interpretation
+    /// where every boundary lands on a triangle edge and all K four-batch LOD ranges partition the
+    /// index buffer exactly. This intentionally fails closed for unknown layouts.
+    /// </summary>
+    public bool TryGetLodRanges(out HeightMapRenderLodRange[] ranges, out string boundaryUnit) {
+      ranges = Array.Empty<HeightMapRenderLodRange>();
+      boundaryUnit = null;
+      if (LevelCount < 1 || LevelCount > (uint)Int32.MaxValue || IndexCount < 3 || IndexCount % 3 != 0) return false;
+      ulong expected64 = 4UL * LevelCount - 1UL;
+      if (expected64 > Int32.MaxValue || BatchBoundaries == null || BatchBoundaries.Length != (int)expected64) return false;
+      if (TryGetLodRanges(1, out ranges)) { boundaryUnit = "indices"; return true; }
+      if (TryGetLodRanges(2, out ranges)) { boundaryUnit = "bytes"; return true; }
+      ranges = Array.Empty<HeightMapRenderLodRange>();
+      return false;
+    }
+
+    private bool TryGetLodRanges(int divisor, out HeightMapRenderLodRange[] ranges) {
+      ranges = Array.Empty<HeightMapRenderLodRange>();
+      int[] boundaries = new int[BatchBoundaries.Length];
+      int previous = -1;
+      for (int i = 0; i < BatchBoundaries.Length; i++) {
+        uint raw = BatchBoundaries[i];
+        if (raw % (uint)divisor != 0) return false;
+        ulong converted64 = raw / (uint)divisor;
+        if (converted64 >= (ulong)IndexCount || converted64 > Int32.MaxValue) return false;
+        int converted = (int)converted64;
+        if (converted <= previous || converted % 3 != 0) return false;
+        boundaries[i] = converted;
+        previous = converted;
+      }
+
+      int levels = (int)LevelCount;
+      var result = new HeightMapRenderLodRange[levels];
+      int covered = 0;
+      for (int level = 0; level < levels; level++) {
+        int start = level == 0 ? 0 : boundaries[level * 4 - 1];
+        int end = level == levels - 1 ? IndexCount : boundaries[level * 4 + 3];
+        int count = end - start;
+        if (start != covered || count <= 0 || count % 3 != 0) return false;
+        result[level] = new HeightMapRenderLodRange { SourceLevel = level, StartIndex = start, Count = count };
+        covered = end;
+      }
+      if (covered != IndexCount) return false;
+      ranges = result;
+      return true;
+    }
+
+    public void ReleaseGeometryData() {
+      Vertices = Array.Empty<HeightMapRenderVertex>();
+      Indices = Array.Empty<ushort>();
+    }
+  }
+
   public class HeightMap {
     public bool hasHoles;
     public float[,] elevation;
@@ -30,10 +140,17 @@ namespace FileFormats {
     public List<TerrainLayerMask> TerrainLayers { get; } = new List<TerrainLayerMask>();
     public List<DynamicDetailPaint> DynamicDetails { get; } = new List<DynamicDetailPaint>();
     public byte[] TerrainColorMapRgba { get; private set; }
+    public bool HasInstancePosition { get; private set; }
+    public float InstancePositionX { get; private set; }
+    public float InstancePositionY { get; private set; }
+    public float InstancePositionZ { get; private set; }
+    public HeightMapRenderMesh RenderMesh { get; private set; }
+    public string RenderMeshParseError { get; private set; }
+    public long UnexplainedTrailingBytes { get; private set; }
 
     private readonly Area area;
 
-    public HeightMap(BinaryReader br, Area area = null) {
+    public HeightMap(BinaryReader br, Area area = null, bool readRenderMesh = false) {
       this.area = area;
       headerBitFlag = br.ReadByte();
       width = br.ReadUInt32();
@@ -44,8 +161,12 @@ namespace FileFormats {
       elevation = new float[depth, width];
       bool sparse = (headerBitFlag & 8) != 0;
       if (sparse) {
-        // SWTOR stores a redundant copy of the placement position in sparse heightmaps.
-        br.ReadSingle(); br.ReadSingle(); br.ReadSingle();
+        // SWTOR stores a redundant copy of the placement position in sparse heightmaps. Jedipedia
+        // surfaces it in the parsed view because it is useful when checking room-placement data.
+        InstancePositionX = br.ReadSingle();
+        InstancePositionY = br.ReadSingle();
+        InstancePositionZ = br.ReadSingle();
+        HasInstancePosition = true;
       }
 
       hasHoles = br.ReadByte() == 1;
@@ -76,6 +197,14 @@ namespace FileFormats {
       } catch (IOException) {
         EnsureFallbackTerrain();
       }
+
+      long decodedEnd = br.BaseStream.CanSeek ? br.BaseStream.Position : 0;
+      // Dense version-2 heightmaps can append a native render mesh after the authored terrain data.
+      // Parsing is intentionally non-fatal: the elevation/splat data remains useful even when a
+      // malformed or partially-patched trailer cannot be validated.
+      if (readRenderMesh && headerBitFlag == 2) TryReadRenderMesh(br, decodedEnd);
+      if (readRenderMesh && br.BaseStream.CanSeek)
+        UnexplainedTrailingBytes = RenderMesh != null ? 0 : Math.Max(0, br.BaseStream.Length - decodedEnd);
     }
 
     private void SetElevation(int x, int z, float value) {
@@ -247,6 +376,181 @@ namespace FileFormats {
         }
         if(painted>0)DynamicDetails.Add(new DynamicDetailPaint{ChannelId=id,Density=density,PaintedVertices=painted});
       }
+    }
+
+    private void TryReadRenderMesh(BinaryReader br, long scanStart) {
+      if (!br.BaseStream.CanSeek || br.BaseStream.Length - scanStart < 24) return;
+      long restore = br.BaseStream.Position;
+      try {
+        long marker = FindTrailingMarker(br.BaseStream, scanStart);
+        if (marker >= br.BaseStream.Length) return;
+        RenderMesh = ReadRenderMesh(br, marker);
+        if (RenderMesh == null) RenderMeshParseError = "0xF1234567 marker found, but the render-mesh layout did not validate.";
+      } catch (Exception ex) when (ex is EndOfStreamException || ex is IOException || ex is OverflowException || ex is InvalidDataException) {
+        RenderMesh = null;
+        RenderMeshParseError = ex.Message;
+      } finally {
+        br.BaseStream.Position = restore;
+      }
+    }
+
+    private static HeightMapRenderMesh ReadRenderMesh(BinaryReader br, long markerPos) {
+      Stream stream = br.BaseStream;
+      long footerPos = stream.Length - 4;
+      if (markerPos < 0 || markerPos + 20 > footerPos) return null;
+
+      stream.Position = markerPos;
+      if (br.ReadUInt32() != HeightMapRenderMesh.Magic) return null;
+      int minX = br.ReadInt32();
+      int minZ = br.ReadInt32();
+      int meshWidth = br.ReadInt32();
+      int meshDepth = br.ReadInt32();
+      long bodyStart = stream.Position;
+
+      stream.Position = footerPos;
+      if (br.ReadUInt32() != HeightMapRenderMesh.FooterMagic) return null;
+      long bodyLength = footerPos - bodyStart;
+      if (bodyLength < 24) return null;
+
+      RenderMeshAnchor anchor = default;
+      bool found = false;
+      for (long candidate = bodyStart; candidate + 24 <= footerPos; candidate++) {
+        if (TryRenderMeshAnchor(br, candidate, bodyStart, footerPos, bodyLength, out anchor)) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) return null;
+
+      if (anchor.VertexCount > (UInt32)Int32.MaxValue || anchor.IndexCount > (UInt32)Int32.MaxValue)
+        throw new InvalidDataException("Heightmap render mesh is too large for the in-memory reader.");
+
+      stream.Position = anchor.TableStart;
+      uint[] boundaries = new uint[anchor.TableEntries];
+      for (int i = 0; i < boundaries.Length; i++) {
+        uint first = br.ReadUInt32();
+        uint duplicate = br.ReadUInt32();
+        if (first != duplicate) throw new InvalidDataException("Heightmap render-mesh batch boundary copy mismatch.");
+        boundaries[i] = first;
+      }
+
+      stream.Position = anchor.RecordStart;
+      var vertices = new HeightMapRenderVertex[(int)anchor.VertexCount];
+      for (int i = 0; i < vertices.Length; i++) {
+        vertices[i] = new HeightMapRenderVertex {
+          U = br.ReadSingle(),
+          X = br.ReadUInt16(),
+          Z = br.ReadUInt16(),
+          NormalX = br.ReadSByte(),
+          NormalY = br.ReadSByte(),
+          NormalZ = br.ReadSByte(),
+          NormalW = br.ReadSByte(),
+          TangentX = br.ReadSByte(),
+          TangentY = br.ReadSByte(),
+          TangentZ = br.ReadSByte(),
+          TangentW = br.ReadSByte()
+        };
+      }
+
+      stream.Position = anchor.IndexStart;
+      ushort[] indices = new ushort[(int)anchor.IndexCount];
+      for (int i = 0; i < indices.Length; i++) {
+        ushort index = br.ReadUInt16();
+        if (index >= vertices.Length)
+          throw new InvalidDataException($"Heightmap render-mesh index {index} exceeds vertex count {vertices.Length}.");
+        indices[i] = index;
+      }
+
+      return new HeightMapRenderMesh {
+        MarkerOffset = markerPos,
+        MinXFixed = minX,
+        MinZFixed = minZ,
+        GridWidth = meshWidth,
+        GridDepth = meshDepth,
+        PrefixLength = checked((int)(anchor.AnchorOffset - bodyStart)),
+        LevelCount = anchor.LevelCount,
+        BatchBoundaries = boundaries,
+        Vertices = vertices,
+        Indices = indices,
+        VertexCount = vertices.Length,
+        IndexCount = indices.Length,
+        RecordOffset = anchor.RecordStart,
+        IndexOffset = anchor.IndexStart
+      };
+    }
+
+    private struct RenderMeshAnchor {
+      public long AnchorOffset;
+      public uint LevelCount;
+      public int TableEntries;
+      public long TableStart;
+      public uint VertexCount;
+      public uint IndexCount;
+      public long RecordStart;
+      public long IndexStart;
+    }
+
+    private static bool TryRenderMeshAnchor(BinaryReader br, long candidate, long bodyStart,
+        long footerPos, long bodyLength, out RenderMeshAnchor anchor) {
+      anchor = default;
+      Stream stream = br.BaseStream;
+      if (candidate < bodyStart || candidate + 8 > footerPos) return false;
+      stream.Position = candidate;
+      uint levelCount = br.ReadUInt32();
+      if (levelCount < 1 || levelCount > 20000 || br.ReadUInt32() != 0) return false;
+
+      ulong tableEntryCount64 = 4UL * levelCount - 1;
+      if (tableEntryCount64 > (UInt64)Int32.MaxValue) return false;
+      int tableEntries = (int)tableEntryCount64;
+      long tableStart = candidate + 8;
+      long tableBytes;
+      try { tableBytes = checked((long)tableEntries * 8); }
+      catch (OverflowException) { return false; }
+      long trailerPos;
+      try { trailerPos = checked(tableStart + tableBytes); }
+      catch (OverflowException) { return false; }
+      if (trailerPos + 20 > footerPos) return false;
+
+      uint previous = 0;
+      bool havePrevious = false;
+      stream.Position = tableStart;
+      for (int i = 0; i < tableEntries; i++) {
+        uint first = br.ReadUInt32();
+        uint duplicate = br.ReadUInt32();
+        if (first != duplicate || (havePrevious && first <= previous) || first >= (ulong)bodyLength) return false;
+        previous = first;
+        havePrevious = true;
+      }
+
+      uint indexCount = br.ReadUInt32();
+      uint big1 = br.ReadUInt32();
+      uint vertexCount = br.ReadUInt32();
+      if (br.ReadUInt32() != indexCount) return false;
+      uint big2 = br.ReadUInt32();
+      ulong expectedDataBytes = (ulong)vertexCount * 16UL + (ulong)indexCount * 2UL;
+      if (expectedDataBytes > UInt32.MaxValue || big2 != (uint)expectedDataBytes) return false;
+      if ((ulong)big1 != expectedDataBytes + 12UL) return false;
+
+      long recordStart = trailerPos + 20;
+      long indexStart;
+      long end;
+      try {
+        indexStart = checked(recordStart + (long)vertexCount * 16L);
+        end = checked(indexStart + (long)indexCount * 2L);
+      } catch (OverflowException) { return false; }
+      if (end != footerPos) return false;
+
+      anchor = new RenderMeshAnchor {
+        AnchorOffset = candidate,
+        LevelCount = levelCount,
+        TableEntries = tableEntries,
+        TableStart = tableStart,
+        VertexCount = vertexCount,
+        IndexCount = indexCount,
+        RecordStart = recordStart,
+        IndexStart = indexStart
+      };
+      return true;
     }
 
     private void AddMasks(Dictionary<string, byte[]> masks, int mapWidth, int mapDepth) {

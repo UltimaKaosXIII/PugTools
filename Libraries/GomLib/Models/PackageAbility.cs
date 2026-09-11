@@ -10,6 +10,7 @@ namespace GomLib.Models {
     public DataObjectModel _dom;
     public PackageAbility() {
       Levels = new List<int>();
+      AttackWaves = new List<long>();
     }
     [JsonIgnore]
     public ulong PackageId { get; set; }
@@ -45,6 +46,7 @@ namespace GomLib.Models {
     public bool AutoAcquire { get; set; }
     public string Toughness { get; set; }
     public long AiUsePriority { get; set; }
+    public List<long> AttackWaves { get; set; }
     public bool IsUtilityPackage { get; set; }
     public long UtilityTier { get; set; }
     public long UtilityPosition { get; set; }
@@ -58,6 +60,7 @@ namespace GomLib.Models {
       hash ^= Level.GetHashCode();
       hash ^= AutoAcquire.GetHashCode();
       if (Toughness != null) hash ^= Toughness.GetHashCode();
+      if (AttackWaves != null) foreach (var x in AttackWaves) hash ^= x.GetHashCode();
       hash ^= IsUtilityPackage.GetHashCode();
       hash ^= UtilityTier.GetHashCode();
       hash ^= UtilityPosition.GetHashCode();

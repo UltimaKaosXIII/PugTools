@@ -105,48 +105,45 @@ namespace PugTools {
     }
     internal void ParseMISC_TUTORIAL(DataObjectModel currentDom) {
       StringTable tutorialTable = currentDom.StringTable.Find("str.gui.tutorials");
+      if (tutorialTable == null || tutorialTable.data == null) return;
 
-      if (tutorialTable != null && tutorialTable.data != null) {
-        foreach (KeyValuePair<Int64, StringTableEntry> item in tutorialTable.data) {
-          if (item.Value.LocalizedText.ContainsKey("enMale")) {
-            String text = item.Value.LocalizedText["enMale"];
+      // Tutorial markup is localized content too. German/French (and occasionally gendered) rows
+      // can contain image references not present in enMale, so inspect every distinct localized
+      // text. Locale directory siblings are expanded later by the Filename Finder and survive only
+      // when their exact current-build PH+SH exists.
+      foreach (KeyValuePair<Int64, StringTableEntry> item in tutorialTable.data) {
+        if (item.Value?.LocalizedText == null) continue;
+        var localizedTexts = new HashSet<String>(StringComparer.Ordinal);
+        foreach (String localizedText in item.Value.LocalizedText.Values) {
+          if (!String.IsNullOrWhiteSpace(localizedText)) localizedTexts.Add(localizedText);
+        }
 
-            if (text.Contains(".dds")) {
-              Int32 start = 0;
-
-              while ((start = text.IndexOf("img://", start)) != -1) {
-                Int32 end = text.IndexOf(".dds", start);
-
-                if (end != -1) {
-                  String temp = text.Substring(start, end - start + 4).ToLower();
-                  temp =
-                    temp.Replace("img://", "/resources/").Replace("//", "/").Replace(
-                      "<<grammar::locpath>>",
-                      "en-us"
-                    );
-                  _fileNames.Add(temp);
-                  start++;
-                }
-              }
-
-            } else if (text.Contains("img://")) {
-              Int32 start = 0;
-
-              while ((start = text.IndexOf("img://", start)) != -1) {
-                Int32 end = text.IndexOf("'", start);
-
-                if (end != -1) {
-                  String temp = text.Substring(start, (end - start) + 1).ToLower();
-                  temp =
-                    temp.Replace("img://", "/resources/").Replace("//", "/").Replace(
-                      "<<grammar::locpath>>",
-                      "en-us"
-                    );
-                  _fileNames.Add(temp + ".dds");
-                  start++;
-                }
-              }
+        foreach (String text in localizedTexts) {
+          Int32 start = 0;
+          while ((start = text.IndexOf("img://", start, StringComparison.OrdinalIgnoreCase)) != -1) {
+            Int32 ddsEnd = text.IndexOf(".dds", start, StringComparison.OrdinalIgnoreCase);
+            if (ddsEnd >= 0) {
+              String temp = text.Substring(start, ddsEnd - start + 4).ToLowerInvariant();
+              temp = temp.Replace("img://", "/resources/").Replace("//", "/");
+              _fileNames.Add(temp);
+              start = ddsEnd + 4;
+              continue;
             }
+
+            // Legacy tutorial markup sometimes omits .dds. Stop at the first quote/whitespace/tag
+            // delimiter and add the extension as a probe; exact hash validation rejects bad guesses.
+            Int32 end = start + 6;
+            while (end < text.Length) {
+              Char c = text[end];
+              if (c == '\'' || c == '"' || c == '<' || c == '>' || Char.IsWhiteSpace(c)) break;
+              end++;
+            }
+            if (end > start + 6) {
+              String temp = text.Substring(start, end - start).ToLowerInvariant();
+              temp = temp.Replace("img://", "/resources/").Replace("//", "/");
+              _fileNames.Add(temp + ".dds");
+            }
+            start = Math.Max(start + 6, end);
           }
         }
       }

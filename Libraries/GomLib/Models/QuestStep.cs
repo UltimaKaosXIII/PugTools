@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -14,6 +14,8 @@ namespace GomLib.Models {
     [Newtonsoft.Json.JsonIgnore]
     public DataObjectModel Dom_ { get; set; }
     public bool IsShareable { get; set; }
+    public long FailTime { get; set; }
+    public bool HideTimer { get; set; }
     public string JournalText { get; set; }
     public Dictionary<string, string> LocalizedJournalText { get; set; }
     public List<QuestTask> Tasks { get; set; }
@@ -22,8 +24,13 @@ namespace GomLib.Models {
     public List<Quest> BonusMissions {
       get {
         var bMissions = new List<Quest>();
+        if (Dom_ == null || BonusMissionsIds == null) return bMissions;
         foreach (var bonMisId in BonusMissionsIds) {
-          bMissions.Add(Dom_.QuestLoader.Load(bonMisId));
+          if (bonMisId == 0) continue;
+          try {
+            Quest mission = Dom_.QuestLoader.Load(bonMisId);
+            if (mission != null) bMissions.Add(mission);
+          } catch { }
         }
         return bMissions;
       }
@@ -36,7 +43,7 @@ namespace GomLib.Models {
       int hash = Id.GetHashCode();
       hash ^= IsShareable.GetHashCode();
       if (JournalText != null) { hash ^= JournalText.GetHashCode(); }
-      foreach (var x in Tasks) { hash ^= x.GetHashCode(); }
+      foreach (var x in Tasks ?? new List<QuestTask>()) { if (x != null) hash ^= x.GetHashCode(); }
       return hash;
     }
 
@@ -55,14 +62,8 @@ namespace GomLib.Models {
 
       if (ReferenceEquals(this, qss)) return true;
 
-      if (BonusMissions != null) {
-        if (qss.BonusMissions == null) {
-          return false;
-        } else {
-          if (!Enumerable.SequenceEqual(BonusMissions, qss.BonusMissions))
-            return false;
-        }
-      }
+      if (!Enumerable.SequenceEqual(BonusMissionsIds ?? new List<ulong>(), qss.BonusMissionsIds ?? new List<ulong>()))
+        return false;
       if (DbId != qss.DbId)
         return false;
       if (Id != qss.Id)
@@ -100,12 +101,14 @@ namespace GomLib.Models {
     }
 
     public XElement ToXElement(bool verbose) {
-      XElement stepNode = new XElement("Step", new XElement("JournalText", JournalText.Replace(Environment.NewLine, "<br>")),
+      XElement stepNode = new XElement("Step", new XElement("JournalText", (JournalText ?? String.Empty).Replace(Environment.NewLine, "<br>")),
                 new XAttribute("Id", Id),
                 new XElement("Shareable", IsShareable),
+                new XElement("FailTime", FailTime),
+                new XElement("HideTimer", HideTimer),
                 new XElement("ItemsTaken"));
       //new XAttribute("DBId", DbId)); //this is always 0
-      foreach (var task in Tasks) {
+      foreach (var task in Tasks ?? new List<QuestTask>()) {
         XElement taskNode = task.ToXElement(verbose);
         stepNode.Add(taskNode); //add task to tasks
       }
@@ -115,9 +118,12 @@ namespace GomLib.Models {
       }
 
       stepNode.Add(new XElement("BonusMissions"));
-      if (BonusMissions.Count > 0) {
-        foreach (var bonus in BonusMissions) {
-          stepNode.Element("BonusMissions").Add(bonus.ToXElement(true));
+      if (BonusMissionsIds != null && BonusMissionsIds.Count > 0) {
+        foreach (UInt64 bonusId in BonusMissionsIds.Where(x => x != 0)) {
+          String fqn = Dom_?.GetStoredTypeName(bonusId);
+          stepNode.Element("BonusMissions").Add(
+            new XElement("Quest", new XAttribute("Id", bonusId),
+              String.IsNullOrWhiteSpace(fqn) ? null : new XAttribute("Fqn", fqn)));
         }
       }
 

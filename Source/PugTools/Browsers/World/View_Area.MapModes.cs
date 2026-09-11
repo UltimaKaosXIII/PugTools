@@ -142,12 +142,16 @@ namespace PugTools {
       AreaMapPage selected = MiniMapSelectedPage;
       bool forceFullExtent = miniMapCaptureForceFullExtent;
       miniMapCaptureForceFullExtent = false;
-      bool usePageBounds = !MiniMapIsWorldScope || (miniMapPreferOriginalArt && selected?.HasImage == true);
-      if (usePageBounds && InteractiveMapPageHasBounds(selected)) SetInteractiveMapExtentFromPage(selected);
-      else if (forceFullExtent && mapFullExtentMaxX > mapFullExtentMinX && mapFullExtentMaxZ > mapFullExtentMinZ) {
-        mapExtentMinX = mapFullExtentMinX; mapExtentMaxX = mapFullExtentMaxX;
-        mapExtentMinZ = mapFullExtentMinZ; mapExtentMaxZ = mapFullExtentMaxZ;
-      } else ApplyMapExtentSelection();
+      if (!MiniMapIsWorldScope && InteractiveMapPageHasBounds(selected)) SetInteractiveMapExtentFromPage(selected);
+      else {
+        if (forceFullExtent && mapFullExtentMaxX > mapFullExtentMinX && mapFullExtentMaxZ > mapFullExtentMinZ) {
+          mapExtentMinX = mapFullExtentMinX; mapExtentMaxX = mapFullExtentMaxX;
+          mapExtentMinZ = mapFullExtentMinZ; mapExtentMaxZ = mapFullExtentMaxZ;
+        } else ApplyMapExtentSelection();
+        // Same rule as the large M-map: an incomplete authored world map is an overlay, not the crop rectangle for
+        // the generated world. This keeps terrain/rooms outside the SWTOR DDS visible in the small minimap as well.
+        if (miniMapPreferOriginalArt && selected?.HasImage == true) ExpandMapExtentToIncludePage(selected);
+      }
       mapCenter = new Vector2((mapExtentMinX + mapExtentMaxX) * .5f, (mapExtentMinZ + mapExtentMaxZ) * .5f);
       mapZoom = 1f;
       UpdateMapCamera();
@@ -278,12 +282,26 @@ namespace PugTools {
       mapExtentMaxZ = Math.Max(page.Min.Z, page.Max.Z);
     }
 
+    private void ExpandMapExtentToIncludePage(AreaMapPage page) {
+      if (!InteractiveMapPageHasBounds(page)) return;
+      mapExtentMinX = Math.Min(mapExtentMinX, Math.Min(page.Min.X, page.Max.X));
+      mapExtentMaxX = Math.Max(mapExtentMaxX, Math.Max(page.Min.X, page.Max.X));
+      mapExtentMinZ = Math.Min(mapExtentMinZ, Math.Min(page.Min.Z, page.Max.Z));
+      mapExtentMaxZ = Math.Max(mapExtentMaxZ, Math.Max(page.Min.Z, page.Max.Z));
+    }
+
     private void ApplyInteractiveMapScopeExtents(bool resetView) {
       if (!mapOpen) return;
       AreaMapPage selected = InteractiveMapSelectedPage;
-      bool usePageBounds = !InteractiveMapIsWorldScope || (interactiveMapPreferOriginalArt && selected?.HasImage == true);
-      if (usePageBounds && InteractiveMapPageHasBounds(selected)) SetInteractiveMapExtentFromPage(selected);
-      else ApplyMapExtentSelection();
+      // Area/submap pages keep SWTOR's authored page bounds. A world page is different: many authored world maps
+      // intentionally cover only the useful travel/map-note region and omit valid world geometry around it. Keep the
+      // generated PugTools world extent and merely expand it when the authored page reaches farther. The original DDS
+      // is then drawn as a world-coordinate overlay instead of cutting everything outside its rectangle away.
+      if (!InteractiveMapIsWorldScope && InteractiveMapPageHasBounds(selected)) SetInteractiveMapExtentFromPage(selected);
+      else {
+        ApplyMapExtentSelection();
+        if (interactiveMapPreferOriginalArt && selected?.HasImage == true) ExpandMapExtentToIncludePage(selected);
+      }
       if (resetView) {
         mapCenter = new Vector2((mapExtentMinX + mapExtentMaxX) * .5f, (mapExtentMinZ + mapExtentMaxZ) * .5f);
         mapZoom = 1f;

@@ -1,5 +1,6 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -121,7 +122,7 @@ namespace GomLib.Models {
       if (CanAbandon != qst.CanAbandon)
         return false;
 
-      if (!Category.Equals(qst.Category)) {
+      if (!String.Equals(Category, qst.Category, StringComparison.Ordinal)) {
         return false;
       }
 
@@ -137,7 +138,7 @@ namespace GomLib.Models {
         }
       }
 
-      if (!Difficulty.Equals(qst.Difficulty))
+      if (!String.Equals(Difficulty, qst.Difficulty, StringComparison.Ordinal))
         return false;
 
       if (Fqn != qst.Fqn)
@@ -202,7 +203,7 @@ namespace GomLib.Models {
     }
 
     public override Int32 GetHashCode() {
-      Int32 hash = Name.GetHashCode();
+      Int32 hash = (Name ?? String.Empty).GetHashCode();
 
       if (Icon != null) {
         hash ^= Icon.GetHashCode();
@@ -211,20 +212,20 @@ namespace GomLib.Models {
       hash ^= IsRepeatable.GetHashCode();
       hash ^= RequiredLevel.GetHashCode();
       hash ^= XpLevel.GetHashCode();
-      hash ^= Difficulty.GetHashCode();
+      hash ^= (Difficulty ?? String.Empty).GetHashCode();
       hash ^= CanAbandon.GetHashCode();
       hash ^= IsHidden.GetHashCode();
       hash ^= IsClassQuest.GetHashCode();
       hash ^= IsBonus.GetHashCode();
       hash ^= BonusShareable.GetHashCode();
-      hash ^= Category.GetHashCode();
+      hash ^= (Category ?? String.Empty).GetHashCode();
 
-      foreach (QuestBranch branch in Branches) {
-        hash ^= branch.GetHashCode();
+      foreach (QuestBranch branch in Branches ?? new List<QuestBranch>()) {
+        if (branch != null) hash ^= branch.GetHashCode();
       }
 
-      foreach (ClassSpec classSpec in Classes) {
-        hash ^= classSpec.Id.GetHashCode();
+      foreach (ClassSpec classSpec in Classes ?? new ClassSpecList()) {
+        if (classSpec != null) hash ^= classSpec.Id.GetHashCode();
       }
 
       return hash;
@@ -338,18 +339,22 @@ namespace GomLib.Models {
         //int r = 1;
         if (Rewards != null) {
           foreach (var rewardEntry in Rewards.OrderBy(x => x.RewardItemId)) {
-            if (rewardEntry.RewardItem != null) {
-              questNode.Add(rewardEntry.ToXElement(verbose));
+            try {
+              if (rewardEntry.RewardItem != null) questNode.Add(rewardEntry.ToXElement(verbose));
+            } catch (Exception ex) {
+              Debug.WriteLine($"Quest reward output failed for {Fqn}: {ex.Message}");
             }
-            //r++;
           }
         }
         //questNode.Add(rewards);
 
-        foreach (var branch in Branches) {
-          XElement branchNode = branch.ToXElement(verbose);
-          questNode.Add(branchNode); //add branch to branches
-
+        foreach (var branch in Branches ?? new List<QuestBranch>()) {
+          try {
+            XElement branchNode = branch.ToXElement(verbose);
+            questNode.Add(branchNode);
+          } catch (Exception ex) {
+            Debug.WriteLine($"Quest branch output failed for {Fqn}: {ex.Message}");
+          }
         }
         //Trash our repeat XElement holders
         m_loadedNpcs = null;

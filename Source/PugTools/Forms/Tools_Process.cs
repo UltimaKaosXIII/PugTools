@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -999,6 +999,12 @@ namespace PugTools {
       Dictionary<GameObject, GameObject> chaItems = new Dictionary<GameObject, GameObject>();
       List<GameObject> newItems = new List<GameObject>();
       List<GameObject> remItems = new List<GameObject>();
+      List<GameObject> changedWithoutPreviousModel = new List<GameObject>();
+      List<String> loadFailures = new List<String>();
+      Int32 rawQuestCompared = 0;
+      Int32 rawQuestChanged = 0;
+      Int32 rawQuestNew = 0;
+      Int32 rawQuestRemoved = 0;
       Int32 i = 0;
       Int32 count = 0;
 
@@ -1008,35 +1014,72 @@ namespace PugTools {
         // Couldn't find a more elegant way to do this with linq.
         List<String> removedNames =
           prevItmNames.Except(curItmNames).ToList();
+        if (gomPrefix == "qst.") rawQuestRemoved = removedNames.Count;
 
         ClearProgress();
 
         i = 0;
         count = curItmList.Count() + removedNames.Count;
 
-        foreach (var curObject in curItmList) {
+        foreach (GomObject curObject in curItmList) {
           ProgressUpdate(i, count);
+          GomObject prevObject = null;
+          Boolean rawChanged = false;
           try {
+            // Do the cheap raw-GOM classification before the semantic quest loader touches/unloads
+            // the object.  This gives the quest extractor a schema-independent source of truth and
+            // makes the diagnostics useful even if a future client field temporarily breaks parsing.
+            try { prevObject = PreviousDom.GetObject(curObject.Name); } catch { prevObject = null; }
+            if (gomPrefix == "qst.") {
+              if (prevObject == null) {
+                rawQuestNew++;
+              } else {
+                rawQuestCompared++;
+                try {
+                  rawChanged = !prevObject.Equals(curObject);
+                  if (rawChanged) rawQuestChanged++;
+                } catch (Exception ex) {
+                  Debug.WriteLine($"Raw quest comparison failed for {curObject.Name}: {ex.Message}");
+                }
+              }
+            }
+
             GameObject curItm = LoadGameObject(CurrentDom, curObject, classOverride);
             if (curItm == null) {
               AddToList2(String.Join("", "Skipped: ", curObject.Name, " (loader returned null)"));
-            } else {
-              GomObject prevObject = PreviousDom.GetObject(curObject.Name);
-              if (prevObject != null) {
-                GameObject prevItm = LoadGameObject(PreviousDom, prevObject, classOverride);
-                if (prevItm != null && !prevItm.Equals(curItm)) {
+            } else if (prevObject != null) {
+              GameObject prevItm = null;
+              try {
+                prevItm = LoadGameObject(PreviousDom, prevObject, classOverride);
+              } catch (Exception ex) {
+                String failure = String.Join("", "Previous parse failed: ", curObject.Name, " - ", ex.GetType().Name, ": ", ex.Message);
+                AddToList2(failure);
+                loadFailures.Add(failure);
+              }
+
+              if (prevItm != null) {
+                if (rawChanged || !prevItm.Equals(curItm)) {
                   AddToList2(String.Join("", "Changed: ", curItm.Fqn));
                   chaItems[prevItm] = curItm;
                 }
-              } else {
-                AddToList2(String.Join("", "New: ", curItm.Fqn));
-                newItems.Add(curItm);
+              } else if (rawChanged) {
+                // We still know from the raw GOM that the quest changed. Keep the current parsed
+                // side instead of dropping the quest merely because the old build's semantic model
+                // could not be reconstructed.
+                AddToList2(String.Join("", "Changed: ", curItm.Fqn, " (previous parsed model unavailable)"));
+                changedWithoutPreviousModel.Add(curItm);
               }
+            } else {
+              AddToList2(String.Join("", "New: ", curItm.Fqn));
+              newItems.Add(curItm);
             }
           } catch (Exception ex) {
-            AddToList2(String.Join("", "Skipped: ", curObject.Name, " - ", ex.GetType().Name, ": ", ex.Message));
+            String failure = String.Join("", "Skipped: ", curObject.Name, " - ", ex.GetType().Name, ": ", ex.Message);
+            AddToList2(failure);
+            loadFailures.Add(failure);
           } finally {
-            curObject.Unload();
+            try { prevObject?.Unload(); } catch { }
+            try { curObject.Unload(); } catch { }
           }
           i++;
         }
@@ -1044,17 +1087,25 @@ namespace PugTools {
         foreach (String removedName in removedNames) {
           ProgressUpdate(i, count);
           AddToList2(String.Join("", "Removed: ", removedName));
-          GameObject prevItm =
-            LoadGameObject(PreviousDom, PreviousDom.GetObject(removedName), classOverride);
-
-          remItems.Add(prevItm);
+          GomObject removedObject = null;
+          try {
+            removedObject = PreviousDom.GetObject(removedName);
+            GameObject prevItm = LoadGameObject(PreviousDom, removedObject, classOverride);
+            if (prevItm != null) remItems.Add(prevItm);
+          } catch (Exception ex) {
+            String failure = String.Join("", "Removed parse failed: ", removedName, " - ", ex.GetType().Name, ": ", ex.Message);
+            AddToList2(failure);
+            loadFailures.Add(failure);
+          } finally {
+            removedObject?.Unload();
+          }
           i++;
         }
 
         ClearProgress();
 
         ObjectLists.Add("New", newItems);
-        ObjectLists.Add("Changed", chaItems.Values.ToList());
+        ObjectLists.Add("Changed", chaItems.Values.Concat(changedWithoutPreviousModel).ToList());
         ObjectLists.Add("Removed", remItems);
 
       } else {
@@ -1067,7 +1118,9 @@ namespace PugTools {
             GameObject obj = LoadGameObject(curObject.Dom_, curObject, classOverride);
             if (obj != null && obj.Id != 0) newItems.Add(obj);
           } catch (Exception ex) {
-            AddToList2(String.Join("", "Skipped: ", curObject.Name, " - ", ex.GetType().Name, ": ", ex.Message));
+            String failure = String.Join("", "Skipped: ", curObject.Name, " - ", ex.GetType().Name, ": ", ex.Message);
+            AddToList2(failure);
+            loadFailures.Add(failure);
           } finally {
             curObject.Unload();
           }
@@ -1078,8 +1131,20 @@ namespace PugTools {
         ObjectLists.Add("Full", newItems);
       }
 
+      if (gomPrefix == "qst." && chkBuildCompare.Checked) {
+        AddToList1(String.Format(
+          "Quest raw scan - {0:N0} compared, {1:N0} changed, {2:N0} new, {3:N0} removed; {4:N0} parse warning(s)",
+          rawQuestCompared, rawQuestChanged, rawQuestNew, rawQuestRemoved, loadFailures.Count));
+      }
+
       Clearlist2();
       AddToList2(String.Format("Generating {0} Output", s_outputTypeName));
+      if (loadFailures.Count > 0) {
+        AddToList2(String.Format(
+          "Warning: {0:N0} {1} object(s) could not be parsed. Showing the first {2:N0} error(s):",
+          loadFailures.Count, xmlRoot, Math.Min(20, loadFailures.Count)));
+        foreach (String failure in loadFailures.Take(20)) AddToList2(failure);
+      }
 
       XDocument xmlDoc = new XDocument();
       XElement elements = new XElement(xmlRoot);
@@ -1109,11 +1174,27 @@ namespace PugTools {
               newElement = CompareElements(oldElement, newElement);
               oldElement = null;
 
+              // A raw qst object may have changed only in a newly-added field that the legacy XML
+              // model does not expose yet.  Do not turn that real patch change back into "0 changed".
+              if (newElement == null && gomPrefix == "qst.")
+                newElement = ConvertToXElement(changedPair.Value);
+
               if (newElement != null) {
                 newElement.Add(new XAttribute("Status", itmList.Key));
                 elements.Add(newElement);
               }
 
+              i++;
+            }
+
+            foreach (GameObject changed in changedWithoutPreviousModel) {
+              ProgressUpdate(i, count);
+              XElement newElement = ConvertToXElement(changed);
+              if (newElement != null) {
+                newElement.Add(new XAttribute("Status", itmList.Key));
+                newElement.Add(ReferencesToXElement(changed.References));
+                elements.Add(newElement);
+              }
               i++;
             }
 
@@ -1402,6 +1483,39 @@ namespace PugTools {
         WriteFile(currentFields, "Gom_Fields.xml", false);
       }
     }
+    private static Dictionary<Object, Object> ReadPrototypeTable(GomObject dataObject, String dataTable,
+                                                                  out String resolvedTable) {
+      resolvedTable = dataTable;
+      if (dataObject == null) return new Dictionary<Object, Object>();
+
+      if (String.Equals(dataTable, "mtxStorefrontData", StringComparison.OrdinalIgnoreCase)) {
+        Dictionary<Object, Object> current = dataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+          "mtxStorefrontItems", null);
+        if (current != null) {
+          resolvedTable = "mtxStorefrontItems";
+          return current;
+        }
+      }
+      if (String.Equals(dataTable, "colCollectionItemsData", StringComparison.OrdinalIgnoreCase)
+          || String.Equals(dataTable, "colMtxItemIdToCollectionItem", StringComparison.OrdinalIgnoreCase)) {
+        Dictionary<Object, Object> current = dataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+          "colMtxItemIdToCollectionItem", null)
+          ?? dataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            "4611686297655094008", null);
+        if (current != null) {
+          resolvedTable = "colMtxItemIdToCollectionItem";
+          return current;
+        }
+        Dictionary<Object, Object> legacy = dataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+          "colCollectionItemsData", null);
+        if (legacy != null) {
+          resolvedTable = "colCollectionItemsData";
+          return legacy;
+        }
+      }
+      return dataObject.Data.ValueOrDefault(dataTable, new Dictionary<Object, Object>());
+    }
+
     public void ProcessProtoData(String xmlRoot, String prototype, String dataTable) {
       if (!OutputCompatible(xmlRoot)) {
         ClearProgress();
@@ -1413,7 +1527,8 @@ namespace PugTools {
       GomObject currentDataObject = CurrentDom.GetObject(prototype);
 
       if (currentDataObject != null) { // Fix to ensure old game assets don't throw exceptions.
-        currentDataProto = currentDataObject.Data.Get<Dictionary<Object, Object>>(dataTable);
+        currentDataProto = ReadPrototypeTable(currentDataObject, dataTable, out String resolvedTable);
+        dataTable = resolvedTable;
         currentDataObject.Unload();
       } else { // Check replaced prototype
         Dictionary<String, KeyValuePair<String, String>> replacedProtos =
@@ -1429,7 +1544,8 @@ namespace PugTools {
 
           // Fix to ensure old game assets don't throw exceptions.
           if (currentDataObject != null) {
-            currentDataProto = currentDataObject.Data.Get<Dictionary<Object, Object>>(dataTable);
+            currentDataProto = ReadPrototypeTable(currentDataObject, dataTable, out String resolvedTable);
+            dataTable = resolvedTable;
             currentDataObject.Unload();
           }
         }
@@ -1451,7 +1567,7 @@ namespace PugTools {
 
         // Fix to ensure old game assets don't throw exceptions.
         if (previousDataObject != null) {
-          previousDataProto = previousDataObject.Data.Get<Dictionary<Object, Object>>(dataTable);
+          previousDataProto = ReadPrototypeTable(previousDataObject, dataTable, out _);
           previousDataObject.Unload();
         }
 

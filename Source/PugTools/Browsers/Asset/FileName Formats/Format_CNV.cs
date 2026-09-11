@@ -26,6 +26,8 @@ namespace PugTools {
       foreach (GomObject obj in cnvNodes) {
         String under = obj.Name.ToLower().ToString().Replace('.', '_');
         String slash = obj.Name.ToLower().ToString().Replace('.', '/');
+        // Localized CNV resources use en-us only as a canonical seed. The central Filename Finder
+        // validation pass expands de-de/fr-fr and accepts only hashes that exist in the build.
         String stb = "/resources/en-us/str/" + slash + ".stb";
         String acb = "/resources/en-us/bnk2/" + under + ".acb";
         String fxe = "/resources/en-us/fxe/" + slash + ".fxe";

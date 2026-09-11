@@ -1056,6 +1056,8 @@ namespace PugTools {
         if (bnk.STID.NumSoundBanks != 0) {
           foreach (var obj in bnk.STID.SoundBanks) {
             _fileNames.Add(bankRoot + obj.Name + ".bnk");
+            // Localized bank names are seeded once; the final hash-validation pass expands the
+            // locale and therefore does not invent de-de/fr-fr banks that are absent from SWTOR.
             _fileNames.Add((isBeta ? "/resources/en-us/bnk/" : "/resources/en-us/bnk2/") + obj.Name + ".bnk");
           }
         }

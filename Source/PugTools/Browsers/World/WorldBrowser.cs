@@ -220,8 +220,14 @@ namespace PugTools {
     private Dictionary<ulong, WorldAreaOverride> worldAreaOverrides = new Dictionary<ulong, WorldAreaOverride>();
     private readonly Dictionary<ulong, string> worldAreaInternalNames = new Dictionary<ulong, string>();
     private readonly HashSet<ulong> worldSystemGeneratedAreaIds = new HashSet<ulong>();
+    private readonly Dictionary<ulong, WorldAreaCatalogEntry> worldInferredAreaCatalog = new Dictionary<ulong, WorldAreaCatalogEntry>();
+    private readonly Dictionary<ulong, string> worldAreaInferenceNotes = new Dictionary<ulong, string>();
+    private readonly Dictionary<ulong, HashSet<string>> worldJedipediaRoomFingerprints = new Dictionary<ulong, HashSet<string>>();
     private const string WorldLiveContentCategory = "Live Content";
     private const string WorldSystemGeneratedGroup = "System Generated";
+    private const double WorldAreaInferenceMinimumSimilarity = 0.75;
+    private const double WorldAreaInferenceMinimumMargin = 0.10;
+    private const int WorldAreaInferenceMinimumSharedRooms = 20;
 
     // Shared with the Asset Browser so both trees use the authored area.dat name when the
     // installed client knows more than the bundled Jedipedia catalog.
@@ -297,6 +303,9 @@ namespace PugTools {
       worldAreaOverrides = WorldAreaNameOverrides.LoadEntries();
       worldAreaInternalNames.Clear();
       worldSystemGeneratedAreaIds.Clear();
+      worldInferredAreaCatalog.Clear();
+      worldAreaInferenceNotes.Clear();
+      worldJedipediaRoomFingerprints.Clear();
       var detectedAreaNames = new List<(ulong Id, string InternalName, string Category, string Group)>();
 
       // mapareasdata is not a complete world list: class phases, old/development maps and some newer areas are
@@ -307,12 +316,16 @@ namespace PugTools {
       foreach (WorldAreaCatalogEntry entry in WorldAreaCatalog.Entries) candidateIds.Add(entry.Id);
       foreach (ulong id in worldAreaOverrides.Keys) candidateIds.Add(id);
 
-      // Live clients can contain generated worlds that never appear in mapareasdata or the bundled Jedipedia
-      // catalog. Recover every numeric ID referenced by a KNOWN filename below
-      // /resources/world/livecontent/systemgenerated/ in the filename dictionary, then probe the installed client
-      // for the deterministic <id>/area.dat path. This also discovers an area when only one of its room DAT filenames is
-      // known. The compact PFD1 pool is prefix-searched directly, so this does not walk/materialise millions
-      // of unrelated filenames.
+      // Current Retail/PTS patches can add ordinary /resources/world/areas/<id>/ trees before that area reaches
+      // mapareasdata or the bundled Jedipedia catalog. Recover every numeric area directory referenced by the
+      // filename dictionary on ALL client generations, then let FindFile(area.dat) below decide whether that area
+      // is actually installed. The compact PFD1 implementation extracts only the numeric child IDs and therefore
+      // does not materialise the ~tens of thousands of world filenames into a temporary String list.
+      foreach (ulong installedAreaId in DiscoverInstalledNamedWorldAreaIds()) candidateIds.Add(installedAreaId);
+
+      // Live clients can also contain generated worlds outside /resources/world/areas/. Discover these from the
+      // filename dictionary on every generation as well. Any known file below the numeric directory is sufficient;
+      // the authoritative area.dat existence probe still happens below.
       foreach (ulong installedAreaId in DiscoverInstalledSystemGeneratedWorldAreaIds()) {
         candidateIds.Add(installedAreaId);
         worldSystemGeneratedAreaIds.Add(installedAreaId);
@@ -352,6 +365,17 @@ namespace PugTools {
         if (String.IsNullOrWhiteSpace(internalName)) internalName = ReadAreaInternalName(areaFile);
         if (!String.IsNullOrWhiteSpace(internalName)) worldAreaInternalNames[id] = internalName.Trim();
 
+        // Jedipedia's area-ids.json is deliberately curated, so a newly patched area can exist in PFD1 before the
+        // public viewer list has been updated. For uncatalogued ordinary areas, compare only their room-DAT names
+        // with the bundled Jedipedia catalog. A high Jaccard match with a clear runner-up margin lets clones/variants
+        // inherit the same category and subgroup without guessing from broad prefixes such as "int_" or "raid_".
+        // Weak/ambiguous matches stay in Unassigned. Exact catalog entries always win when Jedipedia later adds them.
+        if (!systemGenerated && catalogEntry == null
+            && TryInferJedipediaAreaFolder(id, internalName, out WorldAreaCatalogEntry inferredEntry)) {
+          catalogEntry = inferredEntry;
+          worldInferredAreaCatalog[id] = inferredEntry;
+        }
+
         string defaultCategory = systemGenerated
           ? WorldLiveContentCategory
           : catalogEntry?.Category ?? WorldAreaNameOverrides.UnassignedCategory;
@@ -384,26 +408,111 @@ namespace PugTools {
       loadedAssetDict = newAssetDict;
     }
 
-    private IEnumerable<ulong> DiscoverInstalledSystemGeneratedWorldAreaIds() {
-      var result = new HashSet<ulong>();
-      const string prefix = "/resources/world/livecontent/systemgenerated/";
+    private bool TryInferJedipediaAreaFolder(ulong areaId, string internalName, out WorldAreaCatalogEntry inferred) {
+      inferred = null;
+      HashSet<string> unknownRooms = GetWorldAreaRoomFingerprint(areaId);
+      if (unknownRooms.Count < WorldAreaInferenceMinimumSharedRooms) return false;
+
+      WorldAreaCatalogEntry best = null;
+      double bestSimilarity = 0.0;
+      double secondSimilarity = 0.0;
+      int bestShared = 0;
+
+      foreach (WorldAreaCatalogEntry candidate in WorldAreaCatalog.Entries) {
+        HashSet<string> knownRooms = GetJedipediaRoomFingerprint(candidate.Id);
+        if (knownRooms.Count == 0) continue;
+
+        int shared = 0;
+        // Iterate the smaller set to keep newly patched mega-areas cheap.
+        if (unknownRooms.Count <= knownRooms.Count) {
+          foreach (string room in unknownRooms) if (knownRooms.Contains(room)) shared++;
+        } else {
+          foreach (string room in knownRooms) if (unknownRooms.Contains(room)) shared++;
+        }
+        if (shared < WorldAreaInferenceMinimumSharedRooms) continue;
+
+        int union = unknownRooms.Count + knownRooms.Count - shared;
+        if (union <= 0) continue;
+        double similarity = shared / (double)union;
+        if (similarity > bestSimilarity) {
+          secondSimilarity = bestSimilarity;
+          bestSimilarity = similarity;
+          bestShared = shared;
+          best = candidate;
+        } else if (similarity > secondSimilarity) {
+          secondSimilarity = similarity;
+        }
+      }
+
+      if (best == null || bestShared < WorldAreaInferenceMinimumSharedRooms
+          || bestSimilarity < WorldAreaInferenceMinimumSimilarity
+          || bestSimilarity - secondSimilarity < WorldAreaInferenceMinimumMargin)
+        return false;
+
+      string referenceName = StripJedipediaMarkup(best.Comment);
+      if (String.IsNullOrWhiteSpace(referenceName)) referenceName = best.InternalName;
+      string percent = (bestSimilarity * 100.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
+      string note = "Auto-classified from room layout: " + referenceName + " (" + percent + "% Jedipedia match)";
+      inferred = new WorldAreaCatalogEntry(
+        areaId, best.Category, best.Group, internalName ?? String.Empty, String.Empty,
+        best.CategoryOrder, best.GroupOrder, Int32.MaxValue
+      );
+      worldAreaInferenceNotes[areaId] = note;
+      System.Diagnostics.Debug.WriteLine(
+        "World area " + areaId + " inferred as " + best.Category + " / " + best.Group
+        + " from Jedipedia area " + best.Id + " at " + percent + "% room similarity."
+      );
+      return true;
+    }
+
+    private HashSet<string> GetJedipediaRoomFingerprint(ulong areaId) {
+      if (worldJedipediaRoomFingerprints.TryGetValue(areaId, out HashSet<string> cached)) return cached;
+      HashSet<string> fingerprint = GetWorldAreaRoomFingerprint(areaId);
+      worldJedipediaRoomFingerprints[areaId] = fingerprint;
+      return fingerprint;
+    }
+
+    private static bool IsWorldAreaFingerprintNoise(string relativePath) {
+      return String.Equals(relativePath, "area.dat", StringComparison.OrdinalIgnoreCase)
+        || String.Equals(relativePath, "_everywhere_.dat", StringComparison.OrdinalIgnoreCase)
+        || String.Equals(relativePath, "default.dat", StringComparison.OrdinalIgnoreCase)
+        || String.Equals(relativePath, "temp.dat", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private HashSet<string> GetWorldAreaRoomFingerprint(ulong areaId) {
+      var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
       try {
-        IReadOnlyList<string> knownPaths = HashDictionaryInstance.Instance.Dictionary.FindKnownFileNamesByPathPrefix(prefix);
-        foreach (string path in knownPaths) TryAddSystemGeneratedWorldAreaId(path, result);
+        string prefix = "/resources/world/areas/" + areaId + "/";
+        foreach (string rawPath in HashDictionaryInstance.Instance.Dictionary.FindKnownFileNamesByPathPrefix(prefix)) {
+          if (String.IsNullOrWhiteSpace(rawPath) || rawPath.Length <= prefix.Length) continue;
+          string normalized = rawPath.Replace('\\', '/');
+          if (!normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+          string relative = normalized.Substring(prefix.Length);
+          if (!relative.EndsWith(".dat", StringComparison.OrdinalIgnoreCase) || IsWorldAreaFingerprintNoise(relative)) continue;
+          result.Add(relative);
+        }
       } catch { }
       return result;
     }
 
-    private static void TryAddSystemGeneratedWorldAreaId(string rawPath, HashSet<ulong> result) {
-      if (result == null || String.IsNullOrWhiteSpace(rawPath)) return;
-      string path = rawPath.Replace('\\', '/').Trim();
-      const string prefix = "/resources/world/livecontent/systemgenerated/";
-      int start = path.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
-      if (start < 0) return;
-      start += prefix.Length;
-      int slash = path.IndexOf('/', start);
-      string idText = slash < 0 ? path.Substring(start) : path.Substring(start, slash - start);
-      if (UInt64.TryParse(idText, out ulong id) && id != 0) result.Add(id);
+    private IEnumerable<ulong> DiscoverInstalledNamedWorldAreaIds() {
+      try {
+        return HashDictionaryInstance.Instance.Dictionary.FindKnownNumericChildIdsByPathPrefix(
+          "/resources/world/areas/"
+        );
+      } catch {
+        return Array.Empty<ulong>();
+      }
+    }
+
+    private IEnumerable<ulong> DiscoverInstalledSystemGeneratedWorldAreaIds() {
+      try {
+        return HashDictionaryInstance.Instance.Dictionary.FindKnownNumericChildIdsByPathPrefix(
+          "/resources/world/livecontent/systemgenerated/"
+        );
+      } catch {
+        return Array.Empty<ulong>();
+      }
     }
 
     private static bool IsSystemGeneratedWorldPath(string rawPath) {
@@ -652,8 +761,9 @@ namespace PugTools {
       if (String.IsNullOrWhiteSpace(needle)) return true;
       string q = needle.Trim();
       bool Has(string candidate) => !String.IsNullOrWhiteSpace(candidate) && candidate.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0;
+      worldAreaInferenceNotes.TryGetValue(item.Id, out string inferenceNote);
       return Has(item.Id.ToString()) || Has(item.Asset?.displayName) || Has(item.InternalName) || Has(item.Override?.Name) || Has(item.Override?.InternalName)
-        || Has(item.Catalog?.InternalName) || Has(item.Catalog?.Comment) || Has(item.Category) || Has(item.Group);
+        || Has(item.Catalog?.InternalName) || Has(item.Catalog?.Comment) || Has(inferenceNote) || Has(item.Category) || Has(item.Group);
     }
 
     private TreeNode CreateWorldTreeLeaf(WorldTreeEntry item) {
@@ -682,9 +792,11 @@ namespace PugTools {
         SelectedImageIndex = 2
       };
       string comment = StripJedipediaMarkup(item.Catalog?.Comment);
+      worldAreaInferenceNotes.TryGetValue(item.Id, out string inferenceNote);
       string folder = String.IsNullOrWhiteSpace(item.Group) ? item.Category : item.Category + " / " + item.Group;
       node.ToolTipText = folder
         + (String.IsNullOrWhiteSpace(comment) ? String.Empty : Environment.NewLine + comment)
+        + (String.IsNullOrWhiteSpace(inferenceNote) ? String.Empty : Environment.NewLine + inferenceNote)
         + (String.IsNullOrWhiteSpace(internalName) ? String.Empty : Environment.NewLine + internalName)
         + Environment.NewLine + item.Id;
       return node;
@@ -697,9 +809,16 @@ namespace PugTools {
       foreach (var kvp in loadedAssetDict) {
         if (kvp.Key == "/" || !ulong.TryParse(kvp.Key.Trim('/'), out ulong id)) continue;
         WorldAreaCatalogEntry catalog = WorldAreaCatalog.Entries.FirstOrDefault(x => x.Id == id);
+        if (catalog == null) worldInferredAreaCatalog.TryGetValue(id, out catalog);
         worldAreaOverrides.TryGetValue(id, out WorldAreaOverride userEntry);
         bool systemGenerated = worldSystemGeneratedAreaIds.Contains(id);
+        bool generatedUnassignedPlaceholder = userEntry != null
+          && String.IsNullOrWhiteSpace(userEntry.Name)
+          && String.Equals(userEntry.Category?.Trim(), WorldAreaNameOverrides.UnassignedCategory, StringComparison.OrdinalIgnoreCase)
+          && String.IsNullOrWhiteSpace(userEntry.Group)
+          && catalog != null;
         bool userHasCustomFolder = userEntry != null
+          && !generatedUnassignedPlaceholder
           && !String.IsNullOrWhiteSpace(userEntry.Category)
           && (catalog == null
               || !String.Equals(userEntry.Category.Trim(), catalog.Category ?? String.Empty, StringComparison.OrdinalIgnoreCase)
@@ -713,6 +832,12 @@ namespace PugTools {
           // genuinely custom folder assignment remains respected.
           category = WorldLiveContentCategory;
           group = WorldSystemGeneratedGroup;
+        } else if (generatedUnassignedPlaceholder) {
+          // v21 could already have persisted a newly discovered area as the automatic Unassigned placeholder.
+          // Once the Jedipedia-based classifier can place it confidently, migrate that untouched placeholder while
+          // continuing to respect entries whose name/folder was actually edited by the user.
+          category = catalog?.Category ?? WorldAreaNameOverrides.UnassignedCategory;
+          group = catalog?.Group ?? String.Empty;
         } else {
           category = !String.IsNullOrWhiteSpace(userEntry?.Category)
             ? userEntry.Category.Trim()
@@ -4421,16 +4546,15 @@ namespace PugTools {
         List<AreaAsset> speedTreeAssets = area.AssetsByExtension.ContainsKey("spt")
           ? area.AssetsByExtension["spt"]
           : new List<AreaAsset>();
-        // A large share of shipped .spt placements has a same-stem .gr2 companion. Jedipedia decodes the raw
-        // SpeedTree file in WASM; PugTools can already render Granny robustly, so use the companion as a static
-        // fallback until the native .spt decoder/wind path is ported. Do NOT use .spt.gr2 here: those are the
-        // SpeedTree collision/proxy companions and would visibly render collision geometry.
+        // SpeedTree placements are streamed from their native .spt procedural source. The background model
+        // streamer reconstructs a deterministic static tree and only falls back to a same-stem visual .gr2 when
+        // an unusual/beta SPT cannot be expanded. Do NOT use .spt.gr2: those are collision/proxy companions.
         var renderAssetById = new Dictionary<ulong, AreaAsset>();
         foreach (AreaAsset asset in gr2Assets) if (asset != null) renderAssetById[asset.Id] = asset;
         foreach (AreaAsset asset in speedTreeAssets) if (asset != null && !renderAssetById.ContainsKey(asset.Id)) renderAssetById[asset.Id] = asset;
 
         int totalInstances = 0, matchedAssets = 0, ignoredGr2Assets = 0, missingGr2Files = 0, failedGr2Loads = 0;
-        int speedTreeLoaded = 0, speedTreeMissingFallback = 0;
+        int speedTreeNativeQueued = 0, speedTreeMissingSource = 0;
         var matchedSpeedTreeAssets = new HashSet<ulong>();
         var attemptedRenderAssets = new HashSet<ulong>();
         var modelLoadRequests = new List<WorldModelStreamRequest>();
@@ -4452,11 +4576,18 @@ namespace PugTools {
             // v6 keeps only this tiny asset catalog at area-load time. Actual TOR reads and GR2 parsing happen when
             // the room enters the camera working set, rather than decoding every normal world model up front.
             if (!attemptedRenderAssets.Add(asset.Id)) continue;
-            string modelPath = "/resources/" + asset.Path.Replace("\\", "/") + ".gr2";
-            File modelFile = currentAssets.FindFile(modelPath);
-            if (modelFile == null) {
-              if (isSpeedTree) speedTreeMissingFallback++; else missingGr2Files++;
-              continue;
+            string normalizedAssetPath = asset.Path.Replace("\\", "/");
+            if (isSpeedTree) {
+              string sptPath = "/resources/" + normalizedAssetPath + ".spt";
+              string fallbackPath = "/resources/" + normalizedAssetPath + ".gr2";
+              File sptFile = currentAssets.FindFile(sptPath);
+              File fallbackFile = currentAssets.FindFile(fallbackPath);
+              if (sptFile == null && fallbackFile == null) { speedTreeMissingSource++; continue; }
+              speedTreeNativeQueued++;
+            } else {
+              string modelPath = "/resources/" + normalizedAssetPath + ".gr2";
+              File modelFile = currentAssets.FindFile(modelPath);
+              if (modelFile == null) { missingGr2Files++; continue; }
             }
             modelLoadRequests.Add(new WorldModelStreamRequest(asset.Id, asset.Path, isSpeedTree));
           }
@@ -4479,9 +4610,9 @@ namespace PugTools {
         PreloadWorldSpaceCombatEncounterAssets();
 
         SetStatusLabel(string.Format(
-          "Rooms:{0} GR2Assets:{1} SPTAssets:{2} Instanzen:{3} zugeordnet:{4} ignoriert:{5} vorgemerkt:{6} GR2fehlt:{7} GR2Fehler:{8} | SpeedTree fallback:{9}/{10} (ohne GR2:{11}) | Utilities:{12} NPCs:{13} SPN:{14} | {15}",
+          "Rooms:{0} GR2Assets:{1} SPTAssets:{2} Instanzen:{3} zugeordnet:{4} ignoriert:{5} vorgemerkt:{6} GR2fehlt:{7} GR2Fehler:{8} | SpeedTree native:{9}/{10} (Quelle+Fallback fehlen:{11}) | Utilities:{12} NPCs:{13} SPN:{14} | {15}",
           area.RoomList.Count, gr2Assets.Count, speedTreeAssets.Count, totalInstances, matchedAssets, ignoredGr2Assets,
-          modelLoadRequests.Count, missingGr2Files, failedGr2Loads, speedTreeLoaded, speedTreeMatched, speedTreeMissingFallback,
+          modelLoadRequests.Count, missingGr2Files, failedGr2Loads, speedTreeNativeQueued, speedTreeMatched, speedTreeMissingSource,
           worldUtilityModels.Count, worldNpcPlacements.Count, worldSpnPlacements.Count, area.DebugHeaderInfo));
 
         UpdateWorldLoading("Starting visible-room streaming…",0,Math.Max(1,modelLoadRequests.Count));
@@ -4537,26 +4668,21 @@ namespace PugTools {
       }
 
       if (renderer == null) {
-        CleanupWorldRenderResources();
+        BackgroundCleanup.Enqueue(CleanupWorldRenderResources);
         return;
       }
 
+      // Stop work immediately, but never wait for or release thousands of D3D resources on the
+      // WinForms thread. Even a render thread that exits quickly can make Clear() spend seconds
+      // walking terrain/material COM objects. The single low-priority cleanup worker serializes
+      // that cost across all closing browsers instead of hammering CPU/GPU concurrently.
       try { renderer.StopRender(); } catch { }
-      Boolean stopped = renderThread == null || !renderThread.IsAlive;
-      if (!stopped) {
-        try { stopped = renderThread.Join(750); } catch { }
-      }
-
-      if (stopped) {
-        CleanupWorldRenderResources();
-      } else {
-        // A slow D3D shutdown must not freeze every open PugTools browser. Finish cleanup after
-        // the render thread has actually exited instead of blocking the WinForms message loop.
-        ThreadPool.QueueUserWorkItem(_ => {
+      BackgroundCleanup.Enqueue(() => {
+        if (renderThread != null && renderThread.IsAlive) {
           try { renderThread.Join(); } catch { }
-          CleanupWorldRenderResources();
-        });
-      }
+        }
+        CleanupWorldRenderResources();
+      });
     }
 
     public void SetStatusLabel(string message) {

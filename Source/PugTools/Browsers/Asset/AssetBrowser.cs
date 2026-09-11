@@ -75,6 +75,7 @@ namespace PugTools {
     private readonly Boolean m_assetsUsePts;
     private WaveOutEvent m_waveOut;
     private XmlDocument m_xmlDoc;
+    private DataObjectModel m_navigationDom;
     private readonly Object m_previewTextureDecodeLock = new Object();
     // HashDictionary is process-wide. Multiple Asset Browser windows may coexist, but two
     // Filename Finder passes must not mutate its SortedLists at the same time.
@@ -84,6 +85,15 @@ namespace PugTools {
     // extraction/navigation paths are unchanged; only the visible folder label and search gain
     // the authored internal map name (for example 4611686019802841877  hut_main).
     private readonly Dictionary<UInt64, String> m_worldAreaInternalNames = new Dictionary<UInt64, String>();
+
+    // File-reader style navigation. This is deliberately an in-memory history over the already
+    // built asset tree; it does not create a database or rescan the TOR archives.
+    private readonly List<String> m_assetNavigationHistory = new List<String>();
+    private Int32 m_assetNavigationHistoryIndex = -1;
+    private Boolean m_assetHistoryNavigation;
+    private BrowserSessionTabs m_assetPageTabs;
+    private String m_pendingResourceNavigation;
+    private Boolean m_pendingResourceNavigationNewTab;
 
     // DirectMusic SGT playback. SGTs are decoded to an in-memory PCM WAV so beta
     // Microsoft-ADPCM assets do not depend on an installed Windows ACM codec.
@@ -122,7 +132,11 @@ namespace PugTools {
       InitializeAudioBankPreview();
       InitializeAssetFilterTreeView();
       InitializeAssetTreeLiveFilter();
+      InitializeAssetPageTabs();
       InitializeIdenticalFilesContextMenu();
+      // File-reader style cross-links for all structured tree previews, not only the
+      // dedicated MAT/FX controls. Double-clicking a resource path opens it in-place.
+      treeViewGrid1.MouseDoubleClick += TreeViewGrid1MouseDoubleClickNavigateAsset;
       Config.Load();
 
       m_assetsLocation = assetLocation;
@@ -240,7 +254,7 @@ namespace PugTools {
         // D3D resource release can take a noticeable amount of time on some
         // drivers. Never make FormClosed wait for it. The render loop has
         // already been told to stop; finish cleanup off the WinForms thread.
-        ThreadPool.QueueUserWorkItem(_ => {
+        BackgroundCleanup.Enqueue(() => {
           Boolean stopped = renderThread == null || !renderThread.IsAlive;
           if (!stopped) {
             try { stopped = renderThread.Join(5000); } catch { }
@@ -256,10 +270,8 @@ namespace PugTools {
         m_assetFilterTree = null;
       }
 
-      if (treeViewFast1 != null) {
-        treeViewFast1.Dispose();
-        treeViewFast1 = null;
-      }
+      // Form.Dispose() owns the main tree. Avoid explicitly traversing it a second time here.
+      treeViewFast1 = null;
 
       try { StopSgtPreview(true); } catch { }
       try {
@@ -292,6 +304,7 @@ namespace PugTools {
       m_structuredTextPreview = null;
 
       m_assetDict = null;
+      m_navigationDom = null;
       m_assetSearchIndex = Array.Empty<AssetSearchEntry>();
       m_fullAssetTree = null;
 
@@ -334,9 +347,11 @@ namespace PugTools {
     }
 
     private void AssetBrowserFormResize(Object sender, EventArgs e) {
-      Size treeSize = new Size(splitContainer2.Panel1.Width, splitContainer2.Panel1.Height - 70);
+      Int32 tabHeight = m_assetPageTabs?.Height ?? 0;
+      Size treeSize = new Size(splitContainer2.Panel1.Width, Math.Max(20, splitContainer2.Panel1.Height - 70 - tabHeight));
       if (treeViewFast1 != null) treeViewFast1.Size = treeSize;
       if (m_assetFilterTree != null) m_assetFilterTree.Size = treeSize;
+      if (m_assetPageTabs != null) m_assetPageTabs.Width = splitContainer2.Panel1.Width;
     }
 
     #endregion
@@ -823,14 +838,22 @@ namespace PugTools {
       // The old implementation called BeginUpdate/LoadItems directly from this worker thread,
       // which was a cross-thread UI access and still forced every later filter reset to allocate
       // and sort the complete tree again.
+      Dictionary<String, String> heroScriptAliases = BuildHeroScriptQuickOpenAliases(m_currentAssets);
       m_assetSearchIndex = m_assetDict.Values
         .Where(item => item?.HashInfo?.File != null)
-        .Select(item => new AssetSearchEntry(
-          item.Id,
-          item.DisplayName,
-          item.HashInfo.IsNamed,
-          item.HashInfo.FirstSeenVersion
-        ))
+        .Select(item => {
+          String resourcePath = BuildAssetQuickOpenPath(item.HashInfo);
+          heroScriptAliases.TryGetValue(resourcePath ?? String.Empty, out String scriptAlias);
+          return new AssetSearchEntry(
+            item.Id,
+            item.DisplayName,
+            item.HashInfo.IsNamed,
+            item.HashInfo.FirstSeenVersion,
+            resourcePath,
+            item.HashInfo.File == null ? String.Empty : item.HashInfo.File.FileInfo.FileId.ToString("X16", CultureInfo.InvariantCulture),
+            scriptAlias
+          );
+        })
         .ToArray();
 
       String getId(TreeListItem x) => x.Id;
@@ -885,6 +908,7 @@ namespace PugTools {
       ButtonsEnable();
 
       txtSearch.Focus();
+      ApplyPendingResourceNavigation();
     }
 
     #endregion
@@ -1696,10 +1720,32 @@ namespace PugTools {
               break;
             }
 
+            case "INI": {
+              String iniText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_structuredTextPreview.LoadIni(selectedAssetPath, iniText);
+              m_structuredTextPreview.Visible = true;
+              m_structuredTextPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              toolStripStatusLabel1.Text = "INI keybinding inspector";
+              toolStripStatusLabel2.Text = "Sections, commands and device/control bindings parsed from the client file.";
+              return;
+            }
+
+            case "LOD": {
+              String lodText = await Task.Run(ReadCurrentPreviewTextSmart);
+              m_structuredTextPreview.LoadLod(selectedAssetPath, lodText);
+              m_structuredTextPreview.Visible = true;
+              m_structuredTextPreview.BringToFront();
+              LoadingSwirl1Hide();
+              ProgressBar1Hide();
+              toolStripStatusLabel1.Text = "LOD schema inspector";
+              toolStripStatusLabel2.Text = "Schema thresholds used by model LOD selection.";
+              return;
+            }
+
             case "XML":
             case "SVY":
-            case "LOD":
-            case "INI":
             case "TAB":
             case "ABL":
             case "CAM":
@@ -3561,13 +3607,58 @@ namespace PugTools {
       internal String DisplayName { get; }
       internal Boolean IsNamed { get; }
       internal String FirstSeenVersion { get; }
+      internal String ResourcePath { get; }
+      internal String FileId { get; }
+      internal String SearchAlias { get; }
 
-      internal AssetSearchEntry(String id, String displayName, Boolean isNamed, String firstSeenVersion) {
+      internal AssetSearchEntry(String id, String displayName, Boolean isNamed, String firstSeenVersion, String resourcePath, String fileId, String searchAlias = null) {
         Id = id ?? String.Empty;
         DisplayName = displayName ?? String.Empty;
         IsNamed = isNamed;
         FirstSeenVersion = firstSeenVersion;
+        ResourcePath = resourcePath ?? String.Empty;
+        FileId = fileId ?? String.Empty;
+        SearchAlias = searchAlias ?? String.Empty;
       }
+    }
+
+    private static Dictionary<String, String> BuildHeroScriptQuickOpenAliases(Assets assets) {
+      Dictionary<String, String> result = new Dictionary<String, String>(StringComparer.OrdinalIgnoreCase);
+      if (assets == null) return result;
+
+      foreach (String listPath in new[] {
+        "/resources/systemgenerated/scriptdef.list",
+        "/resources/systemgenerated/scripts.list"
+      }) {
+        try {
+          using TorArchive.File listFile = assets.FindFile(listPath);
+          if (listFile == null) continue;
+          using System.IO.Stream stream = listFile.OpenCopyInMemory();
+          using System.IO.BinaryReader reader = new System.IO.BinaryReader(stream, System.Text.Encoding.UTF8, false);
+          ViewHeroScriptLists.HeroScriptListInfo list = ViewHeroScriptLists.Parse(reader);
+          foreach (ViewHeroScriptLists.HeroScriptListEntry script in list.Scripts) {
+            if (script == null || String.IsNullOrWhiteSpace(script.Name)) continue;
+            String compiledPath = "/resources/systemgenerated/compilednative/"
+              + script.Id.ToString(CultureInfo.InvariantCulture);
+            result[compiledPath] = script.Name;
+          }
+          // Live clients use scriptdef.list; beta clients use scripts.list. The first
+          // successfully named list is authoritative and avoids parsing both formats.
+          if (result.Count > 0) break;
+        }
+        catch (Exception ex) {
+          System.Diagnostics.Debug.WriteLine("HeroScript Quick Open index failed for " + listPath + ": " + ex.Message);
+        }
+      }
+      return result;
+    }
+
+    private static String BuildAssetQuickOpenPath(HashFileInfo info) {
+      if (info == null) return String.Empty;
+      if (!info.IsNamed) return "File ID 0x" + (info.File == null ? String.Empty : info.File.FileInfo.FileId.ToString("X16", CultureInfo.InvariantCulture));
+      String directory = (info.Directory ?? String.Empty).TrimEnd('/', '\\');
+      String name = info.FileName ?? String.Empty;
+      return (directory + "/" + name).Replace("//", "/");
     }
 
     private sealed class AssetTreeFilterResult {
@@ -4206,9 +4297,10 @@ namespace PugTools {
             if (String.IsNullOrWhiteSpace(stem)) continue;
             stem = stem.Replace('.', '/').Replace('\\', '/').Trim('/').ToLowerInvariant();
             if (stem.Length == 0) continue;
-            candidates.Add("/resources/de-de/" + stem + ".stb");
+            // Seed one canonical locale only. The final exact-hash validation pass expands
+            // en-us/de-de/fr-fr centrally, so the manifest harvester follows the same rules as
+            // CNV, BNK, STB, tutorial images and imported candidate lists.
             candidates.Add("/resources/en-us/" + stem + ".stb");
-            candidates.Add("/resources/fr-fr/" + stem + ".stb");
           }
         }
       }
@@ -4363,34 +4455,41 @@ namespace PugTools {
 
       if (currentUnnamedFiles.Count == 0) return;
 
-      foreach (String line in LegacyUnnamedFileNameResolver.ExpandCandidates(testLines)) {
-        if (String.IsNullOrWhiteSpace(line)) continue;
+      // Locale variants are deliberately generated only here, after every parser/heuristic has
+      // produced its structural candidates. A de-de/fr-fr filename is therefore persisted only
+      // when its own SWTOR PH+SH is present among the unresolved files in THIS loaded build. This
+      // discovers localized siblings without polluting the dictionary merely because an en-us
+      // spelling was plausible.
+      foreach (String structuralCandidate in LegacyUnnamedFileNameResolver.ExpandCandidates(testLines)) {
+        foreach (String line in LegacyUnnamedFileNameResolver.ExpandLocalizedCandidate(structuralCandidate)) {
+          if (String.IsNullOrWhiteSpace(line)) continue;
 
-        FileId candidateId = FileId.FromFilePath(line);
-        UInt64 signature = ((UInt64)candidateId.Ph << 32) | candidateId.Sh;
-        if (!currentUnnamedFiles.TryGetValue(signature, out List<HashFileInfo> targets)) continue;
+          FileId candidateId = FileId.FromFilePath(line);
+          UInt64 signature = ((UInt64)candidateId.Ph << 32) | candidateId.Sh;
+          if (!currentUnnamedFiles.TryGetValue(signature, out List<HashFileInfo> targets)) continue;
 
-        // Hash equality already proves the candidate belongs to these unresolved current-build
-        // entries. Persist it for each physical TOR copy represented by the Asset Browser without
-        // calling Library.FindFile() for every generated probe.
-        Boolean persisted = false;
-        foreach (HashFileInfo target in targets) {
-          TorArchive.File currentFile = target?.File;
-          if (currentFile?.FileInfo == null || currentFile.Archive == null) continue;
-          if (currentFile.FileInfo.PrimaryHash != candidateId.Ph
-              || currentFile.FileInfo.SecondaryHash != candidateId.Sh) continue;
+          // Hash equality already proves the candidate belongs to these unresolved current-build
+          // entries. Persist it for each physical TOR copy represented by the Asset Browser without
+          // calling Library.FindFile() for every generated probe.
+          Boolean persisted = false;
+          foreach (HashFileInfo target in targets) {
+            TorArchive.File currentFile = target?.File;
+            if (currentFile?.FileInfo == null || currentFile.Archive == null) continue;
+            if (currentFile.FileInfo.PrimaryHash != candidateId.Ph
+                || currentFile.FileInfo.SecondaryHash != candidateId.Sh) continue;
 
-          m_hashData.Dictionary.AddHash(
-            candidateId.Ph,
-            candidateId.Sh,
-            line,
-            currentFile.FileInfo.CRC,
-            currentFile.Archive.StrippedFileName
-          );
-          persisted = true;
+            m_hashData.Dictionary.AddHash(
+              candidateId.Ph,
+              candidateId.Sh,
+              line,
+              currentFile.FileInfo.CRC,
+              currentFile.Archive.StrippedFileName
+            );
+            persisted = true;
+          }
+
+          if (persisted) m_foundFiles.Add(line);
         }
-
-        if (persisted) m_foundFiles.Add(line);
       }
     }
 
@@ -4650,6 +4749,8 @@ namespace PugTools {
       TreeNode node = e?.Node ?? (sender as TreeViewFast.Controls.TreeViewFast)?.SelectedNode;
       if (node?.Tag is not TreeListItem asset) return;
 
+      if (asset.HashInfo?.File != null && !m_assetHistoryNavigation) RecordAssetNavigation(asset.Id);
+      if (asset.HashInfo?.File != null) m_assetPageTabs?.UpdateCurrent(asset.Id, AssetTabTitle(asset));
       Text = "Asset Browser - " + asset.Id.ToString();
 
       if (m_waveOut != null && m_waveOut.PlaybackState != PlaybackState.Stopped) m_waveOut.Stop();
@@ -4789,6 +4890,174 @@ namespace PugTools {
     private void TreeViewFast1KeyDown(Object sender, KeyEventArgs e) {
       if (e.Control && e.KeyCode == Keys.F)
         txtSearch.Focus();
+      else if (e.Control && e.KeyCode == Keys.E) {
+        ShowAssetQuickOpen();
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+      }
+    }
+
+    protected override Boolean ProcessCmdKey(ref Message msg, Keys keyData) {
+      if (m_assetPageTabs != null && m_assetPageTabs.ProcessShortcut(keyData)) return true;
+      if (keyData == (Keys.Control | Keys.E)) { ShowAssetQuickOpen(); return true; }
+      if (keyData == (Keys.Alt | Keys.Left)) { NavigateAssetHistory(-1); return true; }
+      if (keyData == (Keys.Alt | Keys.Right)) { NavigateAssetHistory(1); return true; }
+      return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    private void InitializeAssetPageTabs() {
+      if (splitContainer2?.Panel1 == null) return;
+      m_assetPageTabs = new BrowserSessionTabs {
+        Location = new Point(0, 68),
+        Width = splitContainer2.Panel1.Width,
+        Height = 29,
+        Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+      };
+      m_assetPageTabs.NavigateRequested += delegate (Object sender, BrowserSessionTabs.NavigateEventArgs e) {
+        if (String.IsNullOrWhiteSpace(e.Key)) return;
+        m_assetHistoryNavigation = true;
+        try { NavigateToAssetId(e.Key); }
+        finally { m_assetHistoryNavigation = false; }
+      };
+      splitContainer2.Panel1.Controls.Add(m_assetPageTabs);
+      m_assetPageTabs.BringToFront();
+      AssetBrowserFormResize(this, EventArgs.Empty);
+    }
+
+    private static String AssetTabTitle(TreeListItem asset) {
+      if (asset == null) return "Asset";
+      try {
+        if (asset.HashInfo?.IsNamed == true && !String.IsNullOrWhiteSpace(asset.HashInfo.FileName))
+          return Path.GetFileName(asset.HashInfo.FileName);
+      } catch { }
+      return String.IsNullOrWhiteSpace(asset.DisplayName) ? asset.Id : asset.DisplayName;
+    }
+
+    internal Boolean MatchesAssetSource(String gamePath, Boolean usePts) {
+      if (m_assetsUsePts != usePts) return false;
+      try {
+        return String.Equals(Assets.NormalizeGamePath(m_assetsLocation), Assets.NormalizeGamePath(gamePath), StringComparison.OrdinalIgnoreCase);
+      } catch {
+        return String.Equals(m_assetsLocation?.TrimEnd('\\', '/'), gamePath?.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
+      }
+    }
+
+    internal void NavigateOrQueueResource(String resourcePath, Boolean newTab = false) {
+      if (String.IsNullOrWhiteSpace(resourcePath)) return;
+      if (TryNavigateResourcePath(resourcePath, newTab)) return;
+      m_pendingResourceNavigation = resourcePath;
+      m_pendingResourceNavigationNewTab = newTab;
+      StatusLabel2Text("Waiting for asset index to open " + resourcePath + " ...");
+    }
+
+    private void ApplyPendingResourceNavigation() {
+      if (String.IsNullOrWhiteSpace(m_pendingResourceNavigation)) return;
+      String path = m_pendingResourceNavigation;
+      Boolean newTab = m_pendingResourceNavigationNewTab;
+      m_pendingResourceNavigation = null;
+      m_pendingResourceNavigationNewTab = false;
+      if (!TryNavigateResourcePath(path, newTab))
+        StatusLabel2Text("Referenced asset was not found: " + path);
+    }
+
+    internal Boolean TryNavigateResourcePath(String raw, Boolean newTab = false) {
+      if (String.IsNullOrWhiteSpace(raw) || m_assetDict == null) return false;
+      foreach (String candidate in BuildStructuredAssetCandidates(raw)) {
+        String normalized = candidate.Replace('\\', '/').Trim();
+        if (!normalized.StartsWith("/resources/", StringComparison.OrdinalIgnoreCase))
+          normalized = "/resources/" + normalized.TrimStart('/');
+        String id = "/root/named" + normalized.ToLowerInvariant();
+        if (!m_assetDict.TryGetValue(id, out TreeListItem item) || item?.HashInfo?.File == null) continue;
+        try { if (treeViewFast1?.GetNode(id) == null) return false; } catch { return false; }
+        if (newTab) m_assetPageTabs?.OpenInNewTab(id, AssetTabTitle(item), false);
+        return NavigateToAssetId(id);
+      }
+      return false;
+    }
+
+    private void RecordAssetNavigation(String id) {
+      if (String.IsNullOrWhiteSpace(id)) return;
+      if (m_assetNavigationHistoryIndex >= 0 && m_assetNavigationHistoryIndex < m_assetNavigationHistory.Count
+          && String.Equals(m_assetNavigationHistory[m_assetNavigationHistoryIndex], id, StringComparison.OrdinalIgnoreCase)) return;
+
+      if (m_assetNavigationHistoryIndex + 1 < m_assetNavigationHistory.Count)
+        m_assetNavigationHistory.RemoveRange(m_assetNavigationHistoryIndex + 1, m_assetNavigationHistory.Count - m_assetNavigationHistoryIndex - 1);
+      m_assetNavigationHistory.Add(id);
+      if (m_assetNavigationHistory.Count > 200) m_assetNavigationHistory.RemoveAt(0);
+      m_assetNavigationHistoryIndex = m_assetNavigationHistory.Count - 1;
+    }
+
+    private void NavigateAssetHistory(Int32 direction) {
+      Int32 target = m_assetNavigationHistoryIndex + direction;
+      if (target < 0 || target >= m_assetNavigationHistory.Count) return;
+      String id = m_assetNavigationHistory[target];
+      m_assetHistoryNavigation = true;
+      try {
+        if (NavigateToAssetId(id)) m_assetNavigationHistoryIndex = target;
+      } finally { m_assetHistoryNavigation = false; }
+    }
+
+    private Boolean NavigateToAssetId(String id) {
+      if (String.IsNullOrWhiteSpace(id) || treeViewFast1 == null) return false;
+      if (!String.IsNullOrWhiteSpace(txtSearch.Text)) {
+        txtSearch.Clear();
+        ApplyAssetTreeLiveFilter();
+      }
+      try {
+        TreeNode node = treeViewFast1.GetNode(id);
+        if (node == null) return false;
+        treeViewFast1.SelectedNode = node;
+        node.EnsureVisible();
+        treeViewFast1.Focus();
+        return true;
+      } catch { return false; }
+    }
+
+    private void ShowAssetQuickOpen() {
+      AssetSearchEntry[] entries = m_assetSearchIndex ?? Array.Empty<AssetSearchEntry>();
+      if (entries.Length == 0) {
+        StatusLabel2Text("Quick Open is available after the asset tree has finished loading.");
+        return;
+      }
+
+      using QuickOpenDialog dialog = new QuickOpenDialog(
+        "Open asset",
+        "Filename, /resources/path, extension or file ID...",
+        (query, token) => SearchAssetQuickOpen(entries, query, token)
+      );
+      if (dialog.ShowDialog(this) == DialogResult.OK && dialog.SelectedItem != null)
+        NavigateToAssetId(dialog.SelectedItem.Key);
+    }
+
+    private static IEnumerable<QuickOpenDialog.Item> SearchAssetQuickOpen(AssetSearchEntry[] entries, String query, CancellationToken token) {
+      String[] terms = (query ?? String.Empty).Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+      Int32 yielded = 0;
+      Int32 scanned = 0;
+      foreach (AssetSearchEntry entry in entries ?? Array.Empty<AssetSearchEntry>()) {
+        if (((++scanned) & 0xFF) == 0) token.ThrowIfCancellationRequested();
+        if (terms.Length != 0) {
+          Boolean matches = true;
+          foreach (String term in terms) {
+            if (entry.Id.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
+                && entry.DisplayName.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
+                && entry.ResourcePath.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
+                && entry.FileId.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0
+                && entry.SearchAlias.IndexOf(term, StringComparison.OrdinalIgnoreCase) < 0) {
+              matches = false;
+              break;
+            }
+          }
+          if (!matches) continue;
+        }
+
+        String primary = String.IsNullOrWhiteSpace(entry.DisplayName) ? entry.ResourcePath : entry.DisplayName;
+        String secondary = entry.ResourcePath;
+        if (!String.IsNullOrWhiteSpace(entry.SearchAlias)) secondary += "   [HeroScript: " + entry.SearchAlias + "]";
+        if (!String.IsNullOrWhiteSpace(entry.FileId)) secondary += "   [0x" + entry.FileId + "]";
+        yield return new QuickOpenDialog.Item(entry.Id, primary, secondary, primary + " " + secondary + " " + entry.SearchAlias);
+        yielded++;
+        if (yielded > 500) yield break;
+      }
     }
 
     private void TreeViewFast1MouseHover(Object sender, EventArgs e) {
@@ -4812,6 +5081,62 @@ namespace PugTools {
     #endregion
 
     #region TreeViewGrid1
+    private void TreeViewGrid1MouseDoubleClickNavigateAsset(Object sender, MouseEventArgs e) {
+      if (e.Button != MouseButtons.Left || treeViewGrid1?.SelectedObject is not NodeListItem item) return;
+      Boolean newTab = (ModifierKeys & Keys.Control) == Keys.Control;
+      if (TryNavigateStructuredAssetReference(item, newTab)) return;
+      TryOpenStructuredNodeReference(item, newTab);
+    }
+
+    private Boolean TryNavigateStructuredAssetReference(NodeListItem item, Boolean newTab = false) {
+      if (item == null || m_assetDict == null) return false;
+      foreach (String raw in new[] { item.value as String, item.DisplayValue, item.DisplayName })
+        if (TryNavigateResourcePath(raw, newTab)) return true;
+      return false;
+    }
+
+    private Boolean TryOpenStructuredNodeReference(NodeListItem item, Boolean newTab) {
+      if (item == null || m_currentAssets == null) return false;
+      try {
+        m_navigationDom ??= DomHandler.Instance.GetCurrentDOM(m_currentAssets);
+      } catch { return false; }
+      if (m_navigationDom == null) return false;
+
+      GomObject obj = null;
+      try {
+        if (item.value is UInt64 u) obj = m_navigationDom.GetObject(u);
+        else if (item.value is Int64 i && i >= 0) obj = m_navigationDom.GetObject((UInt64)i);
+        else if (item.value is UInt32 u32) obj = m_navigationDom.GetObject((UInt64)u32);
+        else if (item.value is Int32 i32 && i32 >= 0) obj = m_navigationDom.GetObject((UInt64)i32);
+        else if (item.value is String text) {
+          String candidate = text.Trim();
+          if (UInt64.TryParse(candidate, out UInt64 id)) obj = m_navigationDom.GetObject(id);
+          else if (candidate.IndexOf('/') < 0 && candidate.IndexOf('\\') < 0 && candidate.Contains('.'))
+            obj = m_navigationDom.GetObject(candidate);
+        }
+      } catch { }
+      if (obj == null) return false;
+      BrowserNavigation.OpenNode(this, m_assetsLocation, m_assetsUsePts, obj.Name ?? obj.Id.ToString(CultureInfo.InvariantCulture), newTab);
+      return true;
+    }
+
+    private static IEnumerable<String> BuildStructuredAssetCandidates(String raw) {
+      if (String.IsNullOrWhiteSpace(raw)) yield break;
+      String value = raw.Trim().Trim('"', '\'', '(', ')', '[', ']', '{', '}');
+      Int32 resource = value.IndexOf("/resources/", StringComparison.OrdinalIgnoreCase);
+      if (resource >= 0) value = value.Substring(resource);
+      value = value.TrimEnd(',', ';', ':');
+      if (value.IndexOf('/') < 0 && value.IndexOf('\\') < 0) yield break;
+
+      yield return value;
+      if (value.StartsWith("resources/", StringComparison.OrdinalIgnoreCase)) yield return "/" + value;
+
+      String ext = Path.GetExtension(value);
+      if (!String.IsNullOrWhiteSpace(ext)) yield break;
+      foreach (String suffix in new[] { ".gr2", ".dds", ".tex", ".mat", ".fxspec", ".prt", ".jba", ".mph", ".mag", ".spt", ".stg", ".dyn", ".xml" })
+        yield return value + suffix;
+    }
+
     private void TreeViewGrid1ExpandAll() {
       if (InvokeRequired) Invoke(new Action(() => TreeViewGrid1ExpandAll()));
       else treeViewGrid1.ExpandAll();

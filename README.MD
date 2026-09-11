@@ -1,6 +1,59 @@
-﻿# PugTools
+﻿## 2026-09-10 v24 – hash-verified en-us / de-de / fr-fr Filename Finder
+
+Filename Finder locale handling is now centralized at the final validation boundary. Any candidate whose immediate resource directory is `en-us`, `de-de` or `fr-fr` is expanded to all three SWTOR locales only after the format-specific and Jedipedia candidate heuristics have run. Each generated spelling is hashed independently and is persisted only when that exact PH+SH belongs to an unresolved file in the currently loaded build. Missing language siblings therefore cost only a hash probe and never enter the session dictionary/PFD1. This applies equally to built-in finders and imported candidate lists, and it does not generate locale variants for ordinary `/resources/world`, `/resources/art`, `/resources/gfx`, etc. paths.
+
+The existing STB-manifest harvest now emits one canonical `en-us` seed instead of triplicating every entry up front; CNV STB/ACB/FXE and localized BNK names use the same central expansion automatically. Grammar `<<grammar::locpath>>` placeholders are also expanded only at validation time. Tutorial image harvesting no longer reads just `enMale`: it scans every distinct localized/gendered tutorial string so de-de/fr-fr-only image references can become candidates, while exact hash matching still rejects nonexistent paths.
+
+## 2026-09-10 v23 – incomplete in-game world maps overlay the full PugTools map
+
+The large interactive M-map and the small minimap no longer use an authored SWTOR **world-map** DDS rectangle as a crop boundary for the generated PugTools world. In world scope, PugTools first keeps the normal generated map extent (smart-cropped or full, depending on the existing setting) and then expands that extent only if the authored page reaches farther. The original `_r.dds` therefore remains aligned in world coordinates and is drawn opaquely on top where it exists, while terrain/rooms outside an incomplete in-game world map stay visible underneath.
+
+Area/room/submap scope is intentionally unchanged: local authored pages still define the visible page extent exactly, matching SWTOR's floor/submap behaviour. World-scope original-art mode also keeps the normal PugTools map padding instead of tightening the whole viewport to the DDS, and minimap snapshot cropping/coordinate overlays use the same combined extent.
+
+## 2026-09-10 v22 – Jedipedia-style classification for newly patched world areas
+
+The World Browser now keeps Jedipedia's curated `area-ids.json` as the authoritative exact catalog, but can also place a newly patched ordinary `/resources/world/areas/<id>/` tree before Jedipedia has added that ID to the public list. For an uncatalogued area, PugTools builds a fingerprint from its non-generic room `.dat` filenames and compares it with the installed room fingerprints of the bundled Jedipedia catalog. A folder is inherited only when the best Jaccard similarity is at least 75%, at least 20 room names are shared, and the best match beats the runner-up by at least 10 percentage points; ambiguous/new layouts remain under **Unassigned**. Exact future Jedipedia entries always override an inferred result.
+
+With the supplied 2026-09-10 PFD1, the only ordinary area IDs not present in Jedipedia's 281-entry catalog are `4611686320204664000` and `4611690227550610000`. Their filtered room layouts match Jedipedia's `odessen_enigma` area at 95.3% and 87.8% respectively, so both are placed under **Solo phases / Post-Zakuul story**. The tree tooltip records the reference area and match percentage. Existing untouched `name="" category="Unassigned" group=""` placeholders written by v21 are migrated to the inferred folder, while named or otherwise custom folder assignments remain user-owned.
+The full v22 source package also carries the supplied current `hashes_filename.pfd1.gz`, replacing the older bundled dictionary from v21.1 so a clean build sees these newly named area folders immediately. The small v21.1 -> v22 source patch intentionally omits that large binary replacement; when using the patch, keep/copy the current PFD1 into `Source/PugTools/Hash/` (or the built application's `Hash` folder).
+
+# PugTools
+
+## 2026-09-10 v20 – native heightmap topology / LOD rendering
+
+The World Browser now consumes the validated `0xF1234567 ... 0xABCDEFAB` heightmap render-mesh topology when it can prove the native batch table is safe to draw. The `4*K-1` doubled boundaries are interpreted only when they form triangle-aligned cumulative offsets (tested as index units first and byte units second), the native grid dimensions match the decoded heightmap, every native vertex maps back to an in-range heightmap x/z sample, and every four-batch LOD level covers the authored solid X/Z footprint exactly once. Any ambiguity, future format change, malformed boundary, out-of-grid vertex, degenerate triangle or coverage mismatch falls back automatically to the existing procedural grid LODs.
+
+PugTools deliberately keeps its existing float terrain vertex layout, splat UVs and reconstructed normals/tangents: native render records are used only to recover SWTOR's triangle topology and LOD batches, so the still-unproven first native vertex float is not guessed. Native vertex references are remapped to the regular height grid, complete source levels are ordered densest-to-coarsest for near/far selection, and the instance's existing IBO is reused by the terrain renderer and shadow pass. The temporary native CPU vertex/index arrays are released immediately after conversion, avoiding a second persistent terrain mesh per tile. Native trailers with more than four usable levels retain the established 50/120/250 distance transitions and double the far threshold for each additional level.
+
+The Asset Browser now also reports whether the raw batch table has a triangle-aligned index/byte interpretation and shows the derived source-level index ranges. This diagnostic is intentionally weaker than World Browser activation: runtime use additionally requires the grid/topology coverage checks above.
+
+## 2026-09-10 v19 – native heightmap render-mesh inspection
+
+The Asset Browser now decodes Jedipedia's validated `0xF1234567 ... 0xABCDEFAB` trailer on legacy dense version-2 heightmap `VertexData`. The parser finds the variable-prefix anchor using the same doubled LOD/batch-boundary table and exact end-of-buffer invariants, then retains the complete 16-byte native vertex records and `ushort` triangle index buffer. The structured view exposes the /64 fixed-point tile corner, declared grid size, LOD/batch level count, grouped raw boundary values, vertex/index/triangle counts, opaque-prefix size, grid-coordinate range, packed normal/tangent components and bounded vertex/triangle previews. The first float in each native vertex remains deliberately named `U` because its exact client semantic is not yet proven.
+
+Sparse heightmaps now preserve and display their redundant embedded instance position, and the parsed view reports unexplained trailing bytes in the same spirit as Jedipedia. Native render-mesh decoding is opt-in for inspection only; the World Browser does not duplicate these buffers for every loaded terrain tile yet, avoiding a large memory regression until native LOD rendering actually consumes them. Malformed mesh trailers are non-fatal and appear as a parse diagnostic while the normal elevation/splat data remains usable.
+
+## 2026-09-10 v18 – embedded world-DAT inspection and TOR diagnostics
+
+The Asset Browser now follows Jedipedia's embedded room-DAT readers for the large world-node payloads that used to appear only as opaque `char[]`/binary values. `DepthTexture` (`.wtr`) is decoded as its versioned depth grid with dimensions, range, mean, non-zero coverage and a compact histogram; `wtrVertexData` exposes water vertices, triangles, bounds and bounded geometry previews; `rgnVolumeData` exposes the extruded region footprint with per-edge height, triangle topology and bounds. Heightmap `VertexData` on `.hms` placements reuses PugTools' native terrain decoder and surfaces dimensions, sparse/dense layout, elevation range, holes, terrain-layer count and painted Dynamic Detail channels. Encoded UTF-16/ASCII-hex wrappers and zstd/gzip/zlib payloads are decoded before inspection, matching the same payload path already used by the World Browser.
+
+Direct TOR libraries now also use Jedipedia-style fault isolation during lazy indexing: malformed or truncated archives are recorded as load warnings and skipped while healthy sibling archives remain searchable. The Tools data-load view reports any warnings that were actually encountered while locating/loading the GOM, including the archive path and parser message. If every archive in a library is invalid, loading still fails normally rather than hiding the problem.
+
+## 2026-09-09 v17 – native static SpeedTree world geometry
+
+The World Browser now streams legacy SWTOR `.spt` placements from their native procedural source instead of requiring a same-stem visual GR2. The existing structured SPT reader feeds a bounded deterministic generator for branch tubes, recursive child stems, alpha-tested crossed leaf cards and authored frond textures. Branch/leaf/frond materials use the texture paths stored in the SPT/MapBank records, and the generated model is fitted to the original SpeedTree footer bounds so SWTOR world placement scale remains useful. Generation runs on the existing world model workers and is capped per tree to protect large areas from malformed or unusually dense authored trees.
+
+A same-stem `.gr2` is retained only as a compatibility fallback when an unusual/beta SPT cannot be expanded; `.spt.gr2` collision/proxy companions are still never rendered as the visible tree. Runtime-generated SpeedTree materials are marked separately so the world texture LRU can evict/recreate their DDS resources without trying to parse a non-existent `.mat`. This is a static reconstruction: SpeedTree wind animation, exact proprietary branch pruning/forking and native billboard LOD generation remain future refinements. No database or sidecar is required.
 
 A suite of tools for datamining Star Wars: The Old Republic.
+
+## 2026-09-09 v16 – database-free inspection tools
+
+This branch adds four inspection features that operate directly on the selected SWTOR installation and loaded GOM, without a patch-history database or generated sidecar. The Node Browser can export a single prototype as readable JSON or an entire selected prototype branch as a JSON ZIP, including base/GLOM class metadata. Its raw-data view also exposes a new **Prototype structure** group with base class, component classes, dynamically glommed classes and the effective DOM field set.
+
+The main Tools window now has a **Shader Browser** for `retailclient/shaders/shaders.bin` and standalone `.fxo` files. It scans validated DXBC containers and displays shader model, chunks, constant buffers, variables, bound resources and input/output signatures; an individual compiled shader can be exported as FXO. SCPT previews now add a **Native assembly** section for live payload code sections, using the Iced x86/x64 decoder with NASM formatting, SCPT symbols and relocation annotations. This adds an `Iced` NuGet dependency but no runtime database.
+
+The native SpeedTree follow-up described above in v17 builds on this branch's existing structured `.spt` parser.
 
 ## 2026-09-08 v5 – more offline Jedipedia parity
 

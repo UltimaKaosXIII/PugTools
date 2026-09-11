@@ -23,7 +23,56 @@ namespace PugTools {
             || form is global::PugTools.AssetBrowserFileTable
             || form is global::PugTools.ModelBrowser
             || form is global::PugTools.NodeBrowser
-            || form is global::PugTools.WorldBrowser));
+            || form is global::PugTools.WorldBrowser
+            || form is global::PugTools.ShaderBrowser
+            || form is global::PugTools.DomBrowser));
+    }
+
+    private void InitializeShaderBrowserButton() {
+      if (gbxTools == null) return;
+      Button shaderButton = new Button {
+        Name = "btnShaderBrowser",
+        Text = "Shader Browser",
+        Location = new System.Drawing.Point(7, 122),
+        Margin = new Padding(4, 3, 4, 3),
+        Size = new System.Drawing.Size(126, 27),
+        TabIndex = 52,
+        UseVisualStyleBackColor = true
+      };
+      shaderButton.Click += BtnShaderBrowser_Click;
+      gbxTools.Controls.Add(shaderButton);
+      gbxTools.Height += 34;
+      if (gbxFQN != null) gbxFQN.Top += 34;
+      if (progressBar1 != null) progressBar1.Top += 34;
+      ClientSize = new System.Drawing.Size(ClientSize.Width, ClientSize.Height + 34);
+    }
+
+    private void BtnShaderBrowser_Click(Object sender, EventArgs e) {
+      Form browser = new ShaderBrowser(txtAssetsPath.Text, chkAssetsUsePTS.Checked);
+      browser.Show();
+      browser.Focus();
+    }
+
+    private void InitializeDomBrowserButton() {
+      if (gbxTools == null) return;
+      Button domButton = new Button {
+        Name = "btnDomBrowser",
+        Text = "DOM Browser",
+        Location = new System.Drawing.Point(139, 122),
+        Margin = new Padding(4, 3, 4, 3),
+        Size = new System.Drawing.Size(126, 27),
+        TabIndex = 53,
+        UseVisualStyleBackColor = true
+      };
+      toolTip1?.SetToolTip(domButton, "Browse client.gom classes, fields, enums, composition and schema references without a database.");
+      domButton.Click += BtnDomBrowser_Click;
+      gbxTools.Controls.Add(domButton);
+    }
+
+    private void BtnDomBrowser_Click(Object sender, EventArgs e) {
+      Form browser = new DomBrowser(txtAssetsPath.Text, chkAssetsUsePTS.Checked);
+      browser.Show();
+      browser.Focus();
     }
 
     private void AddToList1(String text) {

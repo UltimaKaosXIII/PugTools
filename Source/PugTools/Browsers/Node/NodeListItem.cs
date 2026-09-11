@@ -9,11 +9,15 @@ namespace PugTools {
   public class NodeListItem { // Must be public for interop with ObjectListView
     internal List<NodeListItem> children = new List<NodeListItem>();
     internal Object value;
+    // Optional browser cross-link metadata. This is intentionally kept separate from value so
+    // the existing raw GOM display/serialization remains byte-for-byte unchanged.
+    internal Object NavigationTarget { get; set; }
 
     public String DisplayName { get; } // Must be public for interop with ObjectListView
     public String DisplayValue { get; private set; } // Must be public for interop with ObjectListView
     public Object Name { get; } // Must be public for interop with ObjectListView
     public String Type { get; private set; } // Must be public for interop with ObjectListView
+    public String FieldId { get; internal set; } = String.Empty; // Optional raw DOM field id for reader-style inspection.
 
     // Sort of hacky to avoid changing all the existing stuff.
     private NodeListItem(Object name, Object value, GomType type = null) {
@@ -106,16 +110,18 @@ namespace PugTools {
 
               if (fieldLookup == null) {
                 try {
-                  if (!UInt64.TryParse(objItem.Key, out UInt64 id)) {
+                  if (UInt64.TryParse(objItem.Key, out UInt64 id))
                     fieldLookup = classLookup.Fields.Find(x => x.Id == id);
-                  }
                 }
                 catch (Exception) { }
               }
 
               if (fieldLookup != null) {
                 NodeListItem child =
-                  new NodeListItem(objItem.Key.ToString(), objItem.Value, fieldLookup.GomType);
+                  new NodeListItem(objItem.Key.ToString(), objItem.Value, fieldLookup.GomType) {
+                    FieldId = fieldLookup.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    NavigationTarget = fieldLookup
+                  };
                 children.Add(child);
               } else {
                 NodeListItem child =

@@ -89,6 +89,9 @@ namespace FileFormats {
     public Buffer VBO, IBO;
     public BufferDescription VBD, IBD;
     public DataStream VDS, IDS;
+    public bool UsesNativeTerrainLods { get; private set; }
+    public string NativeTerrainBoundaryUnit { get; private set; }
+    public HeightMapRenderLodRange[] NativeTerrainLodRanges { get; private set; } = Array.Empty<HeightMapRenderLodRange>();
     public Vector3 position;
     public Vector3 rotation;
     public Vector3 scale = new Vector3(1, 1, 1);
@@ -664,6 +667,7 @@ namespace FileFormats {
     // Kept for older call sites.
     public void ReadHeightMap() => ReadEmbeddedGeometry();
 
+    public static byte[] DecodeRoomPayloadBytes(byte[] bytes) => DecodePayloadBytes(bytes);
     public static byte[] DecompressRoomPayload(byte[] bytes) => Decompress(bytes);
 
     private static byte[] Decompress(byte[] bytes) {
@@ -686,19 +690,24 @@ namespace FileFormats {
     }
 
     private void ReadHeightMap(BinaryReader br) {
-      HeightMap = new HeightMap(br, area);
+      // Decode the validated 0xF1234567 trailer as well. The CPU-side native vertex records are
+      // converted immediately to the regular grid vertex indices used by PugTools, then released;
+      // this keeps the world path close to the previous memory footprint.
+      HeightMap = new HeightMap(br, area, true);
       int w = (int)HeightMap.width, d = (int)HeightMap.depth;
-      var indices = new List<ushort>(Math.Max(0, (w - 1) * (d - 1) * 6));
+      var gridIndices = new List<ushort>(Math.Max(0, (w - 1) * (d - 1) * 6));
       for (int z=0; z<d-1; z++) for (int x=0; x<w-1; x++) {
         if (HeightMap.hasHoles && !HeightMap.CheckNoHole(x,z)) continue;
-        indices.Add((ushort)(z*w+x)); indices.Add((ushort)((z+1)*w+x)); indices.Add((ushort)(z*w+x+1));
-        indices.Add((ushort)(z*w+x+1)); indices.Add((ushort)((z+1)*w+x)); indices.Add((ushort)((z+1)*w+x+1));
+        gridIndices.Add((ushort)(z*w+x)); gridIndices.Add((ushort)((z+1)*w+x)); gridIndices.Add((ushort)(z*w+x+1));
+        gridIndices.Add((ushort)(z*w+x+1)); gridIndices.Add((ushort)((z+1)*w+x)); gridIndices.Add((ushort)((z+1)*w+x+1));
       }
       Vector3[] pos = new Vector3[w*d]; Vector3[] normals = new Vector3[w*d];
       float xmin = -.2f * (float)Math.Ceiling(.5f * (w - 1)); float zmin = -.2f * (float)Math.Ceiling(.5f * (d - 1));
       for (int z=0; z<d; z++) for (int x=0; x<w; x++) pos[z*w+x] = new Vector3(xmin + .2f*x, HeightMap.elevation[z,x], zmin + .2f*z);
-      for (int i=0; i+2<indices.Count; i+=3) {
-        int a=indices[i], b=indices[i+1], c=indices[i+2]; Vector3 n = Vector3.Cross(pos[b]-pos[a], pos[c]-pos[a]); normals[a]+=n; normals[b]+=n; normals[c]+=n;
+      // Keep normals/tangents on the full authored grid. Summing the concatenated native LOD
+      // triangle sets would count the same surface several times and bias the lighting.
+      for (int i=0; i+2<gridIndices.Count; i+=3) {
+        int a=gridIndices[i], b=gridIndices[i+1], c=gridIndices[i+2]; Vector3 n = Vector3.Cross(pos[b]-pos[a], pos[c]-pos[a]); normals[a]+=n; normals[b]+=n; normals[c]+=n;
       }
       var verts = new PosNormalTexTan[w*d];
       for (int z=0; z<d; z++) for (int x=0; x<w; x++) {
@@ -707,7 +716,93 @@ namespace FileFormats {
         float u = w > 1 ? ((pos[i].X-xmin)/(.2f*(w-1))) * w/2f : 0; float v = d > 1 ? ((pos[i].Z-zmin)/(.2f*(d-1))) * d/2f : 0;
         verts[i]=new PosNormalTexTan(pos[i], n, new Vector2(u,v), t);
       }
-      CreateGeometryStreams(verts, indices.ToArray()); hasHeightMap = true;
+
+      ushort[] renderIndices = gridIndices.ToArray();
+      if (TryBuildNativeTerrainTopology(HeightMap, out ushort[] nativeIndices, out HeightMapRenderLodRange[] nativeRanges, out string boundaryUnit)) {
+        renderIndices = nativeIndices;
+        NativeTerrainLodRanges = nativeRanges;
+        NativeTerrainBoundaryUnit = boundaryUnit;
+        UsesNativeTerrainLods = true;
+      }
+      CreateGeometryStreams(verts, renderIndices);
+      if (UsesNativeTerrainLods && NativeTerrainLodRanges.Length > 0) numFaces = NativeTerrainLodRanges[0].Count;
+      HeightMap.RenderMesh?.ReleaseGeometryData();
+      hasHeightMap = true;
+    }
+
+    private static bool TryBuildNativeTerrainTopology(HeightMap map, out ushort[] indices,
+        out HeightMapRenderLodRange[] logicalRanges, out string boundaryUnit) {
+      indices = null; logicalRanges = Array.Empty<HeightMapRenderLodRange>(); boundaryUnit = null;
+      HeightMapRenderMesh mesh = map?.RenderMesh;
+      if (mesh == null || mesh.GridWidth != (int)map.width || mesh.GridDepth != (int)map.depth) return false;
+      if (mesh.Vertices == null || mesh.Indices == null || mesh.Vertices.Length != mesh.VertexCount || mesh.Indices.Length != mesh.IndexCount) return false;
+      if (!mesh.TryGetLodRanges(out HeightMapRenderLodRange[] sourceRanges, out boundaryUnit) || sourceRanges.Length == 0) return false;
+      int w = checked((int)map.width), d = checked((int)map.depth);
+      if ((long)w * d > UInt16.MaxValue + 1L) return false;
+
+      ushort[] vertexToGrid = new ushort[mesh.VertexCount];
+      for (int i = 0; i < mesh.VertexCount; i++) {
+        HeightMapRenderVertex v = mesh.Vertices[i];
+        if (v.X >= w || v.Z >= d) return false;
+        int gridIndex = checked(v.Z * w + v.X);
+        if (gridIndex < 0 || gridIndex > UInt16.MaxValue) return false;
+        vertexToGrid[i] = (ushort)gridIndex;
+      }
+      ushort[] mapped = new ushort[mesh.IndexCount];
+      for (int i = 0; i < mapped.Length; i++) {
+        ushort nativeIndex = mesh.Indices[i];
+        if (nativeIndex >= vertexToGrid.Length) return false;
+        mapped[i] = vertexToGrid[nativeIndex];
+      }
+      if (!ValidateNativeTerrainLodCoverage(map, mapped, sourceRanges, w, d)) return false;
+
+      // The table describes K groups of four batches. Source level numbering has not been proven
+      // to be near->far, so order the complete level ranges by triangle count: the densest topology
+      // is logical LOD 0 and map rendering therefore always receives the highest-detail native set.
+      HeightMapRenderLodRange[] ordered = sourceRanges
+        .OrderByDescending(x => x.Count)
+        .ThenBy(x => x.SourceLevel)
+        .ToArray();
+      ushort[] reordered = new ushort[mapped.Length];
+      var outputRanges = new HeightMapRenderLodRange[ordered.Length];
+      int write = 0;
+      for (int level = 0; level < ordered.Length; level++) {
+        HeightMapRenderLodRange source = ordered[level];
+        if (source.StartIndex < 0 || source.Count <= 0 || source.StartIndex + source.Count > mapped.Length) return false;
+        Array.Copy(mapped, source.StartIndex, reordered, write, source.Count);
+        outputRanges[level] = new HeightMapRenderLodRange { SourceLevel = source.SourceLevel, StartIndex = write, Count = source.Count };
+        write += source.Count;
+      }
+      if (write != reordered.Length) return false;
+      indices = reordered; logicalRanges = outputRanges; return true;
+    }
+
+    private static bool ValidateNativeTerrainLodCoverage(HeightMap map, ushort[] mapped,
+        HeightMapRenderLodRange[] ranges, int width, int depth) {
+      long solidCells = 0;
+      for (int z = 0; z < depth - 1; z++) for (int x = 0; x < width - 1; x++)
+        if (!map.hasHoles || map.CheckNoHole(x, z)) solidCells++;
+      long expectedDoubleArea = solidCells * 2L;
+      if (expectedDoubleArea <= 0) return false;
+
+      foreach (HeightMapRenderLodRange range in ranges) {
+        long doubleArea = 0;
+        int end = range.StartIndex + range.Count;
+        if (range.StartIndex < 0 || range.Count <= 0 || range.Count % 3 != 0 || end > mapped.Length) return false;
+        for (int i = range.StartIndex; i < end; i += 3) {
+          int a = mapped[i], b = mapped[i + 1], c = mapped[i + 2];
+          int ax = a % width, az = a / width, bx = b % width, bz = b / width, cx = c % width, cz = c / width;
+          long cross = (long)(bx - ax) * (cz - az) - (long)(bz - az) * (cx - ax);
+          if (cross == 0) return false;
+          doubleArea += Math.Abs(cross);
+          if (doubleArea > expectedDoubleArea) return false;
+        }
+        // A four-batch level must cover the same authored X/Z footprint exactly once. Besides
+        // validating our table-unit interpretation, this rejects native records whose x/z fields
+        // turn out not to be grid coordinates on a future format revision.
+        if (doubleArea != expectedDoubleArea) return false;
+      }
+      return true;
     }
 
     private void ReadWater(BinaryReader br) {

@@ -34,6 +34,7 @@
       this.btnToggleData = new System.Windows.Forms.Button();
       this.btnExport = new System.Windows.Forms.Button();
       this.btnHelp = new System.Windows.Forms.Button();
+      this.chkShowDyeColoring = new System.Windows.Forms.CheckBox();
       this.treeViewFast1 = new TreeViewFast.Controls.TreeViewFast();
       this.imageList1 = new System.Windows.Forms.ImageList(this.components);
       this.contextMenuStrip1 = new System.Windows.Forms.ContextMenuStrip(this.components);
@@ -133,6 +134,7 @@
       this.splitContainer2.Panel1.Controls.Add(this.btnToggleData);
       this.splitContainer2.Panel1.Controls.Add(this.btnExport);
       this.splitContainer2.Panel1.Controls.Add(this.btnHelp);
+      this.splitContainer2.Panel1.Controls.Add(this.chkShowDyeColoring);
       this.splitContainer2.Panel1.Controls.Add(this.treeViewFast1);
       //
       // splitContainer2.Panel2
@@ -190,9 +192,9 @@
       // LEFT PANEL
       //
 
-      // 
+      //
       // btnStopRender
-      // 
+      //
       this.btnStopRender.Cursor = System.Windows.Forms.Cursors.Default;
       this.btnStopRender.Enabled = false;
       this.btnStopRender.Location = new System.Drawing.Point(5, 6);
@@ -204,9 +206,9 @@
       this.btnStopRender.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
       this.btnStopRender.UseVisualStyleBackColor = true;
       this.btnStopRender.Click += new System.EventHandler(this.BtnStopRenderClick);
-      // 
+      //
       // btnToggleData
-      // 
+      //
       this.btnToggleData.Cursor = System.Windows.Forms.Cursors.Default;
       this.btnToggleData.Enabled = false;
       this.btnToggleData.Location = new System.Drawing.Point(89, 6);
@@ -218,9 +220,9 @@
       this.btnToggleData.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
       this.btnToggleData.UseVisualStyleBackColor = true;
       this.btnToggleData.Click += new System.EventHandler(this.BtnHideDataClick);
-      // 
+      //
       // btnExport
-      // 
+      //
       this.btnExport.Cursor = System.Windows.Forms.Cursors.Default;
       this.btnExport.Enabled = false;
       this.btnExport.Location = new System.Drawing.Point(198, 6);
@@ -232,9 +234,9 @@
       this.btnExport.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
       this.btnExport.UseVisualStyleBackColor = true;
       this.btnExport.Click += new System.EventHandler(this.BtnExportClick);
-      // 
+      //
       // btnHelp
-      // 
+      //
       this.btnHelp.Cursor = System.Windows.Forms.Cursors.Default;
       this.btnHelp.Enabled = false;
       this.btnHelp.Location = new System.Drawing.Point(273, 6);
@@ -246,9 +248,21 @@
       this.btnHelp.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
       this.btnHelp.UseVisualStyleBackColor = true;
       this.btnHelp.Click += new System.EventHandler(this.BtnHelpClick);
-      // 
+      //
+      // chkShowDyeColoring
+      //
+      this.chkShowDyeColoring.AutoSize = true;
+      this.chkShowDyeColoring.Checked = false;
+      this.chkShowDyeColoring.Location = new System.Drawing.Point(7, 38);
+      this.chkShowDyeColoring.Name = "chkShowDyeColoring";
+      this.chkShowDyeColoring.Size = new System.Drawing.Size(126, 19);
+      this.chkShowDyeColoring.TabIndex = 4;
+      this.chkShowDyeColoring.Text = "Show dye coloring";
+      this.chkShowDyeColoring.UseVisualStyleBackColor = true;
+      this.chkShowDyeColoring.CheckedChanged += new System.EventHandler(this.ChkShowDyeColoringCheckedChanged);
+      //
       // treeViewFast1
-      // 
+      //
       this.treeViewFast1.AfterSelect += new System.Windows.Forms.TreeViewEventHandler(this.TreeViewFast1AfterSelect);
       this.treeViewFast1.BorderStyle = System.Windows.Forms.BorderStyle.None;
       this.treeViewFast1.Dock = System.Windows.Forms.DockStyle.Bottom;
@@ -263,31 +277,31 @@
       this.treeViewFast1.Size = new System.Drawing.Size(350, this.splitContainer2.Height - 60);
       this.treeViewFast1.TabIndex = 0;
       this.treeViewFast1.Visible = false;
-      // 
+      //
       // imageList1
-      // 
+      //
       this.imageList1.ColorDepth = System.Windows.Forms.ColorDepth.Depth8Bit;
       this.imageList1.ImageStream = ((System.Windows.Forms.ImageListStreamer)(resources.GetObject("imageList1.ImageStream")));
       this.imageList1.TransparentColor = System.Drawing.Color.Transparent;
       this.imageList1.Images.SetKeyName(0, "COMPUTER.ICO");
       this.imageList1.Images.SetKeyName(1, "Folder.ico");
       this.imageList1.Images.SetKeyName(2, "textdoc.ico");
-      // 
+      //
       // contextMenuStrip1
-      // 
+      //
       this.contextMenuStrip1.Items.AddRange(new System.Windows.Forms.ToolStripItem[] {
         this.toolStripMenuItem1
       });
       this.contextMenuStrip1.Name = "contextMenuStrip1";
       this.contextMenuStrip1.Size = new System.Drawing.Size(149, 26);
-      // 
+      //
       // contextMenuStrip2
-      // 
+      //
       this.contextMenuStrip2.Name = "contextMenuStrip2";
       this.contextMenuStrip2.Size = new System.Drawing.Size(61, 4);
-      // 
+      //
       // toolStripMenuItem1
-      // 
+      //
       this.toolStripMenuItem1.Name = "toolStripMenuItem1";
       this.toolStripMenuItem1.Size = new System.Drawing.Size(148, 22);
       this.toolStripMenuItem1.Text = "View All Items";
@@ -297,9 +311,9 @@
       // CENTER PANEL
       //
 
-      // 
+      //
       // loadingSwirl1
-      // 
+      //
       this.loadingSwirl1.BackColor = System.Drawing.Color.White;
       this.loadingSwirl1.BorderStyle = System.Windows.Forms.BorderStyle.None;
       this.loadingSwirl1.Cursor = System.Windows.Forms.Cursors.Default;
@@ -312,9 +326,9 @@
       this.loadingSwirl1.SizeMode = System.Windows.Forms.PictureBoxSizeMode.CenterImage;
       this.loadingSwirl1.TabIndex = 0;
       this.loadingSwirl1.TabStop = false;
-      // 
+      //
       // renderPanel
-      // 
+      //
       this.renderPanel.BorderStyle = System.Windows.Forms.BorderStyle.None;
       this.renderPanel.Cursor = System.Windows.Forms.Cursors.Default;
       this.renderPanel.Dock = System.Windows.Forms.DockStyle.Fill;
@@ -330,9 +344,9 @@
       // RIGHT PANEL
       //
 
-      // 
+      //
       // treeViewFast2
-      // 
+      //
       this.treeViewFast2.BorderStyle = System.Windows.Forms.BorderStyle.None;
       this.treeViewFast2.Dock = System.Windows.Forms.DockStyle.Fill;
       this.treeViewFast2.Enabled = false;
@@ -343,39 +357,39 @@
       this.treeViewFast2.TabIndex = 0;
       this.treeViewFast2.AfterSelect += new System.Windows.Forms.TreeViewEventHandler(this.TreeViewFast2AfterSelect);
       this.treeViewFast2.MouseUp += new System.Windows.Forms.MouseEventHandler(this.TreeViewFast2MouseUp);
-      // 
+      //
       // contextMenuStrip3
-      // 
+      //
       this.contextMenuStrip3.Items.AddRange(new System.Windows.Forms.ToolStripItem[] {
         this.toolStripMenuItem2
       });
       this.contextMenuStrip3.Name = "contextMenuStrip3";
       this.contextMenuStrip3.Size = new System.Drawing.Size(150, 26);
-      // 
+      //
       // toolStripMenuItem2
-      // 
+      //
       this.toolStripMenuItem2.Name = "toolStripMenuItem2";
       this.toolStripMenuItem2.Size = new System.Drawing.Size(149, 22);
       this.toolStripMenuItem2.Text = "Toggle Render";
       this.toolStripMenuItem2.Click += new System.EventHandler(this.ToolStripMenuItem2Click);
-      // 
+      //
       // contextMenuStrip4
-      // 
+      //
       this.contextMenuStrip4.Items.AddRange(new System.Windows.Forms.ToolStripItem[] {
         this.toolStripMenuItem3
       });
       this.contextMenuStrip4.Name = "contextMenuStrip4";
       this.contextMenuStrip4.Size = new System.Drawing.Size(146, 26);
-      // 
+      //
       // toolStripMenuItem3
-      // 
+      //
       this.toolStripMenuItem3.Name = "toolStripMenuItem3";
       this.toolStripMenuItem3.Size = new System.Drawing.Size(145, 22);
       this.toolStripMenuItem3.Text = "View Material";
       this.toolStripMenuItem3.Click += new System.EventHandler(this.ToolStripMenuItem3Click);
-      // 
+      //
       // dataGridView1
-      // 
+      //
       this.dataGridView1.AllowUserToAddRows = false;
       this.dataGridView1.AllowUserToDeleteRows = false;
       this.dataGridView1.AllowUserToResizeRows = false;
@@ -395,9 +409,9 @@
       // STATUS BAR
       //
 
-      // 
+      //
       // statusStrip1
-      // 
+      //
       this.statusStrip1.Items.AddRange(new System.Windows.Forms.ToolStripItem[] {
         this.toolStripStatusLabel1,
         this.toolStripProgressBar1
@@ -408,14 +422,14 @@
       this.statusStrip1.Size = new System.Drawing.Size(this.splitContainer1.Width, 22);
       this.statusStrip1.TabIndex = 1;
       this.statusStrip1.Text = "statusStrip1";
-      // 
+      //
       // toolStripStatusLabel1
-      // 
+      //
       this.toolStripStatusLabel1.Name = "toolStripStatusLabel1";
       this.toolStripStatusLabel1.Size = new System.Drawing.Size(0, 19);
-      // 
+      //
       // toolStripProgressBar1
-      // 
+      //
       this.toolStripProgressBar1.ForeColor = System.Drawing.Color.Lime;
       this.toolStripProgressBar1.Name = "toolStripProgressBar1";
       this.toolStripProgressBar1.Size = new System.Drawing.Size(117, 18);
@@ -424,25 +438,25 @@
       /////////////////////////////////////////////////////////////////////////////////////////////
       // BACKGROUND
 
-      // 
+      //
       // backgroundWorker1
-      // 
+      //
       this.backgroundWorker1.WorkerSupportsCancellation = true;
       this.backgroundWorker1.DoWork += new System.ComponentModel.DoWorkEventHandler(this.BackgroundWorker1DoWork);
       this.backgroundWorker1.RunWorkerCompleted += new System.ComponentModel.RunWorkerCompletedEventHandler(this.BackgroundWorker1RunWorkerCompleted);
 
-      // 
+      //
       // backgroundWorker2
-      // 
+      //
       this.backgroundWorker2.DoWork += new System.ComponentModel.DoWorkEventHandler(this.BackgroundWorker2DoWork);
       this.backgroundWorker2.ProgressChanged += new System.ComponentModel.ProgressChangedEventHandler(this.BackgroundWorker2ProgressChanged);
       this.backgroundWorker2.RunWorkerCompleted += new System.ComponentModel.RunWorkerCompletedEventHandler(this.BackgroundWorker2Completed);
       this.backgroundWorker2.WorkerReportsProgress = true;
       this.backgroundWorker2.WorkerSupportsCancellation = true;
 
-      // 
+      //
       // backgroundWorker3
-      // 
+      //
       this.backgroundWorker3.WorkerSupportsCancellation = true;
       this.backgroundWorker3.DoWork += new System.ComponentModel.DoWorkEventHandler(this.BackgroundWorker3Run);
       this.backgroundWorker3.RunWorkerCompleted += new System.ComponentModel.RunWorkerCompletedEventHandler(this.BackgroundWorker3RunWorkerCompleted);
@@ -451,9 +465,9 @@
       // FORM
       //
 
-      // 
+      //
       // ModelBrowser
-      // 
+      //
       this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
       this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
       this.ClientSize = System.Windows.Forms.Screen.PrimaryScreen.WorkingArea.Size;
@@ -507,6 +521,7 @@
     private System.Windows.Forms.Button btnToggleData;
     private System.Windows.Forms.Button btnExport;
     private System.Windows.Forms.Button btnHelp;
+    private System.Windows.Forms.CheckBox chkShowDyeColoring;
     private TreeViewFast.Controls.TreeViewFast treeViewFast1;
     private System.Windows.Forms.ContextMenuStrip contextMenuStrip2;
     private System.Windows.Forms.ContextMenuStrip contextMenuStrip1;

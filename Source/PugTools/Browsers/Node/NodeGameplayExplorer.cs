@@ -172,7 +172,50 @@ namespace PugTools {
         || name.StartsWith("sche", StringComparison.OrdinalIgnoreCase)
         || name.StartsWith("tal.", StringComparison.OrdinalIgnoreCase)
         || name.StartsWith("mpn.", StringComparison.OrdinalIgnoreCase)
-        || name.StartsWith("plc.", StringComparison.OrdinalIgnoreCase);
+        || name.StartsWith("plc.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("cnv.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("dec.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("apt.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("spn.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("apc.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("apn.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("pkg.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("class.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("ipp.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("npp.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("nco.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("dyn.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("epp.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("hyd.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("pcs.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("stg.", StringComparison.OrdinalIgnoreCase)
+        || name.StartsWith("tbl.", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("mtxStorefrontInfoPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("achCategoriesTable_Prototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("chrCurrencyTablePrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("colCollectionCategoriesPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("decorationsPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("mntMountInfoPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("tutTutorialDataTablePrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("itmSetTablePrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("cnqConquestInfoPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("ablVanityPetsPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("cbtWeaponPerLevelPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("chrFactionPackagesPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("cnqSchedulePrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("guiInfoPopupsPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("itmUpgradesPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("lgcPerkPrototypeMap", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("lgcSeasonsPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("lgcUnlockPrototypeMap", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("lgcVentures_Prototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("optOptionsDescriptionsPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("pcsSliderDataTablePrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("utlTweakablePerLevelInfoPrototype", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("wevObjectsPrototype_Client", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("MasterComponentMap", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("worldMapData", StringComparison.OrdinalIgnoreCase)
+        || name.Equals("apthookdata", StringComparison.OrdinalIgnoreCase);
     }
 
     private void Build(GomObject gom) {
@@ -192,19 +235,48 @@ namespace PugTools {
           case Ability ability: BuildAbility(root, ability); break;
           case Item item: BuildItem(root, item); break;
           case Npc npc: BuildNpc(root, npc); break;
-          case Quest quest: BuildQuest(root, quest); break;
+          case Quest quest: BuildQuest(root, quest); BuildQuestGomMetadata(root, gom); break;
           case Achievement achievement: BuildAchievement(root, achievement); break;
           case Codex codex: BuildCodex(root, codex); break;
           case Schematic schematic: BuildSchematic(root, schematic); break;
           case Talent talent: BuildTalent(root, talent); break;
           case MapNote mapNote: BuildMapNote(root, mapNote); break;
           case Placeable placeable: BuildPlaceable(root, placeable); break;
+          case Conversation conversation: BuildConversation(root, conversation); break;
+          case AbilityPackage package: BuildAbilityPackage(root, package); break;
+          case Decoration decoration: BuildReflectedDetails(root, decoration, "Decoration details"); break;
+          case Stronghold stronghold: BuildReflectedDetails(root, stronghold, "Stronghold details"); break;
+          case Spawner spawner: BuildReflectedDetails(root, spawner, "Spawner details"); break;
+          case ClassSpec classSpec: BuildReflectedDetails(root, classSpec, "Class / specialization details"); break;
+          case ItemAppearance itemAppearance: BuildItemAppearance(root, itemAppearance); break;
+          case NpcAppearance npcAppearance: BuildNpcAppearance(root, npcAppearance); break;
+          case NewCompanion companion: BuildReflectedDetails(root, companion, "Companion details"); break;
           default:
-            AddNode(root, "No specialized model", null, 0, Detail("Info", "This node currently has no database-free gameplay specialization."));
+            if (!BuildJedipediaPrototype(root, gom))
+              AddNode(root, "No specialized model", null, 0, Detail("Info", "This node currently has no database-free gameplay specialization."));
             break;
         }
+        // Jedipedia's parsed view exposes substantially more than the compact headline fields.
+        // Add a bounded semantic property tree for every loaded GomLib model so newly-added client
+        // fields become inspectable without waiting for a hand-written viewer for each node class.
+        if (model != null && model is not Conversation && model is not AbilityPackage
+            && model is not Decoration && model is not Stronghold && model is not Spawner
+            && model is not ClassSpec && model is not ItemAppearance && model is not NpcAppearance
+            && model is not NewCompanion)
+          BuildReflectedDetails(root, model, "Detailed parsed fields");
+
+        // Jedipedia also keeps the complete decoded GOM structure next to its hand-written view.
+        // Preserve that capability here for fields that are newer than GomLib's typed models. The
+        // tree remains bounded by MaxTreeNodes and collection limits in AddGomValue.
+        if (model != null && gom.Data != null && _createdNodes < MaxTreeNodes) {
+          TreeNode raw = AddNode(root, "Complete parsed GOM fields", null, 0,
+            Detail("Top-level fields", gom.Data.Dictionary.Count.ToString(), "Depth", "5 (bounded)"));
+          AddGomDataMembers(raw, gom.Data, 0, 5);
+        }
         BuildGameplayGraph(gom, model);
-        if (model is Ability || model is Quest) _tabs.SelectedIndex = 1;
+        // Jedipedia opens on its parsed details. Keep the relationship graph one click away but
+        // make the detailed structured view the default for every supported node.
+        _tabs.SelectedIndex = 0;
         root.Expand();
         if (root.Nodes.Count == 1) root.Nodes[0].Expand();
         _tree.SelectedNode = root;
@@ -212,6 +284,317 @@ namespace PugTools {
       } finally {
         _tree.EndUpdate();
       }
+    }
+
+    private Boolean BuildJedipediaPrototype(TreeNode root, GomObject gom) {
+      if (root == null || gom?.Data == null) return false;
+      String table = null;
+      String title = null;
+      switch (gom.Name) {
+        case "mtxStorefrontInfoPrototype": table = "mtxStorefrontItems"; title = "Cartel Market storefront"; break;
+        case "achCategoriesTable_Prototype": table = "achCategoriesTableRowMap"; title = "Achievement categories"; break;
+        case "chrCurrencyTablePrototype": table = "chrCurrencyData"; title = "Currencies"; break;
+        case "colCollectionCategoriesPrototype": table = "colCollectionIdToCategory"; title = "Collections categories"; break;
+        case "decorationsPrototype": table = "decDecorationsById"; title = "Decoration registry"; break;
+        case "mntMountInfoPrototype": table = "mntIdToDataMap"; title = "Mount registry"; break;
+        case "tutTutorialDataTablePrototype": table = "tutTutorialDefinitionLookupList"; title = "Tutorial definitions"; break;
+        case "itmSetTablePrototype": table = "itmSetTablePackageMap"; title = "Item sets / packages"; break;
+        case "cnqConquestInfoPrototype": table = "cnqConquestInfoMap"; title = "Galactic Conquests"; break;
+        default:
+          if (Supports(gom)) {
+            String label = gom.Name.StartsWith("dyn.", StringComparison.OrdinalIgnoreCase)
+              ? "Dynamic object parsed data"
+              : "Jedipedia-style parsed GOM data";
+            TreeNode parsed = AddNode(root, label, null, 0,
+              Detail("Fields", gom.Data.Dictionary.Count.ToString(), "Base class", gom.DomClass?.Name));
+            AddGomDataMembers(parsed, gom.Data, 0, 5);
+            return true;
+          }
+          return false;
+      }
+
+      Dictionary<Object, Object> map = gom.Data.ValueOrDefault<Dictionary<Object, Object>>(table, null);
+      if (map == null) {
+        TreeNode missing = AddNode(root, title, null, 0, Detail("Table", table, "Status", "Field not present in this client build"));
+        AddGomDataMembers(missing, gom.Data, 0, 2);
+        return true;
+      }
+      TreeNode group = AddNode(root, title, null, 0, Detail("Table", table, "Entries", map.Count.ToString()));
+      Int32 index = 0;
+      foreach (KeyValuePair<Object, Object> entry in map) {
+        if (++index > 600 || _createdNodes >= MaxTreeNodes) {
+          AddNode(group, "… " + Math.Max(0, map.Count - index + 1).ToString("N0") + " more entries", null, 0, null);
+          break;
+        }
+        UInt64 id = TryUInt64(entry.Key);
+        String target = id == 0 ? null : ResolveFqn(id);
+        GomObjectData data = entry.Value as GomObjectData;
+        String label = entry.Key?.ToString() ?? "entry";
+        List<KeyValuePair<String, String>> summary = Detail("Key", label);
+        if (data != null && gom.Name == "mtxStorefrontInfoPrototype") {
+          Int64 nameId = data.ValueOrDefault<Int64>("mtxStorefrontItemDisplayName", 0);
+          String display = nameId == 0 ? null : _dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", nameId);
+          String image = data.ValueOrDefault("mtxStorefrontItemImage", "");
+          Int64 cost = data.ValueOrDefault<Int64>("mtxStorefrontItemCost", 0);
+          if (!String.IsNullOrWhiteSpace(display)) label += " — " + OneLine(display);
+          summary.Add(new KeyValuePair<String, String>("Name", display));
+          summary.Add(new KeyValuePair<String, String>("Name string ID", nameId == 0 ? null : nameId.ToString()));
+          summary.Add(new KeyValuePair<String, String>("Image", image));
+          summary.Add(new KeyValuePair<String, String>("Cost", cost == 0 ? null : cost.ToString()));
+          summary.Add(new KeyValuePair<String, String>("Active", YesNo(data.ValueOrDefault("mtxStorefrontItemIsActive", false))));
+          summary.Add(new KeyValuePair<String, String>("On sale", YesNo(data.ValueOrDefault("mtxStorefrontItemIsOnSale", false))));
+        }
+        TreeNode row = AddNode(group, label, target, id, summary);
+        if (data != null) AddGomDataMembers(row, data, 0, 3);
+        else AddGomValue(row, "Value", entry.Value, 0, 3);
+      }
+      return true;
+    }
+
+    private void AddGomDataMembers(TreeNode parent, GomObjectData data, Int32 depth, Int32 maxDepth) {
+      if (parent == null || data == null || depth > maxDepth) return;
+      foreach (KeyValuePair<String, Object> field in data.Dictionary.OrderBy(x => x.Key)) {
+        if (_createdNodes >= MaxTreeNodes) return;
+        AddGomValue(parent, field.Key, field.Value, depth, maxDepth);
+      }
+    }
+
+    private void AddGomValue(TreeNode parent, String name, Object value, Int32 depth, Int32 maxDepth) {
+      if (parent == null || _createdNodes >= MaxTreeNodes) return;
+      if (value == null) { AddNode(parent, name + ": null", null, 0, null); return; }
+      if (value is GomObjectData child) {
+        TreeNode n = AddNode(parent, name, null, 0, Detail("Type", "structure", "Fields", child.Dictionary.Count.ToString()));
+        if (depth < maxDepth) AddGomDataMembers(n, child, depth + 1, maxDepth);
+        return;
+      }
+      if (value is IDictionary dictionary) {
+        TreeNode n = AddNode(parent, name + " (" + dictionary.Count + ")", null, 0, Detail("Count", dictionary.Count.ToString()));
+        if (depth >= maxDepth) return;
+        Int32 count = 0;
+        foreach (DictionaryEntry entry in dictionary) {
+          if (++count > 200 || _createdNodes >= MaxTreeNodes) break;
+          AddGomValue(n, Convert.ToString(entry.Key), entry.Value, depth + 1, maxDepth);
+        }
+        return;
+      }
+      if (value is IEnumerable enumerable && value is not String) {
+        TreeNode n = AddNode(parent, name, null, 0, null);
+        if (depth >= maxDepth) return;
+        Int32 count = 0;
+        foreach (Object item in enumerable) {
+          if (++count > 200 || _createdNodes >= MaxTreeNodes) break;
+          AddGomValue(n, "[" + (count - 1) + "]", item, depth + 1, maxDepth);
+        }
+        return;
+      }
+      UInt64 id = TryUInt64(value);
+      String target = id == 0 ? null : ResolveFqn(id);
+      String text = FormatReflectedValue(value);
+      AddNode(parent, name + ": " + text, target, target == null ? 0 : id, Detail(name, text, "Resolved node", target));
+    }
+
+    private static UInt64 TryUInt64(Object value) {
+      if (value == null) return 0;
+      try {
+        if (value is Int64 signed && signed < 0) return 0;
+        return Convert.ToUInt64(value);
+      } catch { return 0; }
+    }
+
+    private void BuildConversation(TreeNode root, Conversation conversation) {
+      TreeNode overview = AddNode(root, "Conversation", conversation.Fqn, conversation.Id, Detail(
+        "STB", conversation.Stb, "KOTOR style", YesNo(conversation.IsKOTORStyle),
+        "Default speaker", conversation.DefaultSpeaker?.Fqn ?? ResolveFqn(conversation.DefaultSpeakerId),
+        "Speakers", (conversation.SpeakersIds?.Count ?? 0).ToString(),
+        "Dialog nodes", (conversation.DialogNodes?.Count ?? 0).ToString()));
+      foreach (UInt64 id in conversation.SpeakersIds ?? new List<UInt64>()) AddId(overview, "Speaker", id);
+
+      TreeNode effects = AddNode(root, "Quest effects", null, 0, null);
+      foreach (UInt64 id in conversation.QuestStarted ?? new List<UInt64>()) AddId(effects, "Starts quest", id);
+      foreach (UInt64 id in conversation.QuestProgressed ?? new List<UInt64>()) AddId(effects, "Progresses quest", id);
+      foreach (UInt64 id in conversation.QuestEnded ?? new List<UInt64>()) AddId(effects, "Ends quest", id);
+
+      TreeNode graph = AddNode(root, "Dialog graph", null, 0, Detail(
+        "Root nodes", (conversation.RootNodes?.Count ?? 0).ToString(),
+        "Links", (conversation.NodeLinkList?.Count ?? 0).ToString()));
+      HashSet<Int64> roots = new HashSet<Int64>((conversation.RootNodes ?? new Dictionary<Int32, Int64>()).Values);
+      foreach (DialogNode dialog in conversation.DialogNodes ?? new List<DialogNode>()) {
+        if (dialog == null || _createdNodes >= MaxTreeNodes) continue;
+        String label = (roots.Contains(dialog.NodeId) ? "Root " : "Node ") + dialog.NodeId;
+        String text = Localized(dialog.LocalizedText, dialog.Text);
+        if (!String.IsNullOrWhiteSpace(text)) label += " — " + OneLine(text);
+        TreeNode node = AddNode(graph, label, null, 0, Detail(
+          "Node ID", dialog.NodeId.ToString(), "Player node", YesNo(dialog.IsPlayerNode),
+          "Speaker", ResolveFqn(dialog.SpeakerId), "Text", text,
+          "Option text", Localized(dialog.LocalizedOptionText, null),
+          "Min level", dialog.MinLevel.ToString(), "Max level", dialog.MaxLevel.ToString(),
+          "Alignment", dialog.AlignmentGain.ToString(), "Credits", dialog.CreditsGained.ToString(),
+          "Ambient", YesNo(dialog.IsAmbient), "Aborts conversation", YesNo(dialog.AbortsConversation),
+          "Action hook", dialog.ActionHook));
+        foreach (UInt64 id in dialog.QuestsGranted ?? new List<UInt64>()) AddId(node, "Grants quest", id);
+        foreach (UInt64 id in dialog.QuestsProgressed ?? new List<UInt64>()) AddId(node, "Progresses quest", id);
+        foreach (UInt64 id in dialog.QuestsEnded ?? new List<UInt64>()) AddId(node, "Ends quest", id);
+        if (dialog.QuestReward != 0) AddId(node, "Quest reward", dialog.QuestReward);
+        if (dialog.ActionQuest != 0) AddId(node, "Action quest", dialog.ActionQuest);
+        if (dialog.ChildIds != null && dialog.ChildIds.Count > 0)
+          AddNode(node, "Children: " + String.Join(", ", dialog.ChildIds), null, 0, Detail("Child node IDs", String.Join(", ", dialog.ChildIds)));
+      }
+      BuildReflectedDetails(root, conversation, "All conversation fields", 2);
+    }
+
+
+    private void BuildItemAppearance(TreeNode root, ItemAppearance appearance) {
+      TreeNode group = AddNode(root, "Item appearance (IPP)", appearance.Fqn, appearance.Id, Detail(
+        "Color scheme", appearance.ColorScheme.ToString(), "VO sound override", appearance.VOSoundTypeOverride));
+      if (appearance.IPP != null) AddAppearanceSlot(group, "Appearance slot", appearance.IPP);
+      BuildReflectedDetails(root, appearance, "All IPP fields", 3);
+    }
+
+    private void BuildNpcAppearance(TreeNode root, NpcAppearance appearance) {
+      TreeNode group = AddNode(root, "NPC appearance (NPP)", appearance.Fqn, appearance.Id, Detail(
+        "Body type", appearance.BodyType, "NPP type", appearance.NppType,
+        "Sound package", appearance.SoundPackage, "Armor sound override", appearance.ArmorSoundsetOverride,
+        "Slot groups", (appearance.AppearanceSlotMap?.Count ?? 0).ToString()));
+      if (appearance.VocalSoundsetOverride != null && appearance.VocalSoundsetOverride.Count > 0) {
+        TreeNode voices = AddNode(group, "Vocal sound overrides", null, 0, Detail("Count", appearance.VocalSoundsetOverride.Count.ToString()));
+        foreach (KeyValuePair<Int64, String> voice in appearance.VocalSoundsetOverride.OrderBy(x => x.Key))
+          AddNode(voices, voice.Key + " — " + voice.Value, null, 0, Detail("Key", voice.Key.ToString(), "Soundset", voice.Value));
+      }
+      if (appearance.AppearanceSlotMap != null) {
+        foreach (KeyValuePair<String, List<AppSlot>> slotGroup in appearance.AppearanceSlotMap.OrderBy(x => x.Key)) {
+          TreeNode slots = AddNode(group, slotGroup.Key + " (" + (slotGroup.Value?.Count ?? 0) + ")", null, 0, null);
+          Int32 index = 0;
+          foreach (AppSlot slot in slotGroup.Value ?? new List<AppSlot>()) AddAppearanceSlot(slots, "Choice " + (++index), slot);
+        }
+      }
+      BuildReflectedDetails(root, appearance, "All NPP fields", 3);
+    }
+
+    private void AddAppearanceSlot(TreeNode parent, String label, AppSlot slot) {
+      if (parent == null || slot == null) return;
+      String type = null, model = null, material = null, mirror = null, primaryHue = null, secondaryHue = null;
+      try { type = slot.Type; } catch { }
+      try { model = slot.Model; } catch { }
+      try { material = slot.Material0; } catch { }
+      try { mirror = slot.MaterialMirror; } catch { }
+      try { primaryHue = slot.PrimaryHue; } catch { }
+      try { secondaryHue = slot.SecondaryHue; } catch { }
+      TreeNode node = AddNode(parent, label + (String.IsNullOrWhiteSpace(type) ? String.Empty : " — " + type), null, 0, Detail(
+        "Body type", slot.BodyType, "Slot type", type, "Model ID", slot.ModelID.ToString(), "Model", model,
+        "Material index", slot.MaterialIndex.ToString(), "Material", material, "Mirror material", mirror,
+        "Primary hue ID", slot.PrimaryHueId.ToString(), "Primary hue", primaryHue,
+        "Secondary hue ID", slot.SecondaryHueId.ToString(), "Secondary hue", secondaryHue,
+        "Random weight", slot.RandomWeight.ToString()));
+      List<Int64> attachments = slot.Attachments ?? new List<Int64>();
+      List<String> attachedModels = null;
+      try { attachedModels = slot.AttachedModels; } catch { }
+      if (attachments.Count > 0) {
+        TreeNode attached = AddNode(node, "Attachments", null, 0, Detail("Count", attachments.Count.ToString()));
+        for (Int32 i = 0; i < attachments.Count; i++) {
+          String attachedModel = attachedModels != null && i < attachedModels.Count ? attachedModels[i] : null;
+          AddNode(attached, attachments[i] + (String.IsNullOrWhiteSpace(attachedModel) ? String.Empty : " — " + attachedModel), null, 0,
+            Detail("Attachment ID", attachments[i].ToString(), "Model", attachedModel));
+        }
+      }
+    }
+
+    private void BuildAbilityPackage(TreeNode root, AbilityPackage package) {
+      TreeNode abilities = AddNode(root, "Package abilities", null, 0, Detail(
+        "Utility package", YesNo(package.IsUtilityPackage), "Count", (package.PackageAbilities?.Count ?? 0).ToString()));
+      foreach (PackageAbility entry in package.PackageAbilities ?? new List<PackageAbility>()) {
+        if (entry == null) continue;
+        Ability ability = null;
+        try { ability = entry.Ability; } catch { }
+        AddNode(abilities, DisplayName(ability, "Ability"), ability?.Fqn, ability?.Id ?? 0, Detail(
+          "Level", entry.Level.ToString(), "Levels", entry.Levels == null ? null : String.Join(", ", entry.Levels),
+          "Auto acquire", YesNo(entry.AutoAcquire), "Scales", entry.Scales.ToString(),
+          "Utility tier", entry.UtilityTier.ToString(), "Utility position", entry.UtilityPosition.ToString(),
+          "Attack wave", entry.AttackWaves == null || entry.AttackWaves.Count == 0 ? null : String.Join(", ", entry.AttackWaves)));
+      }
+      TreeNode talents = AddNode(root, "Package talents", null, 0, Detail("Count", (package.PackageTalents?.Count ?? 0).ToString()));
+      foreach (PackageTalent entry in package.PackageTalents ?? new List<PackageTalent>()) {
+        if (entry == null) continue;
+        Talent talent = null;
+        try { talent = entry.Talent; } catch { }
+        AddNode(talents, DisplayName(talent, "Talent"), talent?.Fqn, talent?.Id ?? 0,
+          Detail("Utility tier", entry.UtilityTier.ToString(), "Utility position", entry.UtilityPosition.ToString()));
+      }
+      BuildReflectedDetails(root, package, "All package fields", 2);
+    }
+
+    private void BuildReflectedDetails(TreeNode root, Object model, String title, Int32 maxDepth = 3) {
+      if (root == null || model == null || _createdNodes >= MaxTreeNodes) return;
+      TreeNode group = AddNode(root, title, null, 0, Detail("Type", model.GetType().Name));
+      AddReflectedMembers(group, model, 0, maxDepth, new HashSet<Object>(ReferenceEqualityComparer.Instance));
+    }
+
+    private void AddReflectedMembers(TreeNode parent, Object value, Int32 depth, Int32 maxDepth, HashSet<Object> visited) {
+      if (parent == null || value == null || depth > maxDepth || _createdNodes >= MaxTreeNodes) return;
+      Type type = value.GetType();
+      if (!type.IsValueType && value is not String && !visited.Add(value)) return;
+      foreach (PropertyInfo property in type.GetProperties(BindingFlags.Instance | BindingFlags.Public).OrderBy(x => x.Name)) {
+        if (!property.CanRead || property.GetIndexParameters().Length != 0) continue;
+        if (property.Name is "Dom_" or "Dom" or "SQLProperties" or "References") continue;
+        Object prop;
+        try { prop = property.GetValue(value); } catch { continue; }
+        if (prop == null) continue;
+        if (IsSimpleValue(prop)) {
+          AddNode(parent, property.Name + ": " + FormatReflectedValue(prop), null, 0, Detail(property.Name, FormatReflectedValue(prop)));
+          continue;
+        }
+        if (prop is GameObject go) {
+          AddGameObject(parent, property.Name + " — " + DisplayName(go, go.Fqn), go);
+          continue;
+        }
+        if (prop is IDictionary dictionary) {
+          TreeNode map = AddNode(parent, property.Name + " (" + dictionary.Count + ")", null, 0, Detail("Count", dictionary.Count.ToString()));
+          Int32 count = 0;
+          foreach (DictionaryEntry entry in dictionary) {
+            if (++count > 250 || _createdNodes >= MaxTreeNodes) break;
+            AddReflectedEntry(map, Convert.ToString(entry.Key), entry.Value, depth + 1, maxDepth, visited);
+          }
+          continue;
+        }
+        if (prop is IEnumerable enumerable && prop is not String) {
+          TreeNode list = AddNode(parent, property.Name, null, 0, null);
+          Int32 count = 0;
+          foreach (Object item in enumerable) {
+            if (++count > 250 || _createdNodes >= MaxTreeNodes) break;
+            AddReflectedEntry(list, "[" + (count - 1) + "]", item, depth + 1, maxDepth, visited);
+          }
+          continue;
+        }
+        if (depth < maxDepth) {
+          TreeNode nested = AddNode(parent, property.Name, null, 0, Detail("Type", prop.GetType().Name));
+          AddReflectedMembers(nested, prop, depth + 1, maxDepth, visited);
+        }
+      }
+    }
+
+    private void AddReflectedEntry(TreeNode parent, String label, Object value, Int32 depth, Int32 maxDepth, HashSet<Object> visited) {
+      if (value == null) { AddNode(parent, label + ": null", null, 0, null); return; }
+      if (IsSimpleValue(value)) { AddNode(parent, label + ": " + FormatReflectedValue(value), null, 0, Detail(label, FormatReflectedValue(value))); return; }
+      if (value is GameObject go) { AddGameObject(parent, label + " — " + DisplayName(go, go.Fqn), go); return; }
+      TreeNode node = AddNode(parent, label, null, 0, Detail("Type", value.GetType().Name));
+      if (depth <= maxDepth) AddReflectedMembers(node, value, depth, maxDepth, visited);
+    }
+
+    private static Boolean IsSimpleValue(Object value) {
+      if (value == null) return true;
+      Type type = value.GetType();
+      return type.IsPrimitive || type.IsEnum || value is String || value is Decimal || value is DateTime || value is Guid || value is ScriptEnum;
+    }
+
+    private static String FormatReflectedValue(Object value) {
+      if (value == null) return String.Empty;
+      String text = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? String.Empty;
+      return text.Length <= 1200 ? text : text.Substring(0, 1200) + "…";
+    }
+
+    private sealed class ReferenceEqualityComparer : IEqualityComparer<Object> {
+      internal static readonly ReferenceEqualityComparer Instance = new ReferenceEqualityComparer();
+      public new Boolean Equals(Object x, Object y) { return ReferenceEquals(x, y); }
+      public Int32 GetHashCode(Object obj) { return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj); }
     }
 
     private void BuildAbility(TreeNode root, Ability ability) {
@@ -413,12 +796,17 @@ namespace PugTools {
         foreach (QuestStep step in branch.Steps ?? new List<QuestStep>()) {
           String journalText = Localized(step.LocalizedJournalText, step.JournalText);
           TreeNode stepNode = AddNode(branchNode, "Step " + (++stepNo) + (String.IsNullOrWhiteSpace(journalText) ? String.Empty : " — " + OneLine(journalText)), null, 0,
-            Detail("Journal", journalText, "Shareable", YesNo(step.IsShareable)));
+            Detail("Journal", journalText, "Shareable", YesNo(step.IsShareable),
+              "Failure timer", step.FailTime > 0 ? step.FailTime + " s" : null, "Timer hidden", YesNo(step.HideTimer)));
           Int32 taskNo = 0;
           foreach (QuestTask task in step.Tasks ?? new List<QuestTask>()) {
             String text = Localized(task.LocalizedString, task.Text);
             TreeNode taskNode = AddNode(stepNode, "Task " + (++taskNo) + (String.IsNullOrWhiteSpace(text) ? String.Empty : " — " + OneLine(text)), null, 0,
-              Detail("Text", text, "Hook", task.Hook, "Count", task.ShowCount ? task.CountMax.ToString() : null, "Tracking", YesNo(task.ShowTracking)));
+              Detail("Text", text, "String ID", task.StringId == 0 ? null : task.StringId.ToString(),
+                "Hook", task.Hook, "Stable hook ID", task.HookId == 0 ? null : task.HookId.ToString(),
+                "Hook flags", task.HookFlags == 0 ? null : task.HookFlags.ToString(),
+                "Banner hidden", YesNo(task.HideBannerText),
+                "Count", task.ShowCount ? task.CountMax.ToString() : null, "Tracking", YesNo(task.ShowTracking)));
             foreach (UInt64 id in task.TaskNpcIds ?? new List<UInt64>()) AddId(taskNode, "NPC", id);
             foreach (UInt64 id in task.TaskPlcIds ?? new List<UInt64>()) AddId(taskNode, "Placeable", id);
             foreach (UInt64 id in task.TaskQuestIds ?? new List<UInt64>()) AddId(taskNode, "Quest", id);
@@ -447,6 +835,181 @@ namespace PugTools {
           Detail("Always provided", YesNo(reward.IsAlwaysProvided), "Min level", reward.MinLevel.ToString(), "Max level", reward.MaxLevel.ToString(),
                  "Classes", reward.Classes == null ? null : String.Join(", ", reward.Classes.Select(x => x.Name))));
       }
+    }
+
+    private void BuildQuestGomMetadata(TreeNode root, GomObject gom) {
+      if (root == null || gom?.Data == null) return;
+      GomObjectData data = gom.Data;
+      Int64 guid = data.ValueOrDefault<Int64>("qstQuestDefinitionGUID", 0);
+      Int64 version = data.ValueOrDefault<Int64>("qstVersion", 0);
+      Int64 priority = data.ValueOrDefault<Int64>("qstLoadingBlurbPriority", 0);
+      TreeNode metadata = AddNode(root, "Jedipedia quest metadata", null, 0, Detail(
+        "Definition GUID", guid == 0 ? null : guid.ToString(),
+        "Version", version == 0 ? null : version.ToString(),
+        "Name string ID", guid == 0 ? null : (guid + 88).ToString(),
+        "Loading blurb priority", priority == 0 ? null : priority.ToString()));
+      GomObjectData story = data.ValueOrDefault<GomObjectData>("qstCodexStory", null);
+      if (story != null) AddNode(metadata, "Loading-screen story blurb", null, 0, Detail(
+        "Title bit", story.ValueOrDefault<Int64>("cdxStoryTitleBitIndex", 0).ToString(),
+        "Arc bit", story.ValueOrDefault<Int64>("cdxStoryArcBitIndex", 0).ToString(),
+        "Class bit", story.ValueOrDefault<Int64>("cdxStoryClassBitIndex", 0).ToString(),
+        "Quest bit", story.ValueOrDefault<Int64>("cdxStoryQuestBitIndex", 0).ToString(),
+        "Title codex PID", story.ValueOrDefault<UInt64>("cdxStoryTitleCodexPid", 0).ToString(),
+        "Arc codex PID", story.ValueOrDefault<UInt64>("cdxStoryArcCodexPid", 0).ToString(),
+        "Class codex PID", story.ValueOrDefault<UInt64>("cdxStoryClassCodexPid", 0).ToString(),
+        "Quest codex PID", story.ValueOrDefault<UInt64>("cdxStoryQuestCodexPid", 0).ToString()));
+
+      BuildQuestJedipediaRawFlow(metadata, data);
+    }
+
+    private void BuildQuestJedipediaRawFlow(TreeNode parent, GomObjectData questData) {
+      List<Object> branches = questData.ValueOrDefault<List<Object>>("qstBranches", null);
+      if (branches == null || branches.Count == 0) return;
+
+      TreeNode flow = AddNode(parent, "Jedipedia raw branch / step / task data", null, 0,
+        Detail("Branches", branches.Count.ToString(), "Source", "qstBranches"));
+      Int32 branchIndex = 0;
+      foreach (Object rawBranch in branches) {
+        if (rawBranch is not GomObjectData branch || _createdNodes >= MaxTreeNodes) continue;
+        Int64 branchId = branch.ValueOrDefault<Int64>("qstBranchId", branchIndex);
+        List<Object> steps = branch.ValueOrDefault<List<Object>>("qstSteps", null) ?? new List<Object>();
+        TreeNode branchNode = AddNode(flow, "Branch " + branchId, null, 0,
+          Detail("Branch ID", branchId.ToString(), "Steps", steps.Count.ToString()));
+        branchIndex++;
+
+        foreach (Object rawStep in steps) {
+          if (rawStep is not GomObjectData step || _createdNodes >= MaxTreeNodes) continue;
+          Int64 stepId = step.ValueOrDefault<Int64>("qstStepId", 0);
+          List<Object> tasks = step.ValueOrDefault<List<Object>>("qstTasks", null) ?? new List<Object>();
+          TreeNode stepNode = AddNode(branchNode, "Step " + stepId, null, 0, Detail(
+            "Step ID", stepId.ToString(),
+            "Tasks", tasks.Count.ToString(),
+            "Shareable", YesNo(step.ValueOrDefault("qstStepIsShareable", false)),
+            "Failure time", step.ValueOrDefault<Int64>("qstFailTime", 0).ToString(),
+            "Hide timer", YesNo(step.ValueOrDefault("qstHideTimer", false)),
+            "Checkpoint", YesNo(step.ValueOrDefault("qstStepCheckpoint", false)),
+            "Show play button", YesNo(step.ValueOrDefault("qstStepShowPlayButton", false)),
+            "Requires paid permission", YesNo(step.ValueOrDefault("qstStepRequiresPaidPermission", false))));
+
+          List<Object> journalIds = step.ValueOrDefault<List<Object>>("qstStepJournalEntryStringIdList", null);
+          if (journalIds != null && journalIds.Count > 0) {
+            TreeNode journal = AddNode(stepNode, "Journal strings", null, 0, Detail("Entries", journalIds.Count.ToString()));
+            foreach (Object rawId in journalIds) {
+              Int64 stringId;
+              try { stringId = Convert.ToInt64(rawId); } catch { continue; }
+              String text = null;
+              try { text = _dom.StringTable.TryGetString("str.qst", stringId); } catch { }
+              AddNode(journal, stringId + (String.IsNullOrWhiteSpace(text) ? String.Empty : " — " + OneLine(text)), null, 0,
+                Detail("String ID", stringId.ToString(), "Text", text));
+            }
+          }
+
+          AddQuestBonusMissionRaw(stepNode, step.ValueOrDefault<List<Object>>("qstBonusMissions", null));
+          AddQuestHydraRaw(stepNode, step, "Step scripts");
+          AddQuestRawField(stepNode, step, "qstSpawners");
+          AddQuestRawField(stepNode, step, "qstStepInstanceData");
+          AddQuestRawField(stepNode, step, "qstStepPhaseAndAreaList");
+          AddQuestRawField(stepNode, step, "qstStepCnvOverride");
+          AddQuestRawField(stepNode, step, "qstStepCnvOverrideArea");
+          AddQuestRawField(stepNode, step, "qstStepCnvOverridePhase");
+          AddQuestRawField(stepNode, step, "qstStepDate");
+
+          foreach (Object rawTask in tasks) {
+            if (rawTask is not GomObjectData task || _createdNodes >= MaxTreeNodes) continue;
+            Int64 taskId = task.ValueOrDefault<Int64>("qstTaskId", 0);
+            Int64 stringId = QuestRawInt64(task, "qstTaskStringid");
+            String text = null;
+            if (stringId != 0) try { text = _dom.StringTable.TryGetString("str.qst", stringId); } catch { }
+            String hook = task.ValueOrDefault<String>("qstHook", null)
+              ?? task.ValueOrDefault<String>("qstHookName", null);
+            UInt64 hookId = task.ValueOrDefault<UInt64>("qstHookId", 0);
+            Int64 hookFlags = QuestRawInt64(task, "qstHookFlags");
+            Int64 countMax = QuestRawInt64(task, "qstTaskCountMax");
+
+            String label = "Task " + taskId;
+            if (!String.IsNullOrWhiteSpace(text)) label += " — " + OneLine(text);
+            TreeNode taskNode = AddNode(stepNode, label, null, 0, Detail(
+              "Task ID", taskId.ToString(), "Text", text,
+              "String ID", stringId == 0 ? null : stringId.ToString(),
+              "Hook", hook, "Stable hook ID", hookId == 0 ? null : hookId.ToString(),
+              "Hook flags", hookFlags == 0 ? null : hookFlags.ToString(),
+              "Max count", countMax == 0 ? null : countMax.ToString(),
+              "Banner hidden", YesNo(task.ValueOrDefault("qstTaskHideBannerText", false)),
+              "Show tracking", YesNo(task.ValueOrDefault("qstTaskShowTracking", false)),
+              "Show count", YesNo(task.ValueOrDefault("qstTaskShowTrackingCount", false)),
+              "Progress as %", YesNo(task.ValueOrDefault("qstTaskShowProgressAsPercentage", false)),
+              "Conditional", YesNo(task.ValueOrDefault("qstTaskConditional", false)),
+              "Surrender %", QuestRawInt64(task, "qstTaskSurrenderPercentage").ToString()));
+
+            AddQuestTargetDictionary(taskNode, "Objects", task.ValueOrDefault<Dictionary<Object, Object>>("qstTaskObjects", null));
+            AddQuestTargetDictionary(taskNode, "Interaction objects", task.ValueOrDefault<Dictionary<Object, Object>>("qstTaskInteractionObjects", null));
+            AddQuestBonusMissionRaw(taskNode, task.ValueOrDefault<List<Object>>("qstBonusMissions", null));
+            AddQuestHydraRaw(taskNode, task, "Task scripts");
+            AddQuestRawField(taskNode, task, "qstTaskMapNoteList");
+            AddQuestRawField(taskNode, task, "qstTaskIndicatorOverrideList");
+            AddQuestRawField(taskNode, task, "qstTaskIndicatorSourceNameIds");
+            AddQuestRawField(taskNode, task, "qstTaskMapLink");
+            AddQuestRawField(taskNode, task, "qstTaskMapIconOverride");
+            AddQuestRawField(taskNode, task, "qstTaskMapIconRadius");
+            AddQuestRawField(taskNode, task, "qstTaskTrackingDisplayType");
+            AddQuestRawField(taskNode, task, "qstTaskTrackingItemId");
+            AddQuestRawField(taskNode, task, "qstTaskCounterVariable");
+            AddQuestRawField(taskNode, task, "qstTaskAutoCompleteVariable");
+            AddQuestRawField(taskNode, task, "qstTaskHolocomConversation");
+            AddQuestRawField(taskNode, task, "qstTaskHolocomStringid");
+            AddQuestRawField(taskNode, task, "qstTaskHolocomOverrideId");
+            AddQuestRawField(taskNode, task, "qstTaskForceConversationAssociatedObject");
+            AddQuestRawField(taskNode, task, "qstItemsGivenOnCompletion");
+            AddQuestRawField(taskNode, task, "qstItemsTakenOnCompletion");
+          }
+        }
+      }
+    }
+
+    private static Int64 QuestRawInt64(GomObjectData data, String field) {
+      if (data == null || String.IsNullOrWhiteSpace(field)) return 0;
+      if (!data.Dictionary.TryGetValue(field, out Object value) || value == null) return 0;
+      try { return Convert.ToInt64(value); } catch { return 0; }
+    }
+
+    private void AddQuestBonusMissionRaw(TreeNode parent, List<Object> bonuses) {
+      if (bonuses == null || bonuses.Count == 0) return;
+      TreeNode group = AddNode(parent, "Bonus missions", null, 0, Detail("Count", bonuses.Count.ToString()));
+      foreach (Object raw in bonuses) {
+        if (raw is not GomObjectData bonus) continue;
+        UInt64 id = bonus.ValueOrDefault<UInt64>("qstTaskBonusMissionNodeId", 0);
+        UInt64 trigger = bonus.ValueOrDefault<UInt64>("qstTaskBonusMissionStartTrigger", 0);
+        String fqn = id == 0 ? null : ResolveFqn(id);
+        AddNode(group, fqn ?? (id == 0 ? "Bonus mission" : id.ToString()), fqn, id,
+          Detail("Quest ID", id == 0 ? null : id.ToString(), "Start trigger", trigger == 0 ? null : trigger.ToString()));
+      }
+    }
+
+    private void AddQuestTargetDictionary(TreeNode parent, String title, Dictionary<Object, Object> targets) {
+      if (targets == null || targets.Count == 0) return;
+      TreeNode group = AddNode(parent, title, null, 0, Detail("Count", targets.Count.ToString()));
+      foreach (KeyValuePair<Object, Object> target in targets) {
+        UInt64 id = TryUInt64(target.Key);
+        String fqn = id == 0 ? null : ResolveFqn(id);
+        AddNode(group, fqn ?? Convert.ToString(target.Key), fqn, id,
+          Detail("ID", id == 0 ? Convert.ToString(target.Key) : id.ToString(), "Value", FormatReflectedValue(target.Value)));
+      }
+    }
+
+    private void AddQuestHydraRaw(TreeNode parent, GomObjectData data, String title) {
+      if (data == null) return;
+      String[] fields = { "qstHydraScriptOnStart", "qstHydraScriptOnSuccess", "qstHydraScriptOnFailure", "qstHydraScriptOnAbandon", "qstHydraScriptOnIncrement" };
+      TreeNode group = null;
+      foreach (String field in fields) {
+        if (!data.Dictionary.TryGetValue(field, out Object value) || value == null) continue;
+        group ??= AddNode(parent, title, null, 0, null);
+        AddGomValue(group, field, value, 0, 4);
+      }
+    }
+
+    private void AddQuestRawField(TreeNode parent, GomObjectData data, String field) {
+      if (data == null || !data.Dictionary.TryGetValue(field, out Object value) || value == null) return;
+      AddGomValue(parent, field, value, 0, 4);
     }
 
     private void AddQuestItems(TreeNode parent, String relation, List<QuestItem> items) {

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -27,7 +27,13 @@ namespace GomLib.ModelLoader {
       branch.Steps = new List<QuestStep>();
       if (qstSteps != null) {
         foreach (var step in qstSteps) {
-          branch.Steps.Add(_dom.QuestStepLoader.Load((GomObjectData)step, branch));
+          if (step is not GomObjectData stepData) continue;
+          try {
+            QuestStep parsed = _dom.QuestStepLoader.Load(stepData, branch);
+            if (parsed != null) branch.Steps.Add(parsed);
+          } catch (Exception ex) {
+            System.Diagnostics.Debug.WriteLine($"Quest step failed for {qst?.Fqn}: {ex.Message}");
+          }
         }
       }
 

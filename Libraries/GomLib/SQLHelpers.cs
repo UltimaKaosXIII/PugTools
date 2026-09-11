@@ -598,7 +598,15 @@ namespace GomLib {
       var reps = inc.Where(x => string.IsNullOrWhiteSpace(x.Value));
       foreach (var rep in reps.ToList())
         inc[rep.Key] = name;
-      inc["enMale"] = inc["enMale"].Trim();
+
+      // Newer/partial localization tables do not always materialize every gender/locale key.
+      // All semantic loaders use this helper, so make it safe instead of allowing a missing
+      // enMale entry to abort an otherwise valid quest/item/NPC/achievement export.
+      string[] expected = { "enMale", "frMale", "frFemale", "deMale", "deFemale" };
+      foreach (string key in expected) {
+        if (!inc.ContainsKey(key) || string.IsNullOrWhiteSpace(inc[key])) inc[key] = name;
+      }
+      inc["enMale"] = (inc["enMale"] ?? name).Trim();
       return inc;
     }
   }

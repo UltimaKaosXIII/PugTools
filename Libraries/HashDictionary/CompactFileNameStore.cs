@@ -55,6 +55,37 @@ namespace nsHashDictionary {
       return result;
     }
 
+    /// <summary>
+    /// Returns numeric immediate child-directory names below a sorted filename prefix without
+    /// materialising every matching filename. This is primarily used by the World Browser to
+    /// discover newly patched /resources/world/areas/&lt;id&gt;/ trees directly from PFD1.
+    /// </summary>
+    internal IReadOnlyCollection<UInt64> FindNumericChildIdsByPrefix(String prefix) {
+      var result = new HashSet<UInt64>();
+      if (String.IsNullOrEmpty(prefix) || Count == 0) return result;
+
+      Int32 low = 0;
+      Int32 high = Count;
+      while (low < high) {
+        Int32 mid = low + ((high - low) >> 1);
+        String value = GetName(mid);
+        if (StringComparer.Ordinal.Compare(value, prefix) < 0) low = mid + 1;
+        else high = mid;
+      }
+
+      for (Int32 i = low; i < Count; i++) {
+        String value = GetName(i);
+        if (!value.StartsWith(prefix, StringComparison.Ordinal)) break;
+
+        Int32 idStart = prefix.Length;
+        Int32 slash = value.IndexOf('/', idStart);
+        if (slash <= idStart) continue;
+        String idText = value.Substring(idStart, slash - idStart);
+        if (UInt64.TryParse(idText, out UInt64 id) && id != 0) result.Add(id);
+      }
+      return result;
+    }
+
 
     private sealed class BoundedByteReader {
       private readonly Stream m_stream;

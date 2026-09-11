@@ -18,7 +18,8 @@ namespace PugTools {
   /// <summary>
   /// User-editable World Browser metadata. The source copy is shipped next to PugTools.exe; at runtime every
   /// detected area ID is merged into it. name overrides the display name, while category/group control where
-  /// the area appears in the tree. Existing user values are never overwritten by the automatic synchronizer.
+  /// the area appears in the tree. User-edited values are preserved; untouched auto-generated Unassigned placeholders
+  /// may be upgraded when the bundled Jedipedia catalog/classifier later learns a confident folder assignment.
   /// </summary>
   internal static class WorldAreaNameOverrides {
     private const string FileName = "WorldAreaNames.xml";
@@ -93,8 +94,20 @@ namespace PugTools {
             }
             if (element.Attribute("name") == null) { element.SetAttributeValue("name", String.Empty); changed = true; }
             string oldCategory = ((string)element.Attribute("category") ?? String.Empty).Trim();
-            if (String.IsNullOrWhiteSpace(oldCategory)) { element.SetAttributeValue("category", defaultCategory); changed = true; }
-            if (element.Attribute("group") == null) { element.SetAttributeValue("group", defaultGroup); changed = true; }
+            string oldGroup = ((string)element.Attribute("group") ?? String.Empty).Trim();
+            string oldName = ((string)element.Attribute("name") ?? String.Empty).Trim();
+            bool generatedUnassignedPlaceholder = String.IsNullOrWhiteSpace(oldName)
+              && String.Equals(oldCategory, UnassignedCategory, StringComparison.OrdinalIgnoreCase)
+              && String.IsNullOrWhiteSpace(oldGroup)
+              && !String.Equals(defaultCategory, UnassignedCategory, StringComparison.OrdinalIgnoreCase);
+            if (String.IsNullOrWhiteSpace(oldCategory) || generatedUnassignedPlaceholder) {
+              element.SetAttributeValue("category", defaultCategory);
+              element.SetAttributeValue("group", defaultGroup);
+              changed = true;
+            } else if (element.Attribute("group") == null) {
+              element.SetAttributeValue("group", defaultGroup);
+              changed = true;
+            }
           }
         }
 
@@ -125,7 +138,7 @@ namespace PugTools {
       return new XDocument(
         new XDeclaration("1.0", "utf-8", null),
         new XElement("AreaNames",
-          new XComment("PugTools World Browser metadata. Missing area IDs are added automatically. Set name=\"...\" to override the display name. category/group control the tree folder; use category=\"Unassigned\" and group=\"\" for the catch-all folder. internalName is informational and may be refreshed automatically.")));
+          new XComment("PugTools World Browser metadata. Missing area IDs are added automatically. Set name=\"...\" to override the display name. category/group control the tree folder. Untouched name=\"\" category=\"Unassigned\" group=\"\" entries are automatic placeholders and may be reclassified later; set a name or another folder to keep a manual assignment. internalName is informational and may be refreshed automatically.")));
     }
 
     private static void SaveDocument(XDocument doc, string path) {

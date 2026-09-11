@@ -305,6 +305,9 @@ namespace TorArchive {
     #region Properties
     public Icons Icons { get; }
     public List<Library> Libraries { get; private set; }
+    public IEnumerable<String> ArchiveLoadWarnings => Libraries == null
+      ? Enumerable.Empty<String>()
+      : Libraries.SelectMany(library => library.LoadWarnings);
     public List<String> LoadedFileGroups { get; private set; }
     public String GamePath => m_gamePath;
     public String AssetPath => m_assetPath;

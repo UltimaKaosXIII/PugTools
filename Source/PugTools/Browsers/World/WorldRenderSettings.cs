@@ -41,8 +41,8 @@
     public WorldTextureQuality TextureQuality { get; set; } = WorldTextureQuality.High;
     public bool ShowTerrain { get; set; } = true;
     public bool ShowModels { get; set; } = true;
-    // SWTOR SpeedTree placements (.spt). PugTools v12 renders the shipped same-stem Granny fallback where present;
-    // raw SpeedTree decoding/wind remains a separate future path.
+    // SWTOR SpeedTree placements (.spt). The world streamer expands legacy procedural SPT data into a
+    // deterministic static branch/leaf/frond model and keeps the same-stem Granny visual only as a fallback.
     public bool ShowSpeedTrees { get; set; } = true;
     public bool ShowDecorationHooks { get; set; } = true;
     public bool ShowDynamicDetails { get; set; } = true;

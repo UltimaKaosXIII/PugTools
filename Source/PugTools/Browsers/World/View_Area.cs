@@ -1709,15 +1709,12 @@ namespace PugTools {
         // The interactive M map now keeps the user's map-note layer and renders original game symbols. A generated
         // minimap snapshot stays symbol-free because the WinForms overlay paints the same icons live on top of it.
         s.ShowMapNotes=mapOpen&&requestedMapNotes;
-        // The interactive map can now switch between PugTools' top-down world render and the original SWTOR
-        // authored page.  In original-art mode keep the same world-coordinate overlay layer (notes, taxi routes,
-        // player marker), but suppress the generated geometry under it rather than compositing the two maps.
+        // Original SWTOR map art is composited in world coordinates over the generated PugTools map. For world
+        // pages the camera extent is the union of generated-world and authored-page bounds, so incomplete SWTOR world
+        // maps no longer crop valid terrain/rooms around the DDS. Area/submap pages still use their authored bounds.
         bool originalInteractiveMap=mapOpen&&InteractiveMapOriginalArtActive;
         bool originalMiniMap=captureMiniMap&&MiniMapOriginalArtActive;
         s.ShowMapArt=originalInteractiveMap||originalMiniMap;
-        // Keep the generated top-down map underneath the authored SWTOR page. The original DDS is opaque inside its
-        // own page bounds, while the surrounding viewport now shows the normal PugTools map instead of a flat fog /
-        // clear colour. This also makes letterboxed/narrow submaps feel like part of the same map rather than a card.
       }
       Room cameraRoom=FindCameraRoom(camera.Position);
       // A streamed interior can be known from conservative placement bounds before its collision floor is indexed.
@@ -4186,7 +4183,7 @@ namespace PugTools {
         if(protectedMaterials.Contains(material))continue;
         long last=materialLastUseFrame.TryGetValue(material,out long frame)?frame:long.MinValue;
         if(last>cutoff)continue;
-        ReleaseOwnedMaterial(material);material.parsed=false;streamedMaterialResourcesPrepared.Remove(material);materialLastUseFrame.Remove(material);parsed.Remove(material);
+        ReleaseOwnedMaterial(material);if(!material.runtimeGenerated)material.parsed=false;streamedMaterialResourcesPrepared.Remove(material);materialLastUseFrame.Remove(material);parsed.Remove(material);
       }
     }
 
@@ -4555,8 +4552,19 @@ namespace PugTools {
       // In orthographic mode screen size no longer depends on physical camera distance. Jedipedia feeds its LOD
       // system an equivalent perspective distance derived from the zoom box so zooming still selects sensible LODs.
       float distance=orthographicActive?Math.Max(0f,OrthographicReferenceDistance*orthographicZoom-radius):Math.Max(0,(camera.Position-center).Length()-radius);
-      int level=0;while(level<terrainLodDistances.Length&&distance>=terrainLodDistances[level])level++;
-      return gpu.LodRanges[Math.Min(level,gpu.LodRanges.Length-1)];
+      int level=0;
+      while(level<gpu.LodRanges.Length-1){
+        float threshold=TerrainLodDistance(level);if(distance<threshold)break;level++;
+      }
+      return gpu.LodRanges[level];
+    }
+
+    private static float TerrainLodDistance(int transition){
+      if(transition<terrainLodDistances.Length)return terrainLodDistances[transition];
+      // Native SWTOR trailers can expose more levels than the four procedural viewer LODs. Keep
+      // the established 50/120/250 thresholds, then double the far threshold for each extra level.
+      int extra=transition-terrainLodDistances.Length+1;
+      return terrainLodDistances[terrainLodDistances.Length-1]*(float)Math.Pow(2,extra);
     }
 
     private EffectTechnique PickTerrainTech(WorldRenderSettings s,bool additive,bool dummy){if(s.Mode==WorldRenderMode.Wireframe)return fx.Wire;bool lit=s.Mode!=WorldRenderMode.Unlit&&s.EnableLighting;return lit?(additive?fx.TerrainAddLit:fx.TerrainLit):(additive?fx.TerrainAddUnlit:fx.TerrainUnlit);}
@@ -5819,7 +5827,15 @@ namespace PugTools {
       }
     }
     private void BuildTerrainLods(AssetInstance i,TerrainGpu g){
-      HeightMap hm=i.HeightMap;if(hm==null||hm.hasHoles)return;int w=checked((int)hm.width),d=checked((int)hm.depth);if(w<3||d<3||w*d>65535)return;
+      HeightMap hm=i.HeightMap;if(hm==null)return;
+      // v20: a validated native render-mesh topology is already stored in the instance IBO. Reuse
+      // that same GPU buffer and its logical near->far ranges rather than allocating a second IBO.
+      // Heightmaps whose batch table could not be interpreted safely still fall through unchanged
+      // to the shared procedural grid LOD path below.
+      if(i.UsesNativeTerrainLods&&i.IBO!=null&&i.NativeTerrainLodRanges!=null&&i.NativeTerrainLodRanges.Length>0){
+        g.LodIndexBuffer=i.IBO;g.OwnsLodIndexBuffer=false;g.LodRanges=i.NativeTerrainLodRanges.Select(x=>new TerrainLodRange(x.StartIndex,x.Count)).ToArray();return;
+      }
+      if(hm.hasHoles)return;int w=checked((int)hm.width),d=checked((int)hm.depth);if(w<3||d<3||w*d>65535)return;
       var key=(w,d);if(terrainIndexCache.TryGetValue(key,out SharedTerrainIndexGpu cached)){g.LodIndexBuffer=cached.Buffer;g.LodRanges=cached.Ranges;g.OwnsLodIndexBuffer=false;return;}
       var all=new List<ushort>(Math.Max(6,(w-1)*(d-1)*8));var ranges=new List<TerrainLodRange>();
       int start=all.Count;AppendTerrainFullGrid(all,w,d);ranges.Add(new TerrainLodRange(start,all.Count-start));
@@ -6409,7 +6425,11 @@ namespace PugTools {
       float aspect=Math.Max(.1f,ClientWidth/(float)Math.Max(1,ClientHeight));
       // Recalculate the fit height every update. This makes 1x an actual "fit whole map" zoom even after the
       // World Browser, splitter or toolbar changes the render-panel aspect ratio while M is open.
-      float mapPadding=mapOpen&&InteractiveMapOriginalArtActive?1f:1.08f;
+      // Only a local area/submap should fit tightly to its authored DDS. World art is an overlay on the generated
+      // world extent, so retain PugTools' normal breathing room around the combined bounds in both large/small maps.
+      bool tightOriginalArea=(mapOpen&&InteractiveMapOriginalArtActive&&!InteractiveMapIsWorldScope)||
+        (miniMapCaptureRendering&&MiniMapOriginalArtActive&&!MiniMapIsWorldScope);
+      float mapPadding=tightOriginalArea?1f:1.08f;
       float worldWidth=Math.Max(10f,(mapExtentMaxX-mapExtentMinX)*mapPadding);
       float worldHeight=Math.Max(10f,(mapExtentMaxZ-mapExtentMinZ)*mapPadding);
       mapBaseHeight=Math.Max(worldHeight,worldWidth/aspect);

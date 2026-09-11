@@ -6,6 +6,7 @@ using GomLib.Models;
 namespace GomLib.ModelLoader {
   public class MtxStorefrontEntryLoader {
     public Dictionary<object, object> MtxStoreFrontData;
+    public string MtxStoreFrontDataTable { get; private set; }
     readonly DataObjectModel _dom;
 
     public MtxStorefrontEntryLoader(DataObjectModel dom) {
@@ -15,12 +16,34 @@ namespace GomLib.ModelLoader {
 
     public void Flush() {
       MtxStoreFrontData = new Dictionary<object, object>();
+      MtxStoreFrontDataTable = null;
+    }
+
+    public Dictionary<object, object> EnsureStorefrontData() {
+      if (MtxStoreFrontData != null && MtxStoreFrontData.Count > 0) return MtxStoreFrontData;
+      GomObject prototype = _dom.GetObject("mtxStorefrontInfoPrototype");
+      if (prototype == null) {
+        MtxStoreFrontData = new Dictionary<object, object>();
+        return MtxStoreFrontData;
+      }
+
+      // Current clients use mtxStorefrontItems.  Keep mtxStorefrontData as a legacy
+      // fallback so older extracted builds remain supported.
+      MtxStoreFrontData = prototype.Data.ValueOrDefault<Dictionary<object, object>>(
+        "mtxStorefrontItems", null);
+      if (MtxStoreFrontData != null) {
+        MtxStoreFrontDataTable = "mtxStorefrontItems";
+      } else {
+        MtxStoreFrontData = prototype.Data.ValueOrDefault(
+          "mtxStorefrontData", new Dictionary<object, object>());
+        MtxStoreFrontDataTable = "mtxStorefrontData";
+      }
+      prototype.Unload();
+      return MtxStoreFrontData;
     }
 
     public MtxStorefrontEntry Load(long id) {
-      if (MtxStoreFrontData.Count == 0) {
-        MtxStoreFrontData = _dom.GetObject("mtxStorefrontInfoPrototype").Data.Get<Dictionary<object, object>>("mtxStorefrontData");
-      }
+      EnsureStorefrontData();
 
       _ = new object();
       MtxStoreFrontData.TryGetValue(id, out object mtxData);
@@ -35,7 +58,53 @@ namespace GomLib.ModelLoader {
 
       mtx.Dom = _dom;
       mtx.Prototype = "mtxStorefrontInfoPrototype";
-      mtx.ProtoDataTable = "mtxStorefrontData";
+      mtx.ProtoDataTable = MtxStoreFrontDataTable ?? "mtxStorefrontData";
+
+      Boolean currentSchema = mtx.ProtoDataTable == "mtxStorefrontItems"
+        || obj.ContainsKey("mtxStorefrontItemDisplayName")
+        || obj.ContainsKey("mtxStorefrontItemImage");
+
+      if (currentSchema) {
+        long descriptionId = obj.ValueOrDefault<long>("mtxStorefrontItemDisplayDescription", 0);
+        mtx.UnknowntextId = descriptionId;
+        mtx.Unknowntext = _dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", descriptionId);
+        mtx.Localizedunknowntext = _dom.StringTable.TryGetLocalizedStrings("str.gui.mtxstorefrontitems", descriptionId);
+
+        var currentBulletPointIds = obj.ValueOrDefault("mtxStorefrontItemDisplayBullets", new List<object>())
+          .Select(x => { try { return Convert.ToInt64(x); } catch { return 0L; } })
+          .Where(x => x != 0)
+          .ToList();
+        mtx.BulletPoints = currentBulletPointIds
+          .Select(x => _dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", x)).ToList();
+        mtx.LocalizedBulletPoints = currentBulletPointIds
+          .Select(x => _dom.StringTable.TryGetLocalizedStrings("str.gui.mtxstorefrontitems", x)).ToList();
+
+        long currentNameId = obj.ValueOrDefault<long>("mtxStorefrontItemDisplayName", 0);
+        mtx.Name = _dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", currentNameId);
+        mtx.LocalizedName = _dom.StringTable.TryGetLocalizedStrings("str.gui.mtxstorefrontitems", currentNameId);
+        mtx.Id = Id;
+        mtx.Icon = obj.ValueOrDefault("mtxStorefrontItemImage", "");
+        _dom.Assets.Icons.AddMtx(mtx.Icon);
+
+        mtx.Categories = obj.ValueOrDefault("mtxStorefrontItemCategories", new Dictionary<object, object>());
+        mtx.FullPriceCost = obj.ValueOrDefault<long>("mtxStorefrontItemCost", 0);
+        mtx.DiscountCost = obj.ValueOrDefault<long>("mtxStorefrontItemPresaleCost", 0);
+        mtx.ItemIdsList = obj.ValueOrDefault("mtxStorefrontItemAssociatedItems", new List<object>())
+          .Select(x => { try { return Convert.ToUInt64(x); } catch { return 0UL; } })
+          .Where(x => x != 0)
+          .ToList();
+        mtx.LinkedMTXEntryId = obj.ValueOrDefault<long>("mtxStorefrontItemLinkedMtxid", 0);
+        mtx.UnknownNumber = obj.ValueOrDefault<long>("mtxStorefrontItemPurchaseType", 0);
+        mtx.UnknownBool2 = obj.ValueOrDefault("mtxStorefrontItemIsActive", false);
+        mtx.IsAccountUnlock = obj.ValueOrDefault("mtxIsAccountUnlock", false);
+        mtx.IsOnSale = obj.ValueOrDefault("mtxStorefrontItemIsOnSale", false);
+        mtx.IsPlatform = obj.ValueOrDefault("mtxStorefrontItemIsPlatform", false);
+        mtx.CanGift = obj.ValueOrDefault("mtxStorefrontItemCanGift", false);
+        mtx.Flags = obj.ValueOrDefault<long>("mtxStorefrontItemFlags", 0);
+        mtx.VisibilityConditionId = obj.ValueOrDefault<ulong>("mtxStorefrontItemVisibilityConditionalId", 0);
+        return mtx;
+      }
+
       var unknownId = obj.ValueOrDefault<long>("4611686297592334024", 0); //Always 3042172580397056 for collection items
       mtx.UnknowntextId = unknownId;
       mtx.Unknowntext = _dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", unknownId); // need to find the right stringtable for this.

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Data;
 using System.IO;
@@ -121,20 +121,20 @@ namespace PugTools {
       EnableButtons();
     }
     private Dictionary<String, String> MtxIcons() {
-      Dictionary<Object, Object> mtxDataProto = new Dictionary<Object, Object>();
-      GomObject dataObject = CurrentDom.GetObject("mtxStorefrontInfoPrototype");
-
-      if (dataObject != null) { // Fix to ensure old game assets don't throw exceptions.
-        mtxDataProto = dataObject.Data.Get<Dictionary<Object, Object>>("mtxStorefrontData");
-        dataObject.Unload();
-      }
+      Dictionary<Object, Object> mtxDataProto = CurrentDom.MtxStorefrontEntryLoader.EnsureStorefrontData();
 
       Dictionary<Object, Object>.KeyCollection mtxIds = mtxDataProto.Keys;
 
       Dictionary<Object, Object> colDataProto = new Dictionary<Object, Object>();
-      dataObject = CurrentDom.GetObject("colCollectionItemsPrototype");
-      if (dataObject != null) { // fix to ensure old game assets don't throw exceptions.
-        colDataProto = dataObject.Data.Get<Dictionary<Object, Object>>("colCollectionItemsData");
+      GomObject dataObject = CurrentDom.GetObject("colCollectionItemsPrototype");
+      if (dataObject != null) { // Support both current and legacy collection schemas.
+        colDataProto =
+          dataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            "colMtxItemIdToCollectionItem", null)
+          ?? dataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            "4611686297655094008", null)
+          ?? dataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            "colCollectionItemsData", new Dictionary<Object, Object>());
         dataObject.Unload();
       }
 
@@ -150,12 +150,17 @@ namespace PugTools {
       foreach (Object id in mtxIds) {
         ProgressUpdate(i, count);
         mtxDataProto.TryGetValue(id, out Object curData);
-        PseudoGameObject curObj = PseudoGameObject.Load("MtxStoreFronts", CurrentDom, id, curData);
+        PseudoGameObject curObj = PseudoGameObject.Load("MtxStoreFronts", CurrentDom, Convert.ToInt64(id), curData);
+
+        if (curObj is not MtxStorefrontEntry mtx || String.IsNullOrWhiteSpace(mtx.Icon)) {
+          i++;
+          continue;
+        }
 
         String filename =
           String.Format(
             "/resources/gfx/mtxstore/{0}_400x400.dds",
-            ((MtxStorefrontEntry)curObj).Icon
+            mtx.Icon
           );
 
         if (!icons.ContainsValue(filename))
@@ -169,8 +174,13 @@ namespace PugTools {
         colDataProto.TryGetValue(id, out Object curData);
         PseudoGameObject curObj = PseudoGameObject.Load("Collections", CurrentDom, id, curData);
 
+        if (curObj is not Collection collection || String.IsNullOrWhiteSpace(collection.Icon)) {
+          i++;
+          continue;
+        }
+
         String filename =
-          String.Format("/resources/gfx/mtxstore/{0}.dds", ((Collection)curObj).Icon);
+          String.Format("/resources/gfx/mtxstore/{0}.dds", collection.Icon);
 
         if (!icons.ContainsValue(filename))
           icons.Add(FileNameToHash(filename), filename);

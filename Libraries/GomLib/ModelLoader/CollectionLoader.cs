@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -22,7 +22,16 @@ namespace GomLib.ModelLoader {
 
     public Collection Load(long id) {
       if (CollectionItemsData.Count == 0) {
-        CollectionItemsData = _dom.GetObject("colCollectionItemsPrototype").Data.Get<Dictionary<object, object>>("colCollectionItemsData");
+        GomObject collectionPrototype = _dom.GetObject("colCollectionItemsPrototype");
+        if (collectionPrototype != null) {
+          CollectionItemsData =
+            collectionPrototype.Data.ValueOrDefault<Dictionary<object, object>>(
+              "colMtxItemIdToCollectionItem", null)
+            ?? collectionPrototype.Data.ValueOrDefault<Dictionary<object, object>>(
+              "4611686297655094008", null)
+            ?? collectionPrototype.Data.ValueOrDefault<Dictionary<object, object>>(
+              "colCollectionItemsData", new Dictionary<object, object>());
+        }
       }
 
       _ = new object();
@@ -37,45 +46,64 @@ namespace GomLib.ModelLoader {
       if (col == null) { return null; }
 
       if (_dom.MtxStorefrontEntryLoader.MtxStoreFrontData.Count == 0) {
-        GomObject MtxStoreFrontDataObject = _dom.GetObject("mtxStorefrontInfoPrototype");
-        _dom.MtxStorefrontEntryLoader.MtxStoreFrontData = MtxStoreFrontDataObject.Data.Get<Dictionary<object, object>>("mtxStorefrontData");
-        MtxStoreFrontDataObject.Unload();
+        _dom.MtxStorefrontEntryLoader.EnsureStorefrontData();
       }
-      object mtxData = new object();
-      _dom.MtxStorefrontEntryLoader.MtxStoreFrontData.TryGetValue(Id, out mtxData);
+      _dom.MtxStorefrontEntryLoader.MtxStoreFrontData.TryGetValue(Id, out object mtxData);
 
       col.Dom = _dom;
       col.Prototype = "colCollectionItemsPrototype";
-      col.ProtoDataTable = "colCollectionItemsData";
+      Boolean currentCollectionSchema =
+        obj.ContainsKey("colItemImage") || obj.ContainsKey("4611686297655094004");
+      col.ProtoDataTable = currentCollectionSchema
+        ? "colMtxItemIdToCollectionItem"
+        : "colCollectionItemsData";
 
-      var unknownId = ((GomObjectData)mtxData).ValueOrDefault<long>("4611686297592334024", 0); //Always 3042172580397056 for collection items
+      GomObjectData mtxObject = mtxData as GomObjectData;
+      Boolean currentMtx = _dom.MtxStorefrontEntryLoader.MtxStoreFrontDataTable == "mtxStorefrontItems";
+      var unknownId = currentMtx
+        ? mtxObject?.ValueOrDefault<long>("mtxStorefrontItemDisplayDescription", 0) ?? 0
+        : mtxObject?.ValueOrDefault<long>("4611686297592334024", 0) ?? 0; //Always 3042172580397056 for collection items
       col.UnknowntextId = unknownId;
       col.Unknowntext = _dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", unknownId); // need to find the right stringtable for this.
       col.Localizedunknowntext = _dom.StringTable.TryGetLocalizedStrings("str.gui.mtxstorefrontitems", unknownId);
 
-      var rarityId = ((GomObjectData)mtxData).ValueOrDefault<long>("mtxRarityDescriptionId", 0);
+      var rarityId = mtxObject?.ValueOrDefault<long>("mtxRarityDescriptionId", 0) ?? 0;
       col.RarityDescId = rarityId;
       col.RarityDesc = _dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", rarityId);
       col.LocalizedRarityDesc = _dom.StringTable.TryGetLocalizedStrings("str.gui.mtxstorefrontitems", rarityId);
 
-      var bulletPointIds = ((GomObjectData)mtxData).ValueOrDefault("mtxBulletPointDescriptionIds", new List<object>()).ConvertAll(x => (long)x);
+      List<Object> rawBulletPointIds = currentMtx
+        ? (mtxObject?.ValueOrDefault("mtxStorefrontItemDisplayBullets", new List<object>()) ?? new List<object>())
+        : (mtxObject?.ValueOrDefault("mtxBulletPointDescriptionIds", new List<object>()) ?? new List<object>());
+      var bulletPointIds = rawBulletPointIds
+        .Select(x => { try { return Convert.ToInt64(x); } catch { return 0L; } })
+        .Where(x => x != 0)
+        .ToList();
       col.BulletPoints = new List<string>();
       foreach (var bullet in bulletPointIds) { col.BulletPoints.Add(_dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", bullet)); }
       col.LocalizedBulletPoints = new List<Dictionary<string, string>>();
       foreach (var bullet in bulletPointIds) { col.LocalizedBulletPoints.Add(_dom.StringTable.TryGetLocalizedStrings("str.gui.mtxstorefrontitems", bullet)); }
 
-      var nameId = ((GomObjectData)mtxData).ValueOrDefault<long>("mtxName", 0);
+      var nameId = currentMtx
+        ? mtxObject?.ValueOrDefault<long>("mtxStorefrontItemDisplayName", 0) ?? 0
+        : mtxObject?.ValueOrDefault<long>("mtxName", 0) ?? 0;
       col.Name = _dom.StringTable.TryGetString("str.gui.mtxstorefrontitems", nameId);
       col.LocalizedName = _dom.StringTable.TryGetLocalizedStrings("str.gui.mtxstorefrontitems", nameId);
 
       col.Id = Id;
-      col.CreationIndex = (long)obj.ValueOrDefault("colCreationIndex", new object()); // 3460
-      col.Icon = obj.ValueOrDefault("colCollectionIcon", ""); // "Mtx.Season3.Bikini_V02"
-      _dom.Assets.Icons.AddMtx(col.Icon);
+      col.CreationIndex = currentCollectionSchema
+        ? obj.ValueOrDefault<long>("colItemBitIndex",
+            obj.ValueOrDefault<long>("4611686347564387001", 0))
+        : obj.ValueOrDefault<long>("colCreationIndex", 0);
+      col.Icon = currentCollectionSchema
+        ? obj.ValueOrDefault("colItemImage",
+            obj.ValueOrDefault("4611686297655094004", ""))
+        : obj.ValueOrDefault("colCollectionIcon", "");
+      if (!String.IsNullOrWhiteSpace(col.Icon)) _dom.Assets.Icons.AddMtx(col.Icon);
 
-      col.IsFoundInPacks = obj.ValueOrDefault("colItemIsFoundInPacks", false); // True
+      col.IsFoundInPacks = obj.ValueOrDefault("colItemIsFoundInPacks", false);
 
-      col.LinkedId = obj.ValueOrDefault<long>("colLinkedId", 0); // 1597
+      col.LinkedId = obj.ValueOrDefault<long>("colLinkedId", 0);
 
       List<object> unknownList = obj.ValueOrDefault<List<object>>("4611686297968184000", null); // seems to be always empty.
 
@@ -84,7 +112,8 @@ namespace GomLib.ModelLoader {
           if (u != null) {
               string stopHere = ""; } }*/
 
-      List<object> unknownList2 = obj.Get<List<object>>("4611686297983034002"); // { 15607973448745700563 } - need to find out what this is.
+      List<object> unknownList2 = obj.ValueOrDefault("colItemAssociatedMountSpecs",
+        obj.ValueOrDefault("4611686297983034002", new List<object>()));
       /*if (unknownList.Count != 0) {                                         //This is some code to isolate cases where this list might have values
           var u = DataObjectModel.GetObject((ulong)unknownList2[0]);
           if (u != null) {
@@ -92,7 +121,10 @@ namespace GomLib.ModelLoader {
 
       //col.CategoryId = (long)obj.ValueOrDefault<object>("mtxStorefrontMainCategory", new object()); // 610 looked up in colCollectionItemsPrototype("colCollectionItemsCategoryData")
 
-      col.ItemIdsList = obj.ValueOrDefault("colItemList", new List<object>()).ConvertAll(x => (ulong)x);
+      col.ItemIdsList = currentCollectionSchema
+        ? obj.ValueOrDefault("colItemAssociatedItemIds",
+            obj.ValueOrDefault("4611686347564387005", new List<object>())).ConvertAll(Convert.ToUInt64)
+        : obj.ValueOrDefault("colItemList", new List<object>()).ConvertAll(Convert.ToUInt64);
       /*{ 16141048636041134811, 16140999226559259282, 16141134542521957469, 
       * 16140928499777528367, 16141006708961340344, 16141053294373613055, 
       * 16140959691716914276,  } - items*/
@@ -103,44 +135,56 @@ namespace GomLib.ModelLoader {
           col.ItemList.Add(_dom.itemLoader.Load(item));
       }*/
 
-      col.AbilityIdsList = obj.Get<List<object>>("colAbilityList").ConvertAll(x => (ulong)x);  // { 16140962263260863698 } - ability
+      col.AbilityIdsList = currentCollectionSchema
+        ? obj.ValueOrDefault("colItemAssociatedAbilities",
+            obj.ValueOrDefault("4611686347564747001", new List<object>())).ConvertAll(Convert.ToUInt64)
+        : obj.ValueOrDefault("colAbilityList", new List<object>()).ConvertAll(Convert.ToUInt64);
       /*col.AbilityList = new List<Ability>();
       foreach (var ability in col.AbilityIdsList)
       {
           col.AbilityList.Add(_dom.abilityLoader.Load(ability));
       }*/
 
-      var titleShortIdLookupList = obj.ValueOrDefault("colCollectionsTitleId", new List<object>()).ConvertAll(x => (long)x); /* { 150 } - always 1 value that you lookup in
+      var titleShortIdLookupList = currentCollectionSchema
+        ? obj.ValueOrDefault("colItemAssociatedTitle",
+            obj.ValueOrDefault("4611686347564747003", new List<object>())).ConvertAll(Convert.ToInt64)
+        : obj.ValueOrDefault("colCollectionsTitleId", new List<object>()).ConvertAll(Convert.ToInt64); /* legacy title ids; current data stores associated title indices
                                                                                                                                  * colCollectionItemsPrototype
                                                                                                                                  * colCollectionsTitleData                   */
 
-      var emoteShortIdLookupList = obj.ValueOrDefault("colCollectionsEmoteId", new List<object>()).ConvertAll(x => (long)x); /* { 202 } - always 1 value that you lookup in
+      var emoteShortIdLookupList = obj.ValueOrDefault("colCollectionsEmoteId", new List<object>()).ConvertAll(Convert.ToInt64); /* legacy-only field
                                                                                                                                  * colCollectionItemsPrototype
                                                                                                                                  * colCollectionsEmoteData                   */
 
-      var longBoolDic = obj.Get<Dictionary<object, object>>("4611686347575727004"); /* [ 93001972900066292: True, 4095493194534377413: True, 4104425345487988702: True,  ]
+      var longBoolDic = obj.ValueOrDefault("colItemCollectionTags",
+        obj.ValueOrDefault("4611686347575727004", new Dictionary<object, object>())); /* current: collection tags
                                                                                               * need to figure out what the heck these are */
 
       List<object> linkedListO = obj.ValueOrDefault<List<object>>("4611686347582697000", null);
       if (linkedListO != null) {
-        List<long> linkedList = linkedListO.ConvertAll(x => (long)x);
+        List<long> linkedList = linkedListO.ConvertAll(Convert.ToInt64);
       }
 
       var unknownlong = obj.ValueOrDefault<long>("4611686348190277001", 0); // -7824174851411027002 - not sure what this is
 
-      col.RequiredLevel = obj.ValueOrDefault<long>("colCollectionsRequiredLevel", 1); // 1
+      col.RequiredLevel = currentCollectionSchema
+        ? obj.ValueOrDefault<long>("colItemMinimumLevel",
+            obj.ValueOrDefault<long>("4611686348190437000", 1))
+        : obj.ValueOrDefault<long>("colCollectionsRequiredLevel", 1);
 
-      var alternateUnlocks = obj.ValueOrDefault("4611686348190657005", new Dictionary<object, object>());
+      var alternateUnlocks = obj.ValueOrDefault("colCollectionItemAlternateItemsMapping",
+        obj.ValueOrDefault("4611686348190657005", new Dictionary<object, object>()));
       col.HasAlternateUnlocks = (alternateUnlocks.Count > 0);
       col.AlternateUnlocksMap = new Dictionary<ulong, List<ulong>>();
 
       if (alternateUnlocks.Count > 0) {
-        col.AlternateUnlocksMap = alternateUnlocks.ToDictionary(p => (ulong)p.Key, p => ((List<object>)p.Value).ConvertAll(x => (ulong)x));
+        col.AlternateUnlocksMap = alternateUnlocks.ToDictionary(p => Convert.ToUInt64(p.Key), p => ((List<object>)p.Value).ConvertAll(Convert.ToUInt64));
       }
 
 
       List<ulong> collectionItemsList2 = new List<ulong>(); // Might be items granted.
-      collectionItemsList2 = obj.ValueOrDefault("4611686348671327000", new List<object>()).ConvertAll(x => (ulong)x);
+      collectionItemsList2 = obj.ValueOrDefault("colItemDisplayItemIds",
+        obj.ValueOrDefault("4611686348671327000", new List<object>())).ConvertAll(Convert.ToUInt64);
       /*{ 16141048636041134811, 16140999226559259282, 16141134542521957469, 
       * 16140928499777528367, 16141006708961340344, 16141053294373613055, 
       * 16140959691716914276,  } - items*/

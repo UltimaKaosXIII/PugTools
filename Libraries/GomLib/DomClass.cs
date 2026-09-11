@@ -13,6 +13,14 @@ namespace GomLib
         public List<DomClass> Components { get; private set; }
         public List<DomField> Fields { get; private set; }
 
+        // Raw client.gom class metadata.  The exact HeroEngine semantics of the two
+        // method IDs are still being reverse engineered, so expose them without
+        // inventing names/behaviour.  This is useful for schema inspection and
+        // comparing DOM structure without requiring any external database.
+        public ushort Archetype { get; internal set; }
+        public ulong ScriptMethodId1 { get; internal set; }
+        public ulong ScriptMethodId2 { get; internal set; }
+
         public DomClass()
         {
             ComponentIds = new List<ulong>();
@@ -24,6 +32,10 @@ namespace GomLib
         public override void Link(DataObjectModel dom)
         {
             Dom_ = dom;
+            // Link can run once for a lightweight client.gom schema load and again
+            // when that model is upgraded to the full prototype/node model.
+            Components.Clear();
+            Fields.Clear();
             foreach (var cId in ComponentIds)
             {
                 var component = Dom_.Get<DomClass>(cId);

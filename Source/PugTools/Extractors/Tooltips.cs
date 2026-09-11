@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Drawing;
@@ -508,7 +508,7 @@ namespace PugTools {
           "colCollectionItemsPrototype", "colCollectionItemsData" }
         },
         { "MtxStoreFronts", new String[2] {
-          "mtxStorefrontInfoPrototype", "mtxStorefrontData" }
+          "mtxStorefrontInfoPrototype", "mtxStorefrontItems" }
         },
         { "SetBonuses", new String[2] {
           "itmSetBonusesPrototype", "itmSetBonuses" }
@@ -523,8 +523,17 @@ namespace PugTools {
         GomObject currentDataObject = CurrentDom.GetObject(gameObj.Value[0]);
 
         if (currentDataObject != null) { // fix to ensure old game assets don't throw exceptions.
-          currentDataProto =
-            currentDataObject.Data.Get<Dictionary<Object, Object>>(gameObj.Value[1]);
+          currentDataProto = currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+            gameObj.Value[1], null)
+            ?? (gameObj.Key == "Collections"
+              ? currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+                  "colMtxItemIdToCollectionItem", null)
+                ?? currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+                  "4611686297655094008", new Dictionary<Object, Object>())
+              : gameObj.Key == "MtxStoreFronts"
+                ? currentDataObject.Data.ValueOrDefault<Dictionary<Object, Object>>(
+                    "mtxStorefrontData", new Dictionary<Object, Object>())
+                : new Dictionary<Object, Object>());
           currentDataObject.Unload();
         }
 

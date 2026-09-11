@@ -122,10 +122,38 @@ namespace PugTools {
         if(!requested.TryGetValue(request.AssetId,out state)||(state!=0&&state!=1)||!requested.TryUpdate(request.AssetId,2,state))continue;
         GR2 model=null; Exception error=null;
         try {
-          string path="/resources/"+(request.AssetPath??String.Empty).Replace('\\','/').TrimStart('/')+".gr2";
-          ArchiveFile file=area.FindFile(path);
-          if(file==null) throw new FileNotFoundException("World GR2 not found in selected archives.",path);
-          using(Stream stream=file.OpenCopyInMemory()) using(var reader=new BinaryReader(stream)) model=new GR2(reader,request.AssetPath,null);
+          string assetPath=(request.AssetPath??String.Empty).Replace('\\','/').TrimStart('/');
+          if(request.IsSpeedTree) {
+            Exception nativeError=null;
+            string sptPath="/resources/"+assetPath+".spt";
+            ArchiveFile sptFile=area.FindFile(sptPath);
+            if(sptFile!=null) {
+              try {
+                using(Stream stream=sptFile.OpenCopyInMemory()) {
+                  ViewSPT.SptInfo info=ViewSPT.Parse(stream);
+                  model=SpeedTreeProceduralModel.Build(info,request.AssetPath);
+                }
+              } catch(Exception ex) {
+                nativeError=ex;
+                System.Diagnostics.Debug.WriteLine("Native SpeedTree '"+request.AssetPath+"' failed, trying Granny fallback: "+ex.Message);
+              }
+            } else nativeError=new FileNotFoundException("World SPT not found in selected archives.",sptPath);
+
+            // Some SWTOR trees also ship a same-stem visual GR2. Keep that as a compatibility fallback for
+            // beta/edge-case SPT records the procedural reader does not yet understand. Never use .spt.gr2 here:
+            // that companion is collision/proxy geometry rather than the visible SpeedTree.
+            if(model==null) {
+              string fallbackPath="/resources/"+assetPath+".gr2";
+              ArchiveFile fallback=area.FindFile(fallbackPath);
+              if(fallback==null) throw new InvalidDataException("Native SPT generation failed and no same-stem GR2 fallback exists for '"+request.AssetPath+"'.",nativeError);
+              using(Stream stream=fallback.OpenCopyInMemory()) using(var reader=new BinaryReader(stream)) model=new GR2(reader,request.AssetPath+" [SPT fallback]",null);
+            }
+          } else {
+            string path="/resources/"+assetPath+".gr2";
+            ArchiveFile file=area.FindFile(path);
+            if(file==null) throw new FileNotFoundException("World GR2 not found in selected archives.",path);
+            using(Stream stream=file.OpenCopyInMemory()) using(var reader=new BinaryReader(stream)) model=new GR2(reader,request.AssetPath,null);
+          }
         } catch(Exception ex) { error=ex; }
         if(model!=null)requested[request.AssetId]=3;else {requested.TryRemove(request.AssetId,out _);failed.TryAdd(request.AssetId,0);}
         completed.Enqueue(new WorldModelStreamResult(request,model,error));

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -18,6 +18,10 @@ namespace GomLib.Models {
     public string Text { get; set; }
     public Dictionary<string, string> LocalizedString { get; set; }
     public string Hook { get; set; }
+    public ulong HookId { get; set; }
+    public long HookFlags { get; set; }
+    public bool HideBannerText { get; set; }
+    public long StringId { get; set; }
 
     public bool ShowTracking { get; set; }
     public bool ShowCount { get; set; }
@@ -62,7 +66,7 @@ namespace GomLib.Models {
     public List<Quest> BonusMissions {
       get {
         var bMissions = new List<Quest>();
-        foreach (var bonMisId in BonusMissionsIds) {
+        foreach (var bonMisId in BonusMissionsIds ?? new List<ulong>()) {
           if (bonMisId != 0) {
             var qst = Dom_.QuestLoader.Load(bonMisId);
             if (qst.Fqn != null)
@@ -152,23 +156,16 @@ namespace GomLib.Models {
       if (Text != qts.Text)
         return false;
 
-      if (TaskNpcs != null) {
-        if (qts.TaskNpcs == null) {
-          return false;
-        } else {
-          if (!Enumerable.SequenceEqual(TaskNpcs, qts.TaskNpcs))
-            return false;
-        }
-      }
-
-      if (TaskQuests != null) {
-        if (qts.TaskQuests == null) {
-          return false;
-        } else {
-          if (!Enumerable.SequenceEqual(TaskQuests, qts.TaskQuests))
-            return false;
-        }
-      }
+      if (!Enumerable.SequenceEqual(TaskNpcIds ?? new List<ulong>(), qts.TaskNpcIds ?? new List<ulong>()))
+        return false;
+      if (!Enumerable.SequenceEqual(TaskQuestIds ?? new List<ulong>(), qts.TaskQuestIds ?? new List<ulong>()))
+        return false;
+      if (!Enumerable.SequenceEqual(TaskPlcIds ?? new List<ulong>(), qts.TaskPlcIds ?? new List<ulong>()))
+        return false;
+      if (!Enumerable.SequenceEqual(MapNoteFqnList ?? new List<string>(), qts.MapNoteFqnList ?? new List<string>()))
+        return false;
+      if (HookId != qts.HookId || HookFlags != qts.HookFlags || HideBannerText != qts.HideBannerText || StringId != qts.StringId)
+        return false;
 
       return true;
     }
@@ -187,18 +184,24 @@ namespace GomLib.Models {
       Quest.QuestItemsGivenOrTakenToXElement(taskNode, ItemsGiven, ItemsTaken);
 
       taskNode.Add(new XElement("BonusMissions"));
-      if (BonusMissions != null) {
-        foreach (var bonus in BonusMissions) {
-          taskNode.Element("BonusMissions").Add(bonus.ToXElement(verbose));
-        }
+      foreach (UInt64 bonusId in BonusMissionsIds ?? new List<ulong>()) {
+        if (bonusId == 0) continue;
+        String fqn = Dom_?.GetStoredTypeName(bonusId);
+        taskNode.Element("BonusMissions").Add(
+          new XElement("Quest", new XAttribute("Id", bonusId),
+            String.IsNullOrWhiteSpace(fqn) ? null : new XAttribute("Fqn", fqn)));
       }
 
       if (verbose) {
         taskNode.Add(new XElement("Hook", Hook),
+            new XElement("HookId", HookId),
+            new XElement("HookFlags", HookFlags),
+            new XElement("StringId", StringId),
+            new XElement("HideBannerText", HideBannerText),
             new XElement("ShowCount", ShowCount),
             new XElement("ShowTracking", ShowTracking));
         XElement taskNpcs = new XElement("TaskNpcs");
-        foreach (var npc in TaskNpcs) {
+        foreach (var npc in TaskNpcs ?? new List<Npc>()) {
           if (Step.Branch.Quest.m_loadedNpcs.ContainsKey(npc.Fqn)) {
             taskNpcs.Add(Step.Branch.Quest.m_loadedNpcs[npc.Fqn]);
           } else {
@@ -206,11 +209,28 @@ namespace GomLib.Models {
             taskNpcs.Add(taskNpc); //add task npc to task npcs
           }
         }
-        taskNode.Add(taskNpcs); //add task npcs to task
+        foreach (UInt64 npcId in TaskNpcIds ?? new List<ulong>()) {
+          String fqn = Dom_?.GetStoredTypeName(npcId);
+          if (!String.IsNullOrWhiteSpace(fqn) && !taskNpcs.Elements("NpcRef").Any(x => (String)x.Attribute("Fqn") == fqn))
+            taskNpcs.Add(new XElement("NpcRef", new XAttribute("Id", npcId), new XAttribute("Fqn", fqn)));
+        }
+        foreach (UInt64 plcId in TaskPlcIds ?? new List<ulong>()) {
+          String fqn = Dom_?.GetStoredTypeName(plcId);
+          taskNpcs.Add(new XElement("PlaceableRef", new XAttribute("Id", plcId),
+            String.IsNullOrWhiteSpace(fqn) ? null : new XAttribute("Fqn", fqn)));
+        }
+        foreach (String mapNote in MapNoteFqnList ?? new List<String>())
+          taskNpcs.Add(new XElement("MapNoteRef", new XAttribute("Fqn", mapNote)));
+        taskNode.Add(taskNpcs); //add task npcs/placeables/map notes to task
         XElement taskQuests = new XElement("TaskQuests");
-        foreach (var quest in TaskQuests) {
+        foreach (var quest in TaskQuests ?? new List<Quest>()) {
           XElement taskQuest = quest.ToXElement(verbose);
           taskQuests.Add(taskQuest); //add task quest to task quests
+        }
+        foreach (UInt64 questId in TaskQuestIds ?? new List<ulong>()) {
+          String fqn = Dom_?.GetStoredTypeName(questId);
+          if (!String.IsNullOrWhiteSpace(fqn) && !taskQuests.Elements("QuestRef").Any(x => (String)x.Attribute("Fqn") == fqn))
+            taskQuests.Add(new XElement("QuestRef", new XAttribute("Id", questId), new XAttribute("Fqn", fqn)));
         }
         taskNode.Add(taskQuests); //add task quests to task
       }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -108,25 +108,45 @@ namespace GomLib.ModelLoader {
         //Not present pre 4.0 so have to check this exists. This could cause a slow down analayzing pre 4.0 clients.
         GomObject reactionNode = _dom.GetObject("cnvReactionsDataPrototype");
         if (reactionNode != null) {
-          Dictionary<object, object> reactionClassByID = reactionNode.Data.ValueOrDefault<Dictionary<object, object>>("cnvReactionsByID", null);
-          foreach (KeyValuePair<object, object> kvp in reactionClassByID) {
-            long id = (long)kvp.Key;
+          // Current clients expose this map as cnvNpcReactionMap. Keep the old field as a
+          // fallback so older clients can still be parsed. Missing reaction data is valid and
+          // should fall through to the legacy defaults below rather than crashing.
+          Dictionary<object, object> reactionClassByID =
+              reactionNode.Data.ValueOrDefault<Dictionary<object, object>>("cnvNpcReactionMap", null)
+              ?? reactionNode.Data.ValueOrDefault<Dictionary<object, object>>("cnvReactionsByID", null);
 
-            GomObjectData reactionClass = kvp.Value as GomObjectData;
-            long sid = reactionClass.ValueOrDefault<long>("cnvReactionString", 0);
-            long influenceMod = reactionClass.ValueOrDefault<long>("cnvReactionInfluenceModifier", 0);
-            bool influenceNegative = reactionClass.ValueOrDefault("cnvReactionInfluenceNegative", false);
-
-            if (influenceNegative) influenceMod = -influenceMod;
-
-            //Get the string from the string tables.
+          if (reactionClassByID != null) {
             StringTable reactionStb = _dom.StringTable.Find("str.gui.conversationreactions");
-            string reactionString = reactionStb.GetText(sid, "str.gui.conversationreactions");
-            Dictionary<string, string> localizedReactionString = reactionStb.GetLocalizedText(sid, "str.gui.conversationreactions");
 
-            //Store the data for quick lookup. Don't need the influence modifier to be long.
-            reactionDataByID.Add(id, new KeyValuePair<int, string>((int)influenceMod, reactionString));
-            localizedReactionDataByID.Add(id, new KeyValuePair<int, Dictionary<string, string>>((int)influenceMod, localizedReactionString));
+            foreach (KeyValuePair<object, object> kvp in reactionClassByID) {
+              if (!(kvp.Value is GomObjectData reactionClass)) {
+                continue;
+              }
+
+              long id = (long)kvp.Key;
+
+              // Retail/current names first, pre-current names as compatibility fallbacks.
+              long sid = reactionClass.ValueOrDefault<long>("cnvReactionStringId",
+                  reactionClass.ValueOrDefault<long>("cnvReactionString", 0));
+              long influenceMod = reactionClass.ValueOrDefault<long>("cnvReactionInfluence",
+                  reactionClass.ValueOrDefault<long>("cnvReactionInfluenceModifier", 0));
+              bool influenceNegative = reactionClass.ValueOrDefault("cnvReactionDisplayChange",
+                  reactionClass.ValueOrDefault("cnvReactionInfluenceNegative", false));
+
+              if (influenceNegative) influenceMod = -influenceMod;
+
+              string reactionString = null;
+              Dictionary<string, string> localizedReactionString = null;
+              if (reactionStb != null && sid != 0) {
+                reactionString = reactionStb.GetText(sid, "str.gui.conversationreactions");
+                localizedReactionString = reactionStb.GetLocalizedText(sid, "str.gui.conversationreactions");
+              }
+
+              // Use assignment instead of Add so malformed/duplicate reaction IDs cannot abort
+              // an otherwise valid extraction.
+              reactionDataByID[id] = new KeyValuePair<int, string>((int)influenceMod, reactionString);
+              localizedReactionDataByID[id] = new KeyValuePair<int, Dictionary<string, string>>((int)influenceMod, localizedReactionString);
+            }
           }
         }
       }

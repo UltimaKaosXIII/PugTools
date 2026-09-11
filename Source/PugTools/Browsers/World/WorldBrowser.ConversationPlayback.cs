@@ -545,8 +545,10 @@ namespace PugTools {
     }
 
     private void DisposeWorldConversationAudioCache() {
-      foreach (List<ViewWEM> list in worldConversationAudioCache.Values.Where(x => x != null))
-        foreach (ViewWEM wem in list) try { wem?.Vorbis?.Dispose(); } catch { }
+      // Detach potentially hundreds of Vorbis decoders immediately, but do not synchronously
+      // dispose all of them while WinForms is closing the World Browser.
+      List<ViewWEM> disposeLater = worldConversationAudioCache.Values
+        .Where(x => x != null).SelectMany(x => x).Where(x => x != null).ToList();
       worldConversationAudioCache.Clear();
       worldConversationAudioCacheAssets = null;
       worldConversationAnimationCache.Clear();
@@ -554,6 +556,11 @@ namespace PugTools {
       worldConversationFaceFxSetCache.Clear();
       worldConversationFaceFxActorCache.Clear();
       worldConversationFaceFxCacheAssets = null;
+      if (disposeLater.Count > 0) {
+        BackgroundCleanup.Enqueue(() => {
+          foreach (ViewWEM wem in disposeLater) try { wem?.Vorbis?.Dispose(); } catch { }
+        });
+      }
     }
 
     private void StopWorldConversationPlayback(bool clearConversation) {

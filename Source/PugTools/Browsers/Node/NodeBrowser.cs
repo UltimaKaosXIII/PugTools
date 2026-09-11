@@ -56,6 +56,13 @@ namespace PugTools {
     private NodeSearchEntry[] _nodeSearchIndex = Array.Empty<NodeSearchEntry>();
     private TreeViewFast.Controls.TreeViewFast.PreparedTree _fullNodeTree;
     private TreeViewFast.Controls.TreeViewFast _nodeFilterTree;
+    // In-memory file-reader style navigation history. No persistent index/database is created.
+    private readonly List<String> _nodeNavigationHistory = new List<String>();
+    private Int32 _nodeNavigationHistoryIndex = -1;
+    private Boolean _nodeHistoryNavigation;
+    private BrowserSessionTabs _nodePageTabs;
+    private String _pendingNodeNavigation;
+    private Boolean _pendingNodeNavigationNewTab;
     #endregion
 
     #region NodeBrowser
@@ -67,7 +74,10 @@ namespace PugTools {
       InitializeComponent();
       InitializeNodeFilterTreeView();
       InitializeNodeTreeLiveFilter();
+      InitializeNodePageTabs();
       InitializeNodePreviewUi();
+      InitializeNodeExportMenu();
+      InitializeNodeReaderFeatures();
       Config.Load();
 
       _assetsLocation = assetLocation;
@@ -125,6 +135,10 @@ namespace PugTools {
       treeViewGrid1.MouseDoubleClick += TreeViewGrid1MouseDoubleClickNavigate;
     }
     private void NodeBrowserFormClosed(Object sender, FormClosedEventArgs e) {
+      if (_nodePreviewRememberedTextHeight > 0) {
+        Config.NodePreviewTextHeight = _nodePreviewRememberedTextHeight;
+        try { Config.Save(); } catch { }
+      }
       try { _nodeTreeFilterTimer?.Stop(); _nodeTreeFilterTimer?.Dispose(); } catch { }
       _nodeTreeFilterTimer = null;
       try { _nodeTreeFilterCancellation?.Cancel(); _nodeTreeFilterCancellation?.Dispose(); } catch { }
@@ -137,20 +151,10 @@ namespace PugTools {
         _nodeFilterTree = null;
       }
 
-      if (treeViewFast1 != null) {
-        treeViewFast1.Dispose();
-        treeViewFast1 = null;
-      }
-
-      if (treeViewGrid1 != null) {
-        treeViewGrid1.Dispose();
-        treeViewGrid1 = null;
-      }
-
-      if (dataGridView1 != null) {
-        dataGridView1.Dispose();
-        dataGridView1 = null;
-      }
+      // Designer-owned TreeViews/Grid are disposed once by Form.Dispose(); avoid a second deep subtree walk here.
+      treeViewFast1 = null;
+      treeViewGrid1 = null;
+      dataGridView1 = null;
 
       _assetDict = null;
       _currentAssets = null;
@@ -178,10 +182,12 @@ namespace PugTools {
       try { _nodePreviewRenderer?.StopRender(); } catch { }
     }
     private void NodeBrowserFormResize(Object sender, EventArgs e) {
+      Int32 tabHeight = _nodePageTabs?.Height ?? 0;
       var treeSize =
-        new System.Drawing.Size(splitContainer2.Panel1.Width, splitContainer2.Panel1.Height - 70);
+        new System.Drawing.Size(splitContainer2.Panel1.Width, Math.Max(20, splitContainer2.Panel1.Height - 70 - tabHeight));
       if (treeViewFast1 != null) treeViewFast1.Size = treeSize;
       if (_nodeFilterTree != null) _nodeFilterTree.Size = treeSize;
+      if (_nodePageTabs != null) _nodePageTabs.Width = splitContainer2.Panel1.Width;
       ResizeNodePreviewLayout();
     }
     #endregion
@@ -533,6 +539,24 @@ namespace PugTools {
         Boolean xLeaf = x != null && (x.Obj != null || x.dynObject != null || x.objData != null);
         Boolean yLeaf = y != null && (y.Obj != null || y.dynObject != null || y.objData != null);
         if (xLeaf != yLeaf) return xLeaf ? 1 : -1;
+        if (xLeaf && yLeaf) {
+          Boolean xVariant = TryGetNumericAbilityVariant(x?.id, out String xBase, out Int32[] xParts);
+          Boolean yVariant = TryGetNumericAbilityVariant(y?.id, out String yBase, out Int32[] yParts);
+          // Generated effect/variant nodes such as abl.foo/0, /1 and /0/1 belong after
+          // the authored ability nodes, matching Jedipedia's much easier-to-scan layout.
+          if (xVariant != yVariant) return xVariant ? 1 : -1;
+          if (xVariant) {
+            Int32 baseCompare = String.Compare(xBase, yBase, StringComparison.OrdinalIgnoreCase);
+            if (baseCompare != 0) return baseCompare;
+            Int32 partCount = Math.Min(xParts.Length, yParts.Length);
+            for (Int32 index = 0; index < partCount; index++) {
+              Int32 partCompare = xParts[index].CompareTo(yParts[index]);
+              if (partCompare != 0) return partCompare;
+            }
+            Int32 lengthCompare = xParts.Length.CompareTo(yParts.Length);
+            if (lengthCompare != 0) return lengthCompare;
+          }
+        }
         return String.Compare(x?.id, y?.id, StringComparison.Ordinal);
       }
 
@@ -540,6 +564,24 @@ namespace PugTools {
         _assetDict.Values, getId, getParentId, getDisplayName, getImageIndex, compare,
         () => _closing
       );
+    }
+
+    private static Boolean TryGetNumericAbilityVariant(String id, out String baseAbility, out Int32[] parts) {
+      baseAbility = null;
+      parts = Array.Empty<Int32>();
+      if (String.IsNullOrWhiteSpace(id) || !id.StartsWith("abl.", StringComparison.OrdinalIgnoreCase)) return false;
+      Int32 slash = id.IndexOf('/');
+      if (slash <= 4 || slash >= id.Length - 1) return false;
+      String suffix = id.Substring(slash + 1);
+      String[] rawParts = suffix.Split('/');
+      if (rawParts.Length == 0) return false;
+      Int32[] parsed = new Int32[rawParts.Length];
+      for (Int32 index = 0; index < rawParts.Length; index++) {
+        if (!Int32.TryParse(rawParts[index], out parsed[index]) || parsed[index] < 0) return false;
+      }
+      baseAbility = id.Substring(0, slash);
+      parts = parsed;
+      return true;
     }
     private void BackgroundWorker3Completed(Object sender, RunWorkerCompletedEventArgs e) {
       if (_closing) return;
@@ -577,6 +619,7 @@ namespace PugTools {
       if (treeViewFast1.Nodes.Count > 0) treeViewFast1.Nodes[0].Expand();
 
       txtSearch.Focus();
+      ApplyPendingNodeNavigation();
     }
     #endregion
 
@@ -865,6 +908,9 @@ namespace PugTools {
       if (asset.Obj.Data != null) {
         _rootList = new ArrayList();
 
+        NodeListItem prototypeStructure = BuildPrototypeStructureItem(asset.Obj);
+        if (prototypeStructure != null) _rootList.Add(prototypeStructure);
+
         foreach (KeyValuePair<String, Object> item in asset.Obj.Data.Dictionary) {
           if (item.Key.Contains("Script_")) continue;
 
@@ -890,7 +936,10 @@ namespace PugTools {
               NodeListItem item3 = new NodeListItem(item.Key, item.Value, null);
               _rootList.Add(item3);
             } else {
-              NodeListItem item3 = new NodeListItem(item.Key, item.Value, fieldLookup.GomType);
+              NodeListItem item3 = new NodeListItem(item.Key, item.Value, fieldLookup.GomType) {
+                FieldId = fieldLookup.Id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                NavigationTarget = fieldLookup
+              };
               _rootList.Add(item3);
             }
           }
@@ -1433,7 +1482,7 @@ namespace PugTools {
       NavigateToNodeReference(treeViewGrid1.SelectedObject as NodeListItem);
     }
 
-    private Boolean NavigateToNodeReference(NodeListItem item) {
+    private Boolean NavigateToNodeReference(NodeListItem item, Boolean newTab = false) {
       if (!TryGetNodeReference(item, out String nodeString) || String.IsNullOrWhiteSpace(nodeString)) return false;
 
       // Navigation targets the persistent full tree. Leaving the filter view is an O(1) visibility
@@ -1450,6 +1499,8 @@ namespace PugTools {
       }
 
       if (nodes.Length == 0) return false;
+      if (newTab && nodes[0].Tag is NodeAsset targetAsset)
+        _nodePageTabs?.OpenInNewTab(targetAsset.id, targetAsset.Obj?.Name ?? targetAsset.displayName, false);
       treeViewFast1.SelectedNode = nodes[0];
       treeViewFast1.SelectedNode.EnsureVisible();
       treeViewFast1.Focus();
@@ -1559,7 +1610,9 @@ namespace PugTools {
       TreeNode node = e?.Node ?? (sender as TreeViewFast.Controls.TreeViewFast)?.SelectedNode;
       if (node?.Tag is not NodeAsset asset) return;
 
+      if (asset?.Obj != null && !_nodeHistoryNavigation) RecordNodeNavigation(asset.id);
       String actualNodeName = asset?.Obj?.Name ?? asset?.displayName ?? asset?.id;
+      if (asset?.Obj != null) _nodePageTabs?.UpdateCurrent(asset.id, actualNodeName);
       Text = "Node Browser - " + actualNodeName;
 
       _collapsed = false;
@@ -1629,8 +1682,145 @@ namespace PugTools {
     private void TreeViewFast1KeyDown(Object sender, KeyEventArgs e) {
       if (e.Control && e.KeyCode == Keys.F)
         txtSearch.Focus();
+      else if (e.Control && e.KeyCode == Keys.E) {
+        ShowNodeQuickOpen();
+        e.Handled = true;
+        e.SuppressKeyPress = true;
+      }
 
     }
+
+    protected override Boolean ProcessCmdKey(ref Message msg, Keys keyData) {
+      if (_nodePageTabs != null && _nodePageTabs.ProcessShortcut(keyData)) return true;
+      if (ProcessNodeReaderShortcut(keyData)) return true;
+      if (keyData == (Keys.Control | Keys.E)) { ShowNodeQuickOpen(); return true; }
+      if (keyData == (Keys.Alt | Keys.Left)) { NavigateNodeHistory(-1); return true; }
+      if (keyData == (Keys.Alt | Keys.Right)) { NavigateNodeHistory(1); return true; }
+      return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    private void InitializeNodePageTabs() {
+      if (splitContainer2?.Panel1 == null) return;
+      _nodePageTabs = new BrowserSessionTabs {
+        Location = new System.Drawing.Point(0, 68),
+        Width = splitContainer2.Panel1.Width,
+        Height = 29,
+        Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+      };
+      _nodePageTabs.NavigateRequested += delegate (Object sender, BrowserSessionTabs.NavigateEventArgs e) {
+        if (String.IsNullOrWhiteSpace(e.Key)) return;
+        _nodeHistoryNavigation = true;
+        try { NavigateToNodeId(e.Key); }
+        finally { _nodeHistoryNavigation = false; }
+      };
+      splitContainer2.Panel1.Controls.Add(_nodePageTabs);
+      _nodePageTabs.BringToFront();
+      NodeBrowserFormResize(this, EventArgs.Empty);
+    }
+
+    internal Boolean MatchesNodeSource(String gamePath, Boolean usePts) {
+      if (_assetsUsePts != usePts) return false;
+      try {
+        return String.Equals(Assets.NormalizeGamePath(_assetsLocation), Assets.NormalizeGamePath(gamePath), StringComparison.OrdinalIgnoreCase);
+      } catch {
+        return String.Equals(_assetsLocation?.TrimEnd('\\', '/'), gamePath?.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase);
+      }
+    }
+
+    internal void NavigateOrQueueNode(String nodeReference, Boolean newTab = false) {
+      if (String.IsNullOrWhiteSpace(nodeReference)) return;
+      if (TryNavigateNodeReferenceString(nodeReference, newTab)) return;
+      _pendingNodeNavigation = nodeReference;
+      _pendingNodeNavigationNewTab = newTab;
+      StatusLabel1Text("Waiting for node index to open " + nodeReference + " ...");
+    }
+
+    private void ApplyPendingNodeNavigation() {
+      if (String.IsNullOrWhiteSpace(_pendingNodeNavigation)) return;
+      String reference = _pendingNodeNavigation;
+      Boolean newTab = _pendingNodeNavigationNewTab;
+      _pendingNodeNavigation = null;
+      _pendingNodeNavigationNewTab = false;
+      if (!TryNavigateNodeReferenceString(reference, newTab))
+        StatusLabel1Text("Referenced node was not found: " + reference);
+    }
+
+    private Boolean TryNavigateNodeReferenceString(String nodeReference, Boolean newTab = false) {
+      if (String.IsNullOrWhiteSpace(nodeReference)) return false;
+      String reference = nodeReference.Trim().Trim('"', '\'', '(', ')', '[', ']', '{', '}');
+      NodeSearchEntry[] entries = _nodeSearchIndex ?? Array.Empty<NodeSearchEntry>();
+      if (entries.Length == 0) return false;
+
+      NodeSearchEntry match = entries.FirstOrDefault(x =>
+        String.Equals(x.Id, reference, StringComparison.OrdinalIgnoreCase)
+        || String.Equals(x.NodeName, reference, StringComparison.OrdinalIgnoreCase)
+        || String.Equals(x.ObjectId, reference, StringComparison.OrdinalIgnoreCase));
+      if (String.IsNullOrWhiteSpace(match.Id)) return false;
+      try { if (treeViewFast1?.GetNode(match.Id) == null) return false; } catch { return false; }
+      if (newTab) _nodePageTabs?.OpenInNewTab(match.Id, match.NodeName, false);
+      return NavigateToNodeId(match.Id);
+    }
+
+    private void RecordNodeNavigation(String id) {
+      if (String.IsNullOrWhiteSpace(id)) return;
+      if (_nodeNavigationHistoryIndex >= 0 && _nodeNavigationHistoryIndex < _nodeNavigationHistory.Count
+          && String.Equals(_nodeNavigationHistory[_nodeNavigationHistoryIndex], id, StringComparison.OrdinalIgnoreCase)) return;
+      if (_nodeNavigationHistoryIndex + 1 < _nodeNavigationHistory.Count)
+        _nodeNavigationHistory.RemoveRange(_nodeNavigationHistoryIndex + 1, _nodeNavigationHistory.Count - _nodeNavigationHistoryIndex - 1);
+      _nodeNavigationHistory.Add(id);
+      if (_nodeNavigationHistory.Count > 200) _nodeNavigationHistory.RemoveAt(0);
+      _nodeNavigationHistoryIndex = _nodeNavigationHistory.Count - 1;
+    }
+
+    private void NavigateNodeHistory(Int32 direction) {
+      Int32 target = _nodeNavigationHistoryIndex + direction;
+      if (target < 0 || target >= _nodeNavigationHistory.Count) return;
+      _nodeHistoryNavigation = true;
+      try {
+        if (NavigateToNodeId(_nodeNavigationHistory[target])) _nodeNavigationHistoryIndex = target;
+      } finally { _nodeHistoryNavigation = false; }
+    }
+
+    private Boolean NavigateToNodeId(String id) {
+      if (String.IsNullOrWhiteSpace(id) || treeViewFast1 == null) return false;
+      if (!String.IsNullOrWhiteSpace(txtSearch.Text)) {
+        txtSearch.Clear();
+        ApplyNodeTreeLiveFilter();
+      }
+      try {
+        TreeNode node = treeViewFast1.GetNode(id);
+        if (node == null) return false;
+        treeViewFast1.SelectedNode = node;
+        node.EnsureVisible();
+        treeViewFast1.Focus();
+        return true;
+      } catch { return false; }
+    }
+
+    private void ShowNodeQuickOpen() {
+      NodeSearchEntry[] entries = _nodeSearchIndex ?? Array.Empty<NodeSearchEntry>();
+      if (entries.Length == 0) {
+        StatusLabel1Text("Quick Open is available after the node tree has finished loading.");
+        return;
+      }
+
+      List<QuickOpenDialog.Item> items = entries.Select(entry => {
+        String primary = !String.IsNullOrWhiteSpace(entry.NodeName) ? entry.NodeName : entry.DisplayName;
+        String secondary = "ID " + entry.ObjectId;
+        if (!String.IsNullOrWhiteSpace(entry.BaseClassId)) secondary += "   Base " + entry.BaseClassId;
+        String search = entry.Id + " " + entry.DisplayName + " " + entry.NodeName + " " + entry.ObjectId + " " + entry.BaseClassId;
+        return new QuickOpenDialog.Item(entry.Id, primary, secondary, search);
+      }).ToList();
+
+      using QuickOpenDialog dialog = new QuickOpenDialog(
+        "Open node",
+        "FQN, node name, object ID or base-class ID...",
+        items
+      );
+      if (dialog.ShowDialog(this) == DialogResult.OK && dialog.SelectedItem != null)
+        NavigateToNodeId(dialog.SelectedItem.Key);
+    }
+
     private void TreeViewFast1MouseHover(Object sender, EventArgs e) {
       if (!_closing && !btnFindNext.Focused && sender is TreeViewFast.Controls.TreeViewFast tree)
         tree.Focus();
@@ -1673,8 +1863,22 @@ namespace PugTools {
         }
     }
     private void TreeViewGrid1MouseDoubleClickNavigate(Object sender, MouseEventArgs e) {
-      if (e.Button != MouseButtons.Left) return;
-      if (treeViewGrid1.SelectedObject is NodeListItem item) NavigateToNodeReference(item);
+      if (e.Button != MouseButtons.Left || treeViewGrid1.SelectedObject is not NodeListItem item) return;
+      Boolean newTab = (ModifierKeys & Keys.Control) == Keys.Control;
+      if (NavigateToNodeReference(item, newTab)) return;
+      if (TryOpenAssetReference(item, newTab)) return;
+      if (item.NavigationTarget is DomType domType)
+        BrowserNavigation.OpenDom(this, _assetsLocation, _assetsUsePts, domType.Id);
+    }
+
+    private Boolean TryOpenAssetReference(NodeListItem item, Boolean newTab = false) {
+      if (item == null) return false;
+      foreach (String raw in new[] { item.value as String, item.DisplayValue, item.DisplayName }) {
+        if (!BrowserNavigation.TryExtractResourcePath(raw, out String path)) continue;
+        BrowserNavigation.OpenAsset(this, _assetsLocation, _assetsUsePts, path, newTab);
+        return true;
+      }
+      return false;
     }
 
     private void TreeViewGrid1MouseHover(Object sender, EventArgs e) {
@@ -1682,12 +1886,13 @@ namespace PugTools {
         treeViewGrid1.Focus();
     }
     private void TreeViewGrid1MouseUp(Object sender, MouseEventArgs e) {
-      if (e.Button == MouseButtons.Right) {
-        TreeListView tlv = sender as TreeListView;
+      if (e.Button != MouseButtons.Right) return;
+      TreeListView tlv = sender as TreeListView;
+      if (tlv?.SelectedObject is not NodeListItem item) return;
 
-        if (tlv.SelectedObject is NodeListItem item && TryGetNodeReference(item, out _))
-          contextMenuStrip2.Show(treeViewGrid1, e.Location);
-      }
+      toolStripMenuItem2.Enabled = TryGetNodeReference(item, out _);
+      UpdateNodeReaderContextMenu(item);
+      contextMenuStrip2.Show(treeViewGrid1, e.Location);
     }
     private void TreeViewGrid1Roots(ArrayList roots) {
       if (treeViewGrid1.InvokeRequired)

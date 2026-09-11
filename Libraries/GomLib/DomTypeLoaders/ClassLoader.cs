@@ -20,7 +20,8 @@ namespace GomLib.DomTypeLoaders
             {
                 // Beta classes do not contain the two 64-bit script-method IDs.
                 // Layout: archetype, parentCount, parentOffset, fieldCount, fieldOffset.
-                reader.BaseStream.Position = 0x16;
+                reader.BaseStream.Position = 0x14;
+                result.Archetype = reader.ReadUInt16();
                 numComponents = reader.ReadInt16();
                 componentOffset = reader.ReadUInt16();
                 numFields = reader.ReadInt16();
@@ -28,7 +29,13 @@ namespace GomLib.DomTypeLoaders
             }
             else
             {
-                reader.BaseStream.Position = 0x2A;
+                // Live DBLB v2 inserts two 64-bit method identifiers between the
+                // archetype and composition directory. Preserve them as raw schema
+                // metadata instead of silently skipping those bytes.
+                reader.BaseStream.Position = 0x18;
+                result.Archetype = reader.ReadUInt16();
+                result.ScriptMethodId1 = reader.ReadUInt64();
+                result.ScriptMethodId2 = reader.ReadUInt64();
                 numComponents = reader.ReadInt16();
                 componentOffset = reader.ReadUInt16();
                 numFields = reader.ReadInt16();

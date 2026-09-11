@@ -40,6 +40,8 @@ namespace PugTools {
           new StreamWriter(_dest + "\\File_Names\\" + _extension + "_file_names.txt", false);
 
         foreach (String item in FileNames) {
+          // en-us is only the canonical seed spelling here. TestHashFiles expands the locale
+          // segment to en-us/de-de/fr-fr and persists only exact current-build hash hits.
           if (item != "")
             outputFileNames.WriteLine(
               ("/resources/en-us/" + item.Replace(".", "/") + ".stb").Replace("//", "/")
